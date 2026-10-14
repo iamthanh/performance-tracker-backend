@@ -103,7 +103,8 @@ Streams are put on a 1 Hz timer clock: values are held across gaps of up to 5 s,
 and missing power counts as 0 W. Normalized power agrees with Wahoo head units to within about 2 W.
 
 **Thresholds.** FTP and threshold HR are detected automatically: 95 % of the best 20-minute power (or heart rate) on a
-ride in the trailing 90 days. They only fall when your best efforts age out, so without hard efforts they read low.
+ride in the trailing 365 days. They only fall when your best efforts age out after a year, so after a long block
+without hard efforts they read low.
 Override them from a date on:
 
 ```bash

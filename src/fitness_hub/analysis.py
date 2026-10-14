@@ -47,7 +47,8 @@ BATCH = 200
 MAX_GAP_S = 5
 NP_WINDOW_S = 30
 DECOUPLING_MIN_S = 600
-AUTO_WINDOW_DAYS = 90
+# A year, so the estimate does not sink in blocks without all-out efforts.
+AUTO_WINDOW_DAYS = 365
 AUTO_FACTOR = 0.95
 AUTO_DURATION_S = 1200
 POWER_CURVE_DURATIONS = (
@@ -289,7 +290,7 @@ def _replace_auto(store: Store, metric: str, changes: list[tuple[str, float]]) -
         store.conn.executemany(
             "INSERT INTO athlete_settings (metric, effective_date, origin, value, note, updated_at) "
             "VALUES (?, ?, 'auto', ?, ?, ?)",
-            [(metric, d, v, "95% of best 20 min, trailing 90 days", now) for d, v in changes],
+            [(metric, d, v, f"95% of best 20 min, trailing {AUTO_WINDOW_DAYS} days", now) for d, v in changes],
         )
 
 

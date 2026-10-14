@@ -164,9 +164,10 @@ def test_auto_thresholds_use_a_trailing_window() -> None:
         ("2026-04-01", 240.0),
         ("2026-04-02", None),
     ]
-    # 95 % of the best in the trailing 90 days (both ends included): 2026-01-01 is still in the window
-    # on 2026-03-31 and drops out on 2026-04-01, when the best becomes 260 W.
-    assert auto_thresholds(points) == [("2026-01-01", 285.0), ("2026-04-01", 247.0)]
+    # 95 % of the best in the trailing window (both ends included): with 90 days, 2026-01-01 is still in
+    # the window on 2026-03-31 and drops out on 2026-04-01, when the best becomes 260 W.
+    assert auto_thresholds(points, window_days=90) == [("2026-01-01", 285.0), ("2026-04-01", 247.0)]
+    assert auto_thresholds(points) == [("2026-01-01", 285.0)]  # the default year keeps the 300 W
     assert auto_thresholds([]) == []
 
 
@@ -264,7 +265,7 @@ def test_training_load_counts_a_ride_once(store: Store) -> None:
 
 
 def test_best_power_curve_and_activity_analysis(store: Store) -> None:
-    ride(store, "old", "2026-01-01", 300, seconds=1200)
+    ride(store, "old", "2025-06-01", 300, seconds=1200)
     ride(store, "new", "2026-09-01", 250, seconds=1200)
     analyze(store)
     all_time = {r["duration_s"]: r for r in queries.best_power_curve(store.conn)}
@@ -273,7 +274,7 @@ def test_best_power_curve_and_activity_analysis(store: Store) -> None:
     assert recent[60]["watts"] == 250 and recent[1200]["source_id"] == "new" and 1800 not in recent
 
     analysis = queries.activity_analysis(store.conn, "strava", "new")
-    assert analysis["ftp_w"] == 238  # January's 300 W is outside the 90-day window by September
+    assert analysis["ftp_w"] == 238  # the 300 W from June 2025 is outside the 365-day window
     assert queries.activity_analysis(store.conn, "strava", "old")["ftp_w"] == 285
     assert [z["zone"] for z in analysis["power_zones"]] == [name for name, _ in POWER_ZONES]
     assert analysis["power_zones"][-1]["upper"] is None
