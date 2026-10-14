@@ -120,7 +120,10 @@ def dedupe_activities(rows: Iterable[dict[str, Any]], window_s: int = DEDUPE_WIN
     untimed: list[dict[str, Any]] = []
     for row in rows:
         ts = parse_ts(row.get("start_time"))
-        (timed.append((ts, row)) if ts else untimed.append(row))
+        if ts:
+            timed.append((ts, row))
+        else:
+            untimed.append(row)
     timed.sort(key=lambda item: item[0])
 
     clusters: list[tuple[datetime, list[dict[str, Any]]]] = []
