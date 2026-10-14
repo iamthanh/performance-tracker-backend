@@ -10,8 +10,8 @@ Fitbit Web API) into a SQLite database on your machine. It then lets **Claude** 
 - Claude can only read, apart from `sync_now`. The SQL tool cannot change the database.
 - The same ride recorded by Garmin, Strava and Google is counted once.
 
-This repository holds all of the Python side: storage, provider sync, the `fitness-hub` CLI and the MCP server. A read
-API for the web UI will also live here. The UI itself lives in
+This repository holds all of the Python side: storage, provider sync, the `fitness-hub` CLI and the MCP server. It also has
+the read API for the web UI (`fitness-hub serve-api`). The UI itself lives in
 [performance-tracker-ui](https://github.com/iamthanh/performance-tracker-ui). The design spec is [PLAN.md](PLAN.md).
 
 ## Install
@@ -298,6 +298,36 @@ claude mcp add --transport http fitness-hub http://127.0.0.1:8800/mcp
 > syncs through it. fitness-hub only binds to loopback (`127.0.0.1`, `localhost`, `::1`) and refuses any other host.
 > Remote access with authentication is future work.
 
+## Read API for the web UI
+
+```bash
+fitness-hub serve-api                  # http://127.0.0.1:8801/api, interactive docs at /docs
+```
+
+The [performance-tracker-ui](https://github.com/iamthanh/performance-tracker-ui) reads everything through this API.
+Like the MCP HTTP transport it has **no authentication**, binds only to loopback and refuses any other host. Browsers
+may call it only from the origins in `API_CORS_ORIGINS` (default: the UI's dev server, `http://localhost:5173` and
+`http://127.0.0.1:5173`). Reads use read-only connections. The only writes are threshold overrides, which re-score the
+affected activities.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/health` | Status, version, schema version, latest activity date, last analysis time |
+| `GET /api/status` | Row counts and per-source sync state |
+| `GET /api/activities?start_date&end_date&activity_type&limit` | Workouts newest first, one per workout (an analysed copy wins over an unanalysed duplicate), with TSS, IF, NP, work, VI, EF, decoupling, `has_streams` |
+| `GET /api/activities/{source}/{id}` | One workout: `activity`, `analysis` (zones, power curve, thresholds used), `laps`, `device`, available `streams` channels |
+| `GET /api/activities/{source}/{id}/streams?max_points=2000` | Per-sample channels averaged down to `max_points` (`time` in seconds from the start) |
+| `GET /api/summary?start_date&end_date&group_by=week` | Totals per day/week (Monday start)/month, overall and per sport: count, distance, hours, elevation, TSS, kJ |
+| `GET /api/training-load?start_date&end_date` | Daily TSS, CTL, ATL, TSB and `unscored` workouts (default 90 days) |
+| `GET /api/power-curve?start_date&end_date&activity_type` | Best power per duration with the activity that set it (cycling unless `activity_type=all`) |
+| `GET /api/daily-metrics?metric=…`, `/api/sleep`, `/api/body` | Health data, as in the MCP tools |
+| `GET /api/heart-rate/{date}` | All-day heart rate per source |
+| `GET /api/thresholds?on=YYYY-MM-DD` | Every dated threshold value, and those in effect on `on` |
+| `POST /api/thresholds` `{metric, effective_date, value, note?}` | Set a manual value; returns the re-scoring result |
+| `DELETE /api/thresholds/{metric}/{effective_date}` | Remove a manual value |
+
+Invalid dates or values return 400 (`{"detail": …}`), and unknown activities 404.
+
 ## Manual verification checklist
 
 The tests never contact the real services. To check against your own accounts:
@@ -528,9 +558,7 @@ query never blocks the other tools.
 
 ## Future work
 
-- **Read API for the web UI** ([performance-tracker-ui](https://github.com/iamthanh/performance-tracker-ui)): an
-  authenticated HTTP API in this repo, built on `queries.py`. The MCP HTTP transport is not suitable for this: it has
-  no authentication and speaks MCP rather than a normal web API.
+- **Authentication for the read API**, so the UI can be used from other devices (today it is localhost-only).
 
 From the plan, in priority order:
 
