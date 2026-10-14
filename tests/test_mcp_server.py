@@ -27,6 +27,9 @@ EXPECTED_TOOLS = {
     "get_sleep",
     "get_body_measurements",
     "query_sql",
+    "training_load",
+    "power_curve",
+    "get_activity_analysis",
     "sync_now",
 }
 
@@ -90,6 +93,29 @@ def test_get_activity(seeded: Settings) -> None:
     _, row = call(seeded, "get_activity", {"source": "strava", "source_id": "s1", "include_raw": True})
     assert row["avg_power_w"] == 215 and row["raw"] == {"id": "s1"}
     error, missing = call(seeded, "get_activity", {"source": "strava", "source_id": "nope"})
+    assert not error and missing is None
+
+
+def test_training_tools(seeded: Settings) -> None:
+    from fitness_hub.analysis import analyze
+
+    with Store(seeded.db_path) as store:
+        n = 1800
+        streams = {"time": list(range(n)), "power": [215] * n, "heart_rate": [150] * n}
+        store.upsert_activity_streams([{"source": "strava", "source_id": "s1", "streams": streams}])
+        analyze(store)
+    error, load = call(seeded, "training_load", {"start_date": "2026-10-06", "end_date": "2026-10-08"})
+    assert not error and [d["date"] for d in load["days"]] == ["2026-10-06", "2026-10-07", "2026-10-08"]
+    # The Garmin copy of the ride has no streams; the scored Strava copy counts, once. The run is unscored.
+    assert load["days"][0]["tss"] > 0 and load["days"][0]["unscored"] == 0
+    assert load["days"][2]["tss"] == 0 and load["days"][2]["unscored"] == 1
+    _, curve = call(seeded, "power_curve", {})
+    best_20min = next(r for r in curve if r["duration_s"] == 1200)
+    assert best_20min["watts"] == 215.0 and best_20min["source_id"] == "s1"
+    _, analysis = call(seeded, "get_activity_analysis", {"source": "strava", "source_id": "s1"})
+    assert analysis["tss_method"] == "power" and analysis["ftp_w"] == 204
+    assert analysis["power_zones"][4] == {"zone": "Z5 VO2max", "upper": 244, "seconds": n}
+    error, missing = call(seeded, "get_activity_analysis", {"source": "strava", "source_id": "s2"})
     assert not error and missing is None
 
 

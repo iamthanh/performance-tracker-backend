@@ -50,9 +50,12 @@ daily_metrics(source, date, metric, value, raw, updated_at), sleep_sessions(sour
 end_time, local_date, minutes_asleep, minutes_awake, minutes_deep, minutes_light, minutes_rem, is_main, raw, \
 updated_at), body_measurements(source, ts, metric, value, raw, updated_at), sync_state(source, stream, cursor, \
 last_attempt, last_success, last_error, rows_upserted), activity_metrics(source, source_id, analysis_version, \
-ftp_w, threshold_hr, normalized_power_w, intensity_factor, tss, tss_method, variability_index, efficiency_factor, \
-work_kj, decoupling_pct, power_zone_s, hr_zone_s, updated_at), power_curve(source, source_id, duration_s, watts, \
-updated_at), athlete_settings(metric, effective_date, origin, value, note, updated_at), activity_streams(source, \
+streams_updated_at, streams_bytes, timer_s, avg_power_w, max_power_w, normalized_power_w, work_kj, avg_hr, max_hr, \
+hr_20min_bpm, decoupling_pct, power_hist, hr_hist, ftp_w, threshold_hr, intensity_factor, tss, tss_method, \
+variability_index, efficiency_factor, power_zone_s, hr_zone_s, scored_with, updated_at; tss_method is power or hr, \
+and for hr the intensity_factor is the one giving the same TSS), power_curve(source, source_id, duration_s, watts, \
+updated_at), athlete_settings(metric, effective_date, origin, value, note, updated_at; metric ftp_w, threshold_hr, \
+max_hr or resting_hr), activity_streams(source, \
 source_id, channels, sample_count, encoding, data, meta, updated_at) and daily_series(source, date, series, channels, \
 sample_count, encoding, data, updated_at; all-day heart rate); their `data` is a compressed blob, not queryable. \
 activity_metrics, power_curve and athlete_settings are filled by the training analysis and may be empty. \
@@ -189,6 +192,38 @@ def create_server(
         """Weight (kg) and body fat (%) samples with UTC timestamps."""
         rows = await read(lambda c: queries.body_measurements(c, start_date, end_date, metric))
         return _dump({"count": len(rows), "rows": rows})
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=False)
+    async def training_load(
+        start_date: Annotated[str | None, Field(description="YYYY-MM-DD; default 90 days before end_date")] = None,
+        end_date: DateArg = None,
+    ) -> str:
+        """Daily TSS with fitness (CTL, 42-day), fatigue (ATL, 7-day) and form (TSB = yesterday's CTL - ATL),
+        like TrainingPeaks' Performance Management Chart. De-duplicated across services. Only activities
+        with imported streams have a TSS; `unscored` counts the day's workouts without one, so a run of
+        unscored days means the load is understated (e.g. no export imported since)."""
+        rows = await read(lambda c: queries.training_load(c, start_date, end_date))
+        return _dump({"count": len(rows), "days": rows})
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=False)
+    async def power_curve(
+        start_date: Annotated[str | None, Field(description="YYYY-MM-DD; default all time")] = None,
+        end_date: DateArg = None,
+    ) -> str:
+        """Best average power (W) for each duration from 1 s to 5 h in the date range, with the activity
+        that set it (mean-maximal power curve)."""
+        return _dump(await read(lambda c: queries.best_power_curve(c, start_date, end_date)))
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=False)
+    async def get_activity_analysis(
+        source: Annotated[str, Field(description="Source of the activity, e.g. strava")],
+        source_id: Annotated[str, Field(description="The activity id within that source")],
+    ) -> str:
+        """Computed metrics of one activity: NP, IF, TSS (tss_method power, or hr: TRIMP-based, with the IF
+        that gives the same TSS), VI, EF, Pw:HR decoupling, work, time in Coggan power and Friel HR zones
+        (with each zone's highest W / bpm), the FTP / threshold HR used, and its power curve. null if the
+        activity has no analysed streams."""
+        return _dump(await read(lambda c: queries.activity_analysis(c, source, source_id)))
 
     @mcp.tool(annotations=READ_ONLY, structured_output=False)
     async def query_sql(
