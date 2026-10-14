@@ -1,8 +1,11 @@
-"""SQLite schema, idempotent upserts and sync bookkeeping.
+"""SQLite schema, migrations, idempotent upserts and sync bookkeeping.
 
 Timestamps are UTC ISO-8601 text (``YYYY-MM-DDTHH:MM:SSZ``); dates are
 ``YYYY-MM-DD`` on the athlete's local clock. Every row keeps the provider
 payload in ``raw`` and every write is ``INSERT ... ON CONFLICT DO UPDATE``.
+
+``SCHEMA`` is version 1. Later versions are applied by ``migrate`` from
+``MIGRATIONS`` and recorded in ``PRAGMA user_version``.
 """
 
 from __future__ import annotations
@@ -10,11 +13,14 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from collections.abc import Iterable, Mapping
+import time
+import zlib
+from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .util import now_utc_iso
+from .util import now_utc_iso, parse_date, utc_iso
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS activities (
@@ -89,6 +95,89 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 """
 
+SCHEMA_VERSION = 2
+
+# MIGRATIONS[v] upgrades a database from version v - 1 to v. Each one runs in a
+# single transaction together with the ``user_version`` bump.
+MIGRATIONS: dict[int, tuple[str, ...]] = {
+    # Training analysis: per-second streams, derived per-activity metrics, the
+    # mean-maximal power curve and dated athlete thresholds (FTP, ...).
+    2: (
+        """
+        CREATE TABLE activity_streams (
+            source TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            channels TEXT NOT NULL,          -- JSON array of the channel names in data
+            sample_count INTEGER NOT NULL,
+            encoding TEXT NOT NULL,          -- how data is encoded, see STREAM_ENCODING
+            data BLOB NOT NULL,              -- {channel: [value, ...]}, every channel sample_count long
+            meta TEXT,                       -- provider metadata (resolution, series type, ...)
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source, source_id)
+        )
+        """,
+        """
+        CREATE TABLE activity_metrics (
+            source TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            analysis_version INTEGER NOT NULL,
+            ftp_w REAL,                      -- thresholds the metrics were computed with
+            threshold_hr REAL,
+            normalized_power_w REAL,
+            intensity_factor REAL,
+            tss REAL,
+            tss_method TEXT,                 -- power | hr; NULL when no TSS could be computed
+            variability_index REAL,
+            efficiency_factor REAL,
+            work_kj REAL,
+            decoupling_pct REAL,
+            power_zone_s TEXT,               -- JSON array: seconds spent in each power zone
+            hr_zone_s TEXT,                  -- JSON array: seconds spent in each HR zone
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source, source_id)
+        )
+        """,
+        """
+        CREATE TABLE power_curve (
+            source TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            duration_s INTEGER NOT NULL,
+            watts REAL NOT NULL,             -- best average power over duration_s
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source, source_id, duration_s)
+        )
+        """,
+        """
+        CREATE TABLE daily_series (
+            source TEXT NOT NULL,
+            date TEXT NOT NULL,              -- athlete's local date
+            series TEXT NOT NULL,            -- e.g. heart_rate
+            channels TEXT NOT NULL,          -- JSON array of the channel names in data
+            sample_count INTEGER NOT NULL,
+            encoding TEXT NOT NULL,
+            data BLOB NOT NULL,              -- {"time": [epoch s, ...], <series>: [value, ...]}
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source, date, series)
+        )
+        """,
+        """
+        CREATE TABLE athlete_settings (
+            metric TEXT NOT NULL,
+            effective_date TEXT NOT NULL,    -- applies from this local date until the next entry
+            origin TEXT NOT NULL,            -- manual | auto
+            value REAL NOT NULL,
+            note TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (metric, effective_date, origin)
+        )
+        """,
+    ),
+}
+
+STREAM_ENCODING = "zlib+json"
+ATHLETE_SETTINGS = ("ftp_w", "threshold_hr", "max_hr")
+SETTING_ORIGINS = ("manual", "auto")
+
 DATA_TABLES = ("activities", "daily_metrics", "sleep_sessions", "body_measurements")
 
 DAILY_METRICS = (
@@ -143,6 +232,26 @@ _SLEEP_COLUMNS = (
     "raw",
 )
 _DAILY_COLUMNS = ("source", "date", "metric", "value", "raw")
+_STREAM_COLUMNS = ("source", "source_id", "channels", "sample_count", "encoding", "data", "meta")
+_METRIC_COLUMNS = (
+    "source",
+    "source_id",
+    "analysis_version",
+    "ftp_w",
+    "threshold_hr",
+    "normalized_power_w",
+    "intensity_factor",
+    "tss",
+    "tss_method",
+    "variability_index",
+    "efficiency_factor",
+    "work_kj",
+    "decoupling_pct",
+    "power_zone_s",
+    "hr_zone_s",
+)
+_SERIES_COLUMNS = ("source", "date", "series", "channels", "sample_count", "encoding", "data")
+_SETTING_COLUMNS = ("metric", "effective_date", "origin", "value", "note")
 _BODY_COLUMNS = ("source", "ts", "metric", "value", "raw")
 
 
@@ -160,12 +269,60 @@ _SQL_ACTIVITY = _upsert_sql("activities", _ACTIVITY_COLUMNS, ("source", "source_
 _SQL_SLEEP = _upsert_sql("sleep_sessions", _SLEEP_COLUMNS, ("source", "source_id"))
 _SQL_DAILY = _upsert_sql("daily_metrics", _DAILY_COLUMNS, ("source", "date", "metric"))
 _SQL_BODY = _upsert_sql("body_measurements", _BODY_COLUMNS, ("source", "ts", "metric"))
+_SQL_STREAMS = _upsert_sql("activity_streams", _STREAM_COLUMNS, ("source", "source_id"))
+_SQL_METRICS = _upsert_sql("activity_metrics", _METRIC_COLUMNS, ("source", "source_id"))
+_SQL_SERIES = _upsert_sql("daily_series", _SERIES_COLUMNS, ("source", "date", "series"))
+_SQL_SETTING = _upsert_sql("athlete_settings", _SETTING_COLUMNS, ("metric", "effective_date", "origin"))
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return utc_iso(value)
+    return str(value)
 
 
 def _raw(value: Any) -> str | None:
     if value is None or isinstance(value, str):
         return value
-    return json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
+    return json.dumps(value, separators=(",", ":"), sort_keys=True, default=_json_default)
+
+
+def encode_streams(streams: Mapping[str, Sequence[Any]]) -> tuple[list[str], int, bytes]:
+    """``{channel: values}`` -> ``(channels, sample_count, blob)``.
+
+    Every channel must have the same number of samples, so index ``i`` is the
+    same moment in each channel.
+    """
+    if not streams:
+        raise ValueError("streams must have at least one channel")
+    lengths = {name: len(values) for name, values in streams.items()}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"stream channels differ in length: {lengths}")
+    channels = sorted(streams)
+    payload = json.dumps({c: list(streams[c]) for c in channels}, separators=(",", ":"))
+    return channels, next(iter(lengths.values())), zlib.compress(payload.encode())
+
+
+def decode_streams(encoding: str, data: bytes) -> dict[str, list[Any]]:
+    if encoding != STREAM_ENCODING:
+        raise ValueError(f"unknown stream encoding {encoding!r}")
+    return json.loads(zlib.decompress(data))
+
+
+def load_streams(conn: sqlite3.Connection, source: str, source_id: str) -> dict[str, list[Any]] | None:
+    """The stored channels of one activity, or ``None`` if it has no streams."""
+    row = conn.execute(
+        "SELECT encoding, data FROM activity_streams WHERE source = ? AND source_id = ?", (source, source_id)
+    ).fetchone()
+    return decode_streams(row[0], row[1]) if row else None
+
+
+def load_daily_series(conn: sqlite3.Connection, source: str, day: str, series: str) -> dict[str, list[Any]] | None:
+    """One day's intraday series (``{"time": [...], series: [...]}``), or ``None``."""
+    row = conn.execute(
+        "SELECT encoding, data FROM daily_series WHERE source = ? AND date = ? AND series = ?", (source, day, series)
+    ).fetchone()
+    return decode_streams(row[0], row[1]) if row else None
 
 
 def _ensure_private_file(path: Path) -> None:
@@ -185,10 +342,61 @@ def connect(path: Path | str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
-    conn.execute("PRAGMA journal_mode = WAL")
+    _enable_wal(conn)
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.executescript(SCHEMA)
+    migrate(conn)
     return conn
+
+
+def _enable_wal(conn: sqlite3.Connection, attempts: int = 50) -> None:
+    """Switching a database to WAL needs an exclusive lock and ignores
+    ``busy_timeout``, so a new file opened by two processes at once can report
+    "database is locked" here. Retry briefly; once in WAL this is a no-op."""
+    for attempt in range(attempts):
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(0.1)
+
+
+def schema_version(conn: sqlite3.Connection) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
+def _check_not_newer(conn: sqlite3.Connection) -> int:
+    current = schema_version(conn)
+    if current > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"database schema version {current} is newer than this fitness-hub supports ({SCHEMA_VERSION}); "
+            "upgrade fitness-hub"
+        )
+    return current
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Bring a database that has ``SCHEMA`` applied up to ``SCHEMA_VERSION``.
+
+    A database created before versioning reports ``user_version`` 0 and is
+    treated as version 1. Each step re-checks the version once it holds the
+    write lock, so two processes opening the database at once (the daemon and
+    the MCP server) apply each migration only once.
+    """
+    current = _check_not_newer(conn)
+    for target in range(max(current, 1) + 1, SCHEMA_VERSION + 1):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if schema_version(conn) < target:
+                for statement in MIGRATIONS[target]:
+                    conn.execute(statement)
+                conn.execute(f"PRAGMA user_version = {target}")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def open_readonly(path: Path | str) -> sqlite3.Connection:
@@ -202,9 +410,14 @@ def open_readonly(path: Path | str) -> sqlite3.Connection:
         connect(path).close()
     conn = _connect_ro(path)
     present = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    if not present.issuperset((*DATA_TABLES, "sync_state")):
+    try:
+        current = _check_not_newer(conn)
+    except RuntimeError:
         conn.close()
-        connect(path).close()  # apply the idempotent schema, then reopen read-only
+        raise
+    if not present.issuperset((*DATA_TABLES, "sync_state")) or current < SCHEMA_VERSION:
+        conn.close()
+        connect(path).close()  # apply the schema and any migrations, then reopen read-only
         conn = _connect_ro(path)
     return conn
 
@@ -279,6 +492,92 @@ class Store:
             if not row.get("source") or not row.get("ts") or not row.get("metric"):
                 raise ValueError(f"body measurement row missing key fields: {row!r}")
         return self._write(_SQL_BODY, _BODY_COLUMNS, rows)
+
+    # -- training analysis ---------------------------------------------------------
+
+    def upsert_activity_streams(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        """Rows are ``{source, source_id, streams: {channel: values}, meta?}``."""
+        now = now_utc_iso()
+        params = []
+        for row in rows:
+            if not row.get("source") or not row.get("source_id"):
+                raise ValueError("stream row missing source/source_id")
+            channels, count, blob = encode_streams(row.get("streams") or {})
+            channel_list = json.dumps(channels)
+            params.append(
+                (row["source"], row["source_id"], channel_list, count, STREAM_ENCODING, blob, _raw(row.get("meta")),
+                 now)
+            )
+        if not params:
+            return 0
+        with self.conn:
+            self.conn.executemany(_SQL_STREAMS, params)
+        return len(params)
+
+    def upsert_daily_series(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        """Rows are ``{source, date, series, streams: {"time": [...], series: [...]}}``."""
+        now = now_utc_iso()
+        params = []
+        for row in rows:
+            if not row.get("source") or not row.get("date") or not row.get("series"):
+                raise ValueError("daily series row missing source/date/series")
+            channels, count, blob = encode_streams(row.get("streams") or {})
+            params.append((row["source"], row["date"], row["series"], json.dumps(channels), count, STREAM_ENCODING,
+                           blob, now))  # fmt: skip
+        if not params:
+            return 0
+        with self.conn:
+            self.conn.executemany(_SQL_SERIES, params)
+        return len(params)
+
+    def upsert_activity_metrics(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        now = now_utc_iso()
+        params = []
+        for row in rows:
+            if not row.get("source") or not row.get("source_id") or row.get("analysis_version") is None:
+                raise ValueError("activity metrics row missing source/source_id/analysis_version")
+            values = [row.get(c) for c in _METRIC_COLUMNS]
+            for column in ("power_zone_s", "hr_zone_s"):
+                i = _METRIC_COLUMNS.index(column)
+                values[i] = _raw(values[i])
+            params.append((*values, now))
+        if not params:
+            return 0
+        with self.conn:
+            self.conn.executemany(_SQL_METRICS, params)
+        return len(params)
+
+    def replace_power_curve(self, source: str, source_id: str, curve: Mapping[int, float]) -> int:
+        """Store one activity's ``{duration_s: watts}`` curve, replacing the old one."""
+        now = now_utc_iso()
+        params = [(source, source_id, int(d), float(w), now) for d, w in sorted(curve.items())]
+        with self.conn:
+            self.conn.execute("DELETE FROM power_curve WHERE source = ? AND source_id = ?", (source, source_id))
+            self.conn.executemany(
+                "INSERT INTO power_curve (source, source_id, duration_s, watts, updated_at) VALUES (?, ?, ?, ?, ?)",
+                params,
+            )
+        return len(params)
+
+    def set_athlete_setting(
+        self, metric: str, effective_date: str, value: float, origin: str = "manual", note: str | None = None
+    ) -> None:
+        if metric not in ATHLETE_SETTINGS:
+            raise ValueError(f"unknown athlete setting {metric!r}; expected one of {', '.join(ATHLETE_SETTINGS)}")
+        if origin not in SETTING_ORIGINS:
+            raise ValueError(f"origin must be one of {', '.join(SETTING_ORIGINS)}")
+        effective_date = parse_date(effective_date, "effective_date").isoformat()
+        with self.conn:
+            self.conn.execute(_SQL_SETTING, (metric, effective_date, origin, float(value), note, now_utc_iso()))
+
+    def delete_athlete_setting(self, metric: str, effective_date: str, origin: str = "manual") -> bool:
+        effective_date = parse_date(effective_date, "effective_date").isoformat()
+        with self.conn:
+            cursor = self.conn.execute(
+                "DELETE FROM athlete_settings WHERE metric = ? AND effective_date = ? AND origin = ?",
+                (metric, effective_date, origin),
+            )
+        return cursor.rowcount > 0
 
     # -- sync bookkeeping --------------------------------------------------------
 

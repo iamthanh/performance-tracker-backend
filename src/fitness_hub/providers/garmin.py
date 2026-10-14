@@ -167,6 +167,40 @@ def map_hrv(day: str, data: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     ]
 
 
+def map_heart_rates(day: str, data: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """``get_heart_rates`` -> a ``daily_series`` row of all-day HR (epoch seconds, bpm).
+
+    ``heartRateValues`` holds ``[timestamp_ms_gmt, bpm]`` pairs (about one every
+    two minutes); ``heartRateValueDescriptors`` names the positions when present.
+    Samples without a value are dropped.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    values = data.get("heartRateValues")
+    if not isinstance(values, list):
+        return None
+    index = {"timestamp": 0, "heartrate": 1}
+    for d in data.get("heartRateValueDescriptors") or []:
+        if isinstance(d, Mapping) and d.get("key") in index and isinstance(d.get("index"), int):
+            index[d["key"]] = d["index"]
+    samples = []
+    for pair in values:
+        if not isinstance(pair, (list, tuple)) or len(pair) <= max(index.values()):
+            continue
+        ts, bpm = to_float(pair[index["timestamp"]]), to_float(pair[index["heartrate"]])
+        if ts is not None and bpm is not None:
+            samples.append((int(ts // 1000), bpm))
+    if not samples:
+        return None
+    samples.sort()
+    return {
+        "source": SOURCE,
+        "date": day,
+        "series": "heart_rate",
+        "streams": {"time": [t for t, _ in samples], "heart_rate": [b for _, b in samples]},
+    }
+
+
 def map_body(data: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     if not isinstance(data, Mapping):
         return []
@@ -238,11 +272,16 @@ class GarminProvider:
         if not login.ok:
             return [login]
         client = holder["client"]
-        return [
-            self._run(store, window, full, "activities", lambda s, e, p: self._activities(client, store, s, e, p)),
-            self._run(store, window, full, "daily", lambda s, e, p: self._daily(client, store, s, e, p)),
-            self._run(store, window, full, "body", lambda s, e, p: self._body(client, store, s, e, p)),
-        ]
+        results = []
+        # Workouts normally come from Strava; GARMIN_ACTIVITIES=true also syncs Garmin's.
+        if self.settings.garmin_activities:
+            activities = lambda s, e, p: self._activities(client, store, s, e, p)  # noqa: E731
+            results.append(self._run(store, window, full, "activities", activities))
+        elif store.get_state(SOURCE, "activities"):
+            log.info("garmin activities are no longer synced by default; set GARMIN_ACTIVITIES=true to sync them")
+        results.append(self._run(store, window, full, "daily", lambda s, e, p: self._daily(client, store, s, e, p)))
+        results.append(self._run(store, window, full, "body", lambda s, e, p: self._body(client, store, s, e, p)))
+        return results
 
     def _run(
         self,
@@ -273,8 +312,12 @@ class GarminProvider:
             sleep_data = _day_call(client.get_sleep_data, iso, stop_on={"throttled", "auth", "error"})
             # HRV is absent on many devices, so only throttling or auth problems stop the stream.
             hrv = _day_call(client.get_hrv_data, iso, stop_on={"throttled", "auth"})
+            heart_rates = _day_call(client.get_heart_rates, iso, stop_on={"throttled", "auth"})
             session, sleep_metrics = map_sleep(iso, sleep_data)
             progress.rows += store.upsert_daily_metrics(map_stats(iso, stats) + sleep_metrics + map_hrv(iso, hrv))
+            hr_series = map_heart_rates(iso, heart_rates)
+            if hr_series:
+                progress.rows += store.upsert_daily_series([hr_series])
             if session:
                 progress.rows += store.upsert_sleep_sessions([session])
             progress.cursor = partial_cursor(day)  # replaced by the window end on success
