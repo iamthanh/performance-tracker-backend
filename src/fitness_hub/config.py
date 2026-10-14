@@ -88,6 +88,8 @@ class Settings:
     lookback_days: int = 7
     # Workouts come from Strava by default; Garmin supplies daily health data.
     garmin_activities: bool = False
+    # Browser origins allowed to call the read API (the UI's dev server by default).
+    api_cors_origins: tuple[str, ...] = ("http://localhost:5173", "http://127.0.0.1:5173")
 
     @property
     def db_path(self) -> Path:
@@ -135,4 +137,7 @@ class Settings:
             backfill_days=_int(merged, "BACKFILL_DAYS", 365),
             lookback_days=_int(merged, "LOOKBACK_DAYS", 7),
             garmin_activities=_bool(merged, "GARMIN_ACTIVITIES", False),
+            api_cors_origins=tuple(o.strip().rstrip("/") for o in merged["API_CORS_ORIGINS"].split(",") if o.strip())
+            if merged.get("API_CORS_ORIGINS")
+            else cls.api_cors_origins,
         )

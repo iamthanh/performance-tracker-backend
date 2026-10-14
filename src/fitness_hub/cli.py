@@ -98,6 +98,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1", help="HTTP bind address (loopback only)")
     serve.add_argument("--port", type=int, default=8800)
 
+    api = sub.add_parser("serve-api", help="serve the read API for the web UI on localhost")
+    api.add_argument("--host", default="127.0.0.1", help="bind address (loopback only)")
+    api.add_argument("--port", type=int, default=8801)
+
     run = sub.add_parser("run", help="daemon: sync every N minutes (optionally also serve MCP over HTTP)")
     run.add_argument("--interval-minutes", type=float, default=60.0)
     run.add_argument("--http", action="store_true", help="also serve MCP over HTTP on --host/--port")
@@ -263,6 +267,16 @@ def cmd_thresholds(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve_api(settings: Settings, args: argparse.Namespace) -> int:
+    from .api import serve
+    from .mcp_server import check_http_host
+
+    check_http_host(args.host)
+    print(f"fitness-hub API on http://{args.host}:{args.port}/api (docs: /docs). Ctrl-C to stop.", file=sys.stderr)
+    serve(settings, host=args.host, port=args.port)
+    return 0
+
+
 def cmd_serve(settings: Settings, args: argparse.Namespace) -> int:
     from .mcp_server import serve
 
@@ -317,6 +331,7 @@ COMMANDS = {
     "analyze": cmd_analyze,
     "thresholds": cmd_thresholds,
     "serve-mcp": cmd_serve,
+    "serve-api": cmd_serve_api,
     "run": cmd_run,
 }
 

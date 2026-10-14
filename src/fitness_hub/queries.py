@@ -11,12 +11,14 @@ import re
 import sqlite3
 import time
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from .db import row_counts, sync_states
-from .util import parse_date, parse_ts
+import numpy as np
+
+from .db import load_daily_series, load_streams, row_counts, sync_states
+from .util import InputError, parse_date, parse_ts
 
 DEDUPE_WINDOW_S = 180
 SOURCE_PRIORITY = ("garmin", "google_health", "strava", "garmin_export")
@@ -89,6 +91,9 @@ def _type_clause(activity_type: str | None) -> tuple[str, list[str]]:
     return "LOWER(activity_type) LIKE ?", [f"%{wanted}%"]
 
 
+MAX_RANGE_DAYS = 366 * 50
+
+
 def _date_range(
     start_date: str | None, end_date: str | None, default_days: int | None, today: date | None = None
 ) -> tuple[str | None, str | None]:
@@ -96,9 +101,14 @@ def _date_range(
     end = parse_date(end_date, "end_date") if end_date else None
     if default_days is not None and start is None:
         anchor = end or today or date.today()
-        start = anchor - timedelta(days=default_days - 1)
+        try:
+            start = anchor - timedelta(days=default_days - 1)
+        except OverflowError:
+            raise InputError(f"end_date {anchor} is out of range") from None
     if start and end and start > end:
-        raise ValueError(f"start_date {start} is after end_date {end}")
+        raise InputError(f"start_date {start} is after end_date {end}")
+    if start and end and (end - start).days > MAX_RANGE_DAYS:
+        raise InputError("the date range is limited to 50 years")
     return (start.isoformat() if start else None, end.isoformat() if end else None)
 
 
@@ -376,6 +386,9 @@ def training_load(
     last 90 days.
     """
     start, end = _date_range(start_date, end_date, 90, today)
+    latest = (today or date.today()) + timedelta(days=366)
+    if end and end > latest.isoformat():
+        raise InputError(f"end_date can be at most a year ahead ({latest})")
     end = end or (today or date.today()).isoformat()
     tss: dict[str, float] = {}
     unscored: dict[str, int] = {}
@@ -469,6 +482,189 @@ def activity_analysis(conn: sqlite3.Connection, source: str, source_id: str) -> 
         )
     ]
     return result
+
+
+# -- for the web UI: activities with their analysis, period totals, streams ---------------
+
+_LIST_METRIC_COLUMNS = (
+    "tss",
+    "tss_method",
+    "intensity_factor",
+    "normalized_power_w",
+    "work_kj",
+    "timer_s",
+    "variability_index",
+    "efficiency_factor",
+    "decoupling_pct",
+)
+
+
+def activities_with_metrics(
+    conn: sqlite3.Connection,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    activity_type: str | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Workouts newest first, de-duplicated across sources (an analysed copy is kept
+    over an unanalysed duplicate), each with its key training metrics (``None``
+    when it was not analysed), ``has_streams`` (charts are available) and
+    ``analysed``. The type filter applies before de-duplication."""
+    start, end = _date_range(start_date, end_date, None)
+    clauses, params = [], []
+    if start:
+        clauses.append("a.local_date >= ?")
+        params.append(start)
+    if end:
+        clauses.append("a.local_date <= ?")
+        params.append(end)
+    type_sql, type_params = _type_clause(activity_type)
+    if type_sql:
+        clauses.append(type_sql.replace("activity_type", "a.activity_type"))
+        params.extend(type_params)
+    columns = ", ".join(f"a.{c}" for c in ACTIVITY_COLUMNS)
+    metric_columns = ", ".join(f"m.{c} AS m_{c}" for c in _LIST_METRIC_COLUMNS)
+    sql = (
+        f"SELECT {columns}, {metric_columns}, m.source IS NOT NULL AS analysed, EXISTS (SELECT 1 FROM "
+        "activity_streams s WHERE s.source = a.source AND s.source_id = a.source_id) AS has_streams "
+        "FROM activities a LEFT JOIN activity_metrics m USING (source, source_id)"
+    )
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    rows = [dict(r) for r in conn.execute(sql, params)]
+    kept = dedupe_activities(
+        rows, rank=lambda r: (not r["analysed"], not r["has_streams"], _priority(r["source"]))
+    )
+    kept.sort(key=lambda r: r.get("start_time") or "", reverse=True)
+    out = []
+    for row in kept[: limit if limit else None]:
+        item = {c: row[c] for c in ACTIVITY_COLUMNS}
+        item.update(sport=sport_family(row["activity_type"]), also_recorded_by=row["also_recorded_by"],
+                    has_streams=bool(row["has_streams"]), analysed=bool(row["analysed"]))  # fmt: skip
+        item.update({c: row[f"m_{c}"] for c in _LIST_METRIC_COLUMNS})
+        out.append(item)
+    return out
+
+
+def _new_totals() -> dict[str, Any]:
+    return {"count": 0, "distance_km": 0.0, "moving_hours": 0.0, "elevation_gain_m": 0.0, "tss": 0.0, "work_kj": 0.0,
+            "unscored": 0}  # fmt: skip
+
+
+def _add(totals: dict[str, Any], row: Mapping[str, Any]) -> None:
+    totals["count"] += 1
+    totals["unscored"] += row.get("tss") is None
+    totals["distance_km"] += (row.get("distance_m") or 0.0) / 1000
+    totals["moving_hours"] += (row.get("moving_s") or row.get("timer_s") or row.get("duration_s") or 0.0) / 3600
+    totals["elevation_gain_m"] += row.get("elevation_gain_m") or 0.0
+    totals["tss"] += row.get("tss") or 0.0
+    totals["work_kj"] += row.get("work_kj") or 0.0
+
+
+def _rounded(totals: dict[str, Any]) -> dict[str, Any]:
+    return {k: (round(v, 2) if isinstance(v, float) else v) for k, v in totals.items()}
+
+
+def period_totals(
+    conn: sqlite3.Connection, start_date: str, end_date: str, group_by: str = "week"
+) -> dict[str, Any]:
+    """Totals per day, week (Monday start) or month, overall and per sport: count,
+    distance, moving hours, elevation, TSS, work and workouts without a TSS
+    (``unscored``). De-duplicated; empty periods included. A period is labelled by
+    its first day, which can be before ``start_date`` (the first week or month is
+    then only counted from ``start_date``)."""
+    if group_by not in ("day", "week", "month"):
+        raise InputError(f"group_by must be day, week or month; got {group_by!r}")
+    if not start_date or not end_date:
+        raise InputError("start_date and end_date are required (YYYY-MM-DD)")
+    start, end = _date_range(start_date, end_date, None)
+    assert start and end
+    periods = {
+        key: {"total": _new_totals(), "by_sport": {}}
+        for key in _periods(date.fromisoformat(start), date.fromisoformat(end), group_by)
+    }
+    for row in activities_with_metrics(conn, start, end):
+        period = periods[_period_key(row["local_date"], group_by)]
+        _add(period["total"], row)
+        _add(period["by_sport"].setdefault(row["sport"], _new_totals()), row)
+    return {
+        "start_date": start,
+        "end_date": end,
+        "group_by": group_by,
+        "periods": [
+            {"period": key, "total": _rounded(p["total"]),
+             "by_sport": {sport: _rounded(t) for sport, t in sorted(p["by_sport"].items())}}
+            for key, p in periods.items()
+        ],  # fmt: skip
+    }
+
+
+def activity_detail(conn: sqlite3.Connection, source: str, source_id: str) -> dict[str, Any] | None:
+    """One activity with its analysis, laps and device (``None`` if it does not exist)."""
+    activity = get_activity(conn, source, source_id)
+    if activity is None:
+        return None
+    meta_row = conn.execute(
+        "SELECT meta, sample_count, channels FROM activity_streams WHERE source = ? AND source_id = ?",
+        (source, str(source_id)),
+    ).fetchone()
+    meta = json.loads(meta_row["meta"]) if meta_row and meta_row["meta"] else {}
+    return {
+        "activity": activity,
+        "analysis": activity_analysis(conn, source, source_id),
+        "streams": {"sample_count": meta_row["sample_count"], "channels": json.loads(meta_row["channels"])}
+        if meta_row
+        else None,
+        "device": meta.get("device") or meta.get("manufacturer"),
+        "laps": meta.get("laps") or [],
+    }
+
+
+def downsample(streams: Mapping[str, list[Any]], max_points: int) -> dict[str, list[Any]]:
+    """Average consecutive samples into at most ``max_points`` buckets (missing values ignored)."""
+    n = len(streams.get("time") or [])
+    if n <= max_points:
+        return {c: list(v) for c, v in streams.items()}
+    edges = np.linspace(0, n, max_points + 1).astype(int)
+    out: dict[str, list[Any]] = {}
+    for channel, values in streams.items():
+        arr = np.array([np.nan if v is None else v for v in values], dtype=float)
+        sums = np.add.reduceat(np.nan_to_num(arr, nan=0.0), edges[:-1])
+        counts = np.add.reduceat((~np.isnan(arr)).astype(float), edges[:-1])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            means = sums / counts
+        digits = 6 if channel in ("lat", "lng") else 2
+        out[channel] = [None if np.isnan(m) else round(float(m), digits) for m in means]
+    return out
+
+
+def activity_streams(
+    conn: sqlite3.Connection, source: str, source_id: str, max_points: int = 2000
+) -> dict[str, list[Any]] | None:
+    """The activity's per-sample channels (``time`` in seconds from the start), averaged
+    down to at most ``max_points`` samples for charts. ``None`` if it has no streams."""
+    streams = load_streams(conn, source, str(source_id))
+    if streams is None:
+        return None
+    return downsample(streams, max(10, int(max_points)))
+
+
+def heart_rate_day(conn: sqlite3.Connection, day: str) -> dict[str, Any]:
+    """All-day heart rate of one local date (``time`` in epoch seconds), per source."""
+    iso = parse_date(day, "date").isoformat()
+    sql = "SELECT source FROM daily_series WHERE date = ? AND series = 'heart_rate' ORDER BY source"
+    sources = [r[0] for r in conn.execute(sql, (iso,))]
+    return {"date": iso, "sources": {s: load_daily_series(conn, s, iso, "heart_rate") for s in sources}}
+
+
+def thresholds(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Every dated threshold value, manual and automatic."""
+    return [
+        dict(r)
+        for r in conn.execute(
+            "SELECT metric, effective_date, origin, value, note FROM athlete_settings ORDER BY metric, effective_date"
+        )
+    ]
 
 
 # -- daily metrics, sleep, body ---------------------------------------------------------
