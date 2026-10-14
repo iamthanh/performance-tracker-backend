@@ -1,9 +1,17 @@
 """HTTP read API for the web UI (performance-tracker-ui).
 
-Local only, like the MCP HTTP transport: it binds to loopback and refuses any
-other host, and has no authentication. Every read opens its own read-only
-connection (``mode=ro`` + ``query_only``); the only writes are threshold
-overrides, which re-score the affected activities.
+Local only: it binds to loopback, refuses any other host and has no
+authentication. Protections for a browser on the same machine:
+
+- Requests whose ``Host`` is not a loopback name are refused (421), so a web
+  page cannot reach the API through DNS rebinding.
+- Writes (POST/DELETE) carrying an ``Origin`` header must come from a loopback
+  origin or one in ``API_CORS_ORIGINS`` (403); CORS lets only those origins read
+  responses; and JSON bodies need ``Content-Type: application/json``, which a
+  cross-site form or simple request cannot send.
+
+Every read opens its own read-only connection (``mode=ro`` + ``query_only``);
+the only writes are threshold overrides, which re-score the affected activities.
 
 Dates are ``YYYY-MM-DD`` on the athlete's local clock; units are those of the
 database (metres, seconds, watts, bpm) unless a field name says otherwise.
@@ -12,28 +20,29 @@ database (metres, seconds, watts, bpm) unless a field name says otherwise.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import closing
 from dataclasses import asdict
 from typing import Annotated, Any, Literal, get_args
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from . import __version__, queries
 from .analysis import analyze, thresholds_on
 from .config import Settings
 from .db import ATHLETE_SETTINGS, Store, open_readonly, schema_version
-from .mcp_server import check_http_host
-from .util import parse_date
+from .mcp_server import LOOPBACK_HOSTS, check_http_host, normalize_host
+from .util import InputError, parse_date
 
 DateQuery = Annotated[str | None, Query(description="YYYY-MM-DD (local date), inclusive")]
 
 
 ThresholdMetric = Literal["ftp_w", "threshold_hr", "max_hr", "resting_hr"]
-assert set(get_args(ThresholdMetric)) == set(ATHLETE_SETTINGS)
+if set(get_args(ThresholdMetric)) != set(ATHLETE_SETTINGS):  # pragma: no cover - a programming error
+    raise RuntimeError("ThresholdMetric is out of sync with db.ATHLETE_SETTINGS")
 
 
 class ThresholdIn(BaseModel):
@@ -44,8 +53,22 @@ class ThresholdIn(BaseModel):
 
 
 def _read(request: Request) -> Iterator[sqlite3.Connection]:
-    with closing(open_readonly(request.app.state.settings.db_path)) as conn:
+    # FastAPI may run this dependency's setup, the endpoint and the cleanup on different
+    # worker threads; one request still uses the connection one step at a time.
+    with closing(open_readonly(request.app.state.settings.db_path, check_same_thread=False)) as conn:
         yield conn
+
+
+def host_name(value: str) -> str:
+    """``"localhost:8801"`` -> ``"localhost"``, ``"[::1]:8801"`` -> ``"::1"``."""
+    value = value.strip().lower()
+    if value.startswith("["):
+        return value[1 : value.find("]")] if "]" in value else value
+    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
+
+
+def origin_host(origin: str) -> str:
+    return host_name(origin.split("://", 1)[-1].split("/", 1)[0])
 
 
 # Module level: with postponed annotations FastAPI resolves these names from the module's globals.
@@ -60,16 +83,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         description="Read API over the local fitness-hub database, for the performance-tracker UI.",
     )
     app.state.settings = settings
+    allowed_origins = {o.rstrip("/") for o in settings.api_cors_origins}
+
+    @app.middleware("http")
+    async def same_machine_only(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        if host_name(request.headers.get("host", "")) not in LOOPBACK_HOSTS:
+            return JSONResponse(status_code=421, content={"detail": "only loopback Host names are served"})
+        origin = request.headers.get("origin")
+        if (
+            request.method not in ("GET", "HEAD", "OPTIONS")
+            and origin
+            and origin.rstrip("/") not in allowed_origins
+            and origin_host(origin) not in LOOPBACK_HOSTS
+        ):
+            return JSONResponse(status_code=403, content={"detail": f"writes are not allowed from {origin}"})
+        return await call_next(request)
+
+    # Added last so it runs first: preflight requests are answered before the checks above.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=list(settings.api_cors_origins),
+        allow_origins=sorted(allowed_origins),
         allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["Content-Type"],
     )
 
-    @app.exception_handler(ValueError)
-    async def bad_request(request: Request, exc: ValueError) -> JSONResponse:
+    @app.exception_handler(InputError)
+    async def bad_request(request: Request, exc: InputError) -> JSONResponse:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.exception_handler(RuntimeError)
+    async def unavailable(request: Request, exc: RuntimeError) -> JSONResponse:
+        # e.g. a database written by a newer fitness-hub
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
 
     @app.get("/api/health")
     def health(conn: Conn) -> dict[str, Any]:
@@ -95,7 +140,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         start_date: DateQuery = None,
         end_date: DateQuery = None,
         activity_type: Annotated[str | None, Query(description="Sport family or provider type")] = None,
-        limit: Annotated[int, Query(ge=1, le=5000)] = 500,
+        limit: Annotated[int, Query(ge=1, le=20000)] = 500,
     ) -> list[dict[str, Any]]:
         """Workouts newest first, one per workout, with TSS, IF, NP and work."""
         return queries.activities_with_metrics(conn, start_date, end_date, activity_type, limit)
@@ -183,16 +228,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         in_effect = asdict(thresholds_on(conn, day)) if day else None
         return {"values": queries.thresholds(conn), "on": day, "in_effect": in_effect}
 
-    def _rescore() -> dict[str, int]:
-        with Store(settings.db_path) as store:
-            return analyze(store)
-
     @app.post("/api/thresholds", status_code=201)
     def set_threshold(body: ThresholdIn) -> dict[str, Any]:
         """Set a manual value from a date on and re-score the affected activities."""
         with Store(settings.db_path) as store:
             store.set_athlete_setting(body.metric, body.effective_date, body.value, note=body.note)
-        return {"analysis": _rescore()}
+            return {"analysis": analyze(store)}
 
     @app.delete("/api/thresholds/{metric}/{effective_date}")
     def delete_threshold(metric: ThresholdMetric, effective_date: str) -> dict[str, Any]:
@@ -200,7 +241,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with Store(settings.db_path) as store:
             if not store.delete_athlete_setting(metric, effective_date):
                 raise HTTPException(status_code=404, detail=f"no manual {metric} value from {effective_date}")
-        return {"analysis": _rescore()}
+            return {"analysis": analyze(store)}
 
     return app
 
@@ -209,4 +250,4 @@ def serve(settings: Settings, host: str = "127.0.0.1", port: int = 8801) -> None
     import uvicorn
 
     check_http_host(host)
-    uvicorn.run(create_app(settings), host=host, port=port, log_level="warning")
+    uvicorn.run(create_app(settings), host=normalize_host(host), port=port, log_level="warning")

@@ -305,10 +305,16 @@ fitness-hub serve-api                  # http://127.0.0.1:8801/api, interactive 
 ```
 
 The [performance-tracker-ui](https://github.com/iamthanh/performance-tracker-ui) reads everything through this API.
-Like the MCP HTTP transport it has **no authentication**, binds only to loopback and refuses any other host. Browsers
-may call it only from the origins in `API_CORS_ORIGINS` (default: the UI's dev server, `http://localhost:5173` and
-`http://127.0.0.1:5173`). Reads use read-only connections. The only writes are threshold overrides, which re-score the
-affected activities.
+It has **no authentication**, so it only serves this machine:
+
+- It binds only to loopback and refuses any other host.
+- It answers only requests whose `Host` is a loopback name, so a web page cannot reach it through DNS rebinding.
+- Browsers may read responses only from the origins in `API_CORS_ORIGINS` (default: the UI's dev server,
+  `http://localhost:5173` and `http://127.0.0.1:5173`).
+- Writes with an `Origin` header must come from one of those or a loopback origin, and JSON bodies need
+  `Content-Type: application/json`.
+
+Reads use read-only connections. The only writes are threshold overrides, which re-score the affected activities.
 
 | Endpoint | Returns |
 |---|---|
@@ -326,7 +332,13 @@ affected activities.
 | `POST /api/thresholds` `{metric, effective_date, value, note?}` | Set a manual value; returns the re-scoring result |
 | `DELETE /api/thresholds/{metric}/{effective_date}` | Remove a manual value |
 
-Invalid dates or values return 400 (`{"detail": …}`), and unknown activities 404.
+Errors return `{"detail": …}`:
+
+- **422:** a malformed request (a missing or ill-typed parameter, or an invalid threshold body).
+- **400:** a well-formed request with a bad date or range. Ranges are limited to 50 years, and the training load to a
+  year ahead.
+- **404:** an unknown activity.
+- **503:** a database written by a newer fitness-hub.
 
 ## Manual verification checklist
 

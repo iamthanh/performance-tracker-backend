@@ -9,11 +9,12 @@ description = "Local-first hub for Strava, Garmin Connect and Google Health data
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi>=0.115,<1",
+    # 0.132 rejects JSON bodies without Content-Type: application/json (no CSRF via simple requests).
+    "fastapi>=0.132,<1",
     "fitdecode>=0.10,<1",
     "httpx>=0.27,<1",
     "numpy>=1.26,<3",
-    "uvicorn>=0.30",
+    "uvicorn>=0.30,<1",
     # FastMCP API of the 1.x line; 2.x was not reviewed.
     "mcp>=1.30,<2",
 ]

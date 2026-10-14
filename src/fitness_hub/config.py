@@ -137,7 +137,7 @@ class Settings:
             backfill_days=_int(merged, "BACKFILL_DAYS", 365),
             lookback_days=_int(merged, "LOOKBACK_DAYS", 7),
             garmin_activities=_bool(merged, "GARMIN_ACTIVITIES", False),
-            api_cors_origins=tuple(o.strip() for o in merged["API_CORS_ORIGINS"].split(",") if o.strip())
+            api_cors_origins=tuple(o.strip().rstrip("/") for o in merged["API_CORS_ORIGINS"].split(",") if o.strip())
             if merged.get("API_CORS_ORIGINS")
             else cls.api_cors_origins,
         )

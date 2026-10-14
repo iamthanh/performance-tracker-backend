@@ -76,6 +76,10 @@ def parse_duration_s(value: Any) -> float | None:
     return None
 
 
+class InputError(ValueError):
+    """Invalid input from a caller (a bad date, range or value), as opposed to a fault."""
+
+
 def parse_date(value: str | date, field: str = "date") -> date:
     if isinstance(value, datetime):
         return value.date()
@@ -84,7 +88,7 @@ def parse_date(value: str | date, field: str = "date") -> date:
     try:
         return date.fromisoformat(str(value).strip()[:10])
     except ValueError:
-        raise ValueError(f"{field} must be YYYY-MM-DD, got {value!r}") from None
+        raise InputError(f"{field} must be YYYY-MM-DD, got {value!r}") from None
 
 
 def date_from_parts(parts: Any) -> str | None:

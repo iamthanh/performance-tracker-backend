@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .util import now_utc_iso, parse_date, utc_iso
+from .util import InputError, now_utc_iso, parse_date, utc_iso
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS activities (
@@ -449,16 +449,17 @@ def migrate(conn: sqlite3.Connection) -> None:
             raise
 
 
-def open_readonly(path: Path | str) -> sqlite3.Connection:
+def open_readonly(path: Path | str, *, check_same_thread: bool = True) -> sqlite3.Connection:
     """Open a connection that cannot write: ``mode=ro`` plus ``query_only``.
 
     The file and schema are created first if missing so read tools work on a
-    fresh install.
+    fresh install. ``check_same_thread=False`` lets a web framework open the
+    connection in one thread and use or close it in another (never concurrently).
     """
     path = Path(path)
     if not path.exists():
         connect(path).close()
-    conn = _connect_ro(path)
+    conn = _connect_ro(path, check_same_thread)
     present = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     try:
         current = _check_not_newer(conn)
@@ -468,12 +469,14 @@ def open_readonly(path: Path | str) -> sqlite3.Connection:
     if not present.issuperset((*DATA_TABLES, "sync_state")) or current < SCHEMA_VERSION:
         conn.close()
         connect(path).close()  # apply the schema and any migrations, then reopen read-only
-        conn = _connect_ro(path)
+        conn = _connect_ro(path, check_same_thread)
     return conn
 
 
-def _connect_ro(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=30)
+def _connect_ro(path: Path, check_same_thread: bool = True) -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=30, check_same_thread=check_same_thread
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA query_only = ON")
@@ -613,12 +616,12 @@ class Store:
         self, metric: str, effective_date: str, value: float, origin: str = "manual", note: str | None = None
     ) -> None:
         if metric not in ATHLETE_SETTINGS:
-            raise ValueError(f"unknown athlete setting {metric!r}; expected one of {', '.join(ATHLETE_SETTINGS)}")
+            raise InputError(f"unknown athlete setting {metric!r}; expected one of {', '.join(ATHLETE_SETTINGS)}")
         if origin not in SETTING_ORIGINS:
-            raise ValueError(f"origin must be one of {', '.join(SETTING_ORIGINS)}")
+            raise InputError(f"origin must be one of {', '.join(SETTING_ORIGINS)}")
         value = float(value)
         if not math.isfinite(value) or value <= 0:
-            raise ValueError(f"{metric} must be a positive number, got {value!r}")
+            raise InputError(f"{metric} must be a positive number, got {value!r}")
         effective_date = parse_date(effective_date, "effective_date").isoformat()
         with self.conn:
             self.conn.execute(_SQL_SETTING, (metric, effective_date, origin, value, note, now_utc_iso()))
