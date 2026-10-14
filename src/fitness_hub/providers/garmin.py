@@ -35,7 +35,7 @@ TOKEN_FILE = "garmin_tokens.json"  # name garminconnect 0.3 uses inside a token 
 DAY_PAUSE_S = 0.4
 REAUTH = "run `fitness-hub auth garmin`"
 INSTALL_HINT = (
-    "the Garmin provider needs the optional dependency: pip install 'fitness-hub-core[garmin]' "
+    "the Garmin provider needs the optional dependency: pip install 'fitness-hub[garmin]' "
     "(garminconnect requires Python >= 3.12). The CSV importer works without it."
 )
 

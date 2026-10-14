@@ -26,3 +26,10 @@ jobs:
           pip install -e '.[dev,garmin]'
       - name: Test
         run: pytest
+      - name: CLI smoke test
+        env:
+          FITNESS_HUB_HOME: ${{ runner.temp }}/fitness-hub-home
+        run: |
+          fitness-hub --help
+          fitness-hub status
+          fitness-hub sync
