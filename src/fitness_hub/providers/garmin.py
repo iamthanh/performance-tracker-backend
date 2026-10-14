@@ -278,7 +278,7 @@ class GarminProvider:
             activities = lambda s, e, p: self._activities(client, store, s, e, p)  # noqa: E731
             results.append(self._run(store, window, full, "activities", activities))
         elif store.get_state(SOURCE, "activities"):
-            log.info("garmin activities are no longer synced by default; set GARMIN_ACTIVITIES=true to keep syncing them")
+            log.info("garmin activities are no longer synced by default; set GARMIN_ACTIVITIES=true to sync them")
         results.append(self._run(store, window, full, "daily", lambda s, e, p: self._daily(client, store, s, e, p)))
         results.append(self._run(store, window, full, "body", lambda s, e, p: self._body(client, store, s, e, p)))
         return results
