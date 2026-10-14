@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# fitness-hub: local data and secrets (never commit)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+tokens.json
+tokens.json.*
+garmin-tokens/
+garmin_tokens.json

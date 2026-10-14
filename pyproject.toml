@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fitness-hub"
+version = "0.1.0"
+description = "Local-first hub for Strava, Garmin Connect and Google Health data, stored in SQLite and served to Claude over MCP."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27,<1",
+    # FastMCP API of the 1.x line; 2.x was not reviewed.
+    "mcp>=1.30,<2",
+]
+
+[project.optional-dependencies]
+# garminconnect 0.3.x needs Python >= 3.12; on 3.11 the extra installs nothing
+# and the Garmin provider reports a clear error (CSV import still works).
+garmin = ["garminconnect>=0.3.17,<0.4; python_version >= '3.12'"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+fitness-hub = "fitness_hub.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fitness_hub"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

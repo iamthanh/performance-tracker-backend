@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install (the garmin extra is a no-op on 3.11)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev,garmin]'
+      - name: Test
+        run: pytest
+      - name: CLI smoke test
+        env:
+          FITNESS_HUB_HOME: ${{ runner.temp }}/fitness-hub-home
+        run: |
+          fitness-hub --help
+          fitness-hub status
+          fitness-hub sync
