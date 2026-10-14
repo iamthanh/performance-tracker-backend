@@ -106,8 +106,10 @@ body_battery_high, body_battery_low, spo2_pct, respiratory_rate_bpm, vo2_max`.
 **Where a stream starts:** at the window start if `--full` is set or the stream has no cursor yet. Otherwise it
 starts at `cursor − LOOKBACK_DAYS`, clamped to today. `--since` also pulls an incremental run back to that date.
 
-**Cursors:** Strava `activities` stores the newest `start_time` seen. Day-based streams store the window end. Garmin
-`daily` stores the last day that was fully synced, so a throttled run resumes where it stopped.
+**Cursors:** Strava `activities` stores the newest `start_time` seen. Day-based streams store the window end. When
+Garmin `daily` is throttled partway, it stores the last fully synced day as a partial cursor (`YYYY-MM-DD/partial`).
+The next run resumes on the following day, without the lookback overlap, so a throttled backfill always moves forward.
+Once a run completes, the cursor is a normal date again.
 
 **Consistency:** each batch of rows is written in its own transaction, and a cursor only moves when everything before
 it is stored. If a sync is killed partway, the database stays consistent and the next run fetches the gap again
@@ -191,9 +193,17 @@ rowing, strength, skiing, yoga). That way an `activity_type="cycling"` filter ma
 
 ## Read-only SQL
 
-`queries.run_select` accepts exactly one `SELECT`/`WITH` statement. As further protection, it installs a SQLite
-authorizer that only allows reads (so `WITH … DELETE`, `PRAGMA` and `ATTACH` are refused even on a read-write
-connection) and a 10-second time limit. The MCP server also runs it on a `mode=ro` + `PRAGMA query_only=ON` connection.
+`queries.run_select` accepts exactly one `SELECT`/`WITH` statement; SQLite's own parser rejects a second statement,
+so a `;` inside a string literal is fine. As further protection, it installs a SQLite authorizer that only allows reads.
+That means `WITH … DELETE`, `PRAGMA`, `ATTACH`, `load_extension` and `fts3_tokenizer` are refused even on a read-write
+connection.
+
+Runtime is bounded too. Every string or blob value is capped at 1 MB, and LIKE patterns at 1000 characters. A
+10-second time limit is checked every 1000 SQLite steps. The limit is best effort: one function call cannot be
+interrupted, but the size cap keeps the slowest case, `instr()` on two maximal strings, to about 6 s.
+
+The MCP server runs these queries in a worker thread, on a `mode=ro` + `PRAGMA query_only=ON` connection, so a slow
+query never blocks the other tools.
 
 ## Limitations
 

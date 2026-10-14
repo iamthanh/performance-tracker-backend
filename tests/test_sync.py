@@ -105,3 +105,16 @@ def test_concurrent_sync_is_refused(settings) -> None:
             run_sync(settings, providers={"strava": FakeProvider("strava")}, sources=["strava"], today=TODAY)
     # lock released afterwards
     assert run_sync(settings, providers={"strava": FakeProvider("strava")}, sources=["strava"], today=TODAY)[0].ok
+
+
+def test_corrupt_tokens_file_does_not_stop_other_providers(settings) -> None:
+    from fitness_hub.auth import TokenStore
+    from fitness_hub.providers.strava import StravaProvider
+
+    settings.ensure_home()
+    settings.tokens_path.write_text("{not json")
+    providers = {"strava": StravaProvider(settings, TokenStore(settings.tokens_path)), "garmin": FakeProvider("garmin")}
+    results = run_sync(settings, sources=["strava", "garmin"], providers=providers, today=TODAY)
+    by_source = {r.source: r for r in results}
+    assert "corrupt" in by_source["strava"].error
+    assert by_source["garmin"].ok and by_source["garmin"].rows == 1

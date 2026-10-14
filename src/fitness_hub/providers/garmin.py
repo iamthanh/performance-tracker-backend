@@ -25,7 +25,7 @@ from ..auth import AuthError
 from ..config import Settings
 from ..db import Store
 from ..util import daterange, epoch_ms_to_utc_iso, parse_date, to_float, utc_iso
-from . import StreamProgress, SyncResult, SyncWindow, run_stream
+from . import StreamProgress, SyncResult, SyncWindow, partial_cursor, run_stream
 
 log = logging.getLogger(__name__)
 
@@ -288,7 +288,7 @@ class GarminProvider:
             progress.rows += store.upsert_daily_metrics(map_stats(iso, stats) + sleep_metrics + map_hrv(iso, hrv))
             if session:
                 progress.rows += store.upsert_sleep_sessions([session])
-            progress.cursor = iso
+            progress.cursor = partial_cursor(day)  # replaced by the window end on success
             if index < len(days) - 1:
                 self.sleep(DAY_PAUSE_S)
 

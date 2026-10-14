@@ -126,23 +126,26 @@ def dedupe_activities(rows: Iterable[dict[str, Any]], window_s: int = DEDUPE_WIN
             untimed.append(row)
     timed.sort(key=lambda item: item[0])
 
-    clusters: list[tuple[datetime, list[dict[str, Any]]]] = []
-    open_from = 0  # clusters before this index are out of the window for good
+    # Each group tracks its latest start time: rows arrive in time order, so the
+    # gap to the nearest member is the gap to that latest one.
+    clusters: list[list[Any]] = []  # [latest_ts, members]
+    open_clusters: list[list[Any]] = []
     for ts, row in timed:
-        while open_from < len(clusters) and (ts - clusters[open_from][0]).total_seconds() > window_s:
-            open_from += 1
+        open_clusters = [c for c in open_clusters if (ts - c[0]).total_seconds() <= window_s]
         best = None
-        for index in range(open_from, len(clusters)):
-            anchor, members = clusters[index]
-            if any(m["source"] == row["source"] for m in members):
+        for cluster in open_clusters:
+            if any(m["source"] == row["source"] for m in cluster[1]):
                 continue
-            gap = abs((ts - anchor).total_seconds())
-            if gap <= window_s and (best is None or gap < best[0]):
-                best = (gap, index)
+            gap = (ts - cluster[0]).total_seconds()
+            if best is None or gap < best[0]:
+                best = (gap, cluster)
         if best is None:
-            clusters.append((ts, [row]))
+            cluster = [ts, [row]]
+            clusters.append(cluster)
+            open_clusters.append(cluster)
         else:
-            clusters[best[1]][1].append(row)
+            best[1][0] = ts
+            best[1][1].append(row)
 
     result = []
     for _, members in clusters:
@@ -409,23 +412,34 @@ _ALLOWED_ACTIONS = {
     sqlite3.SQLITE_FUNCTION,
     getattr(sqlite3, "SQLITE_RECURSIVE", 33),
 }
+# Functions that reach outside the data: tokenizer pointers, extension loading.
+_DENIED_FUNCTIONS = {"fts3_tokenizer", "load_extension"}
+# Caps that bound how long one function call (instr, replace, LIKE, ...) can run,
+# since the time limit is only checked between SQLite VM steps: the slowest case,
+# instr() on two maximal strings, takes ~6 s at 1 MB (and grows quadratically).
+# Stored raw payloads are a few hundred KB at most.
+SQL_MAX_VALUE_BYTES = 1_000_000
+SQL_MAX_LIKE_PATTERN = 1000
 
 
-def _authorizer(action: int, *args: Any) -> int:
-    return sqlite3.SQLITE_OK if action in _ALLOWED_ACTIONS else sqlite3.SQLITE_DENY
+def _authorizer(action: int, arg1: Any, arg2: Any, *rest: Any) -> int:
+    if action not in _ALLOWED_ACTIONS:
+        return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_FUNCTION and str(arg2).lower() in _DENIED_FUNCTIONS:
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
 
 
 def validate_select(sql: str) -> str:
-    """Return the statement without trailing semicolons, or raise ValueError
-    unless it is a single ``SELECT``/``WITH`` statement."""
+    """Return the query, or raise ValueError unless it starts with ``SELECT``
+    or ``WITH``. A second statement is rejected by SQLite itself when the
+    query is prepared (it parses quotes and comments correctly)."""
     if not isinstance(sql, str) or not sql.strip():
         raise ValueError("sql must be a non-empty string")
-    body = _LEADING_COMMENTS.sub("", sql, count=1).strip().rstrip(";").rstrip()
+    body = _LEADING_COMMENTS.sub("", sql, count=1).strip()
     first = re.match(r"[A-Za-z]+", body)
     if not first or first.group(0).lower() not in ("select", "with"):
         raise ValueError("only a single SELECT or WITH query is allowed")
-    if ";" in body:
-        raise ValueError("only a single statement is allowed (remove ';')")
     return body
 
 
@@ -438,27 +452,39 @@ def _jsonable(value: Any) -> Any:
 def run_select(conn: sqlite3.Connection, sql: str, limit: int = 200) -> dict[str, Any]:
     """Run one read-only query: ``{columns, rows, truncated}``.
 
-    Defense in depth: statement validation, a SQLite authorizer that only allows
-    reads, a time limit, and (in the MCP server) a ``mode=ro`` +
-    ``query_only`` connection.
+    Defense in depth: statement validation; SQLite rejecting a second
+    statement; an authorizer that only allows reads; value-size and
+    LIKE-pattern caps; a time limit checked every 1000 VM steps (best effort:
+    it cannot interrupt a single function call); and, in the MCP server, a
+    ``mode=ro`` + ``query_only`` connection used from a worker thread.
     """
     body = validate_select(sql)
     limit = max(1, min(int(limit), MAX_SQL_LIMIT))
     deadline = time.monotonic() + SQL_TIMEOUT_S
+    old_length = conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, SQL_MAX_VALUE_BYTES)
+    old_like = conn.setlimit(sqlite3.SQLITE_LIMIT_LIKE_PATTERN_LENGTH, SQL_MAX_LIKE_PATTERN)
     conn.set_authorizer(_authorizer)
-    conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10_000)
+    conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 1000)
     try:
         cursor = conn.execute(body)
         columns = [c[0] for c in cursor.description or ()]
         fetched = cursor.fetchmany(limit + 1)
+    except sqlite3.ProgrammingError as exc:
+        if "one statement" in str(exc):
+            raise ValueError("only a single statement is allowed") from None
+        raise ValueError(f"SQL error: {exc}") from None
     except sqlite3.DatabaseError as exc:
         if "interrupted" in str(exc):
             raise ValueError(f"query exceeded the {SQL_TIMEOUT_S:.0f}s time limit") from None
         if "not authorized" in str(exc) or "prohibited" in str(exc):
             raise ValueError(f"query not allowed: {exc}") from None
+        if "too big" in str(exc):
+            raise ValueError(f"SQL error: {exc} (query_sql caps each value at 1 MB)") from None
         raise ValueError(f"SQL error: {exc}") from None
     finally:
         conn.set_authorizer(None)
         conn.set_progress_handler(None, 0)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, old_length)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_LIKE_PATTERN_LENGTH, old_like)
     rows = [[_jsonable(v) for v in tuple(r)] for r in fetched[:limit]]
     return {"columns": columns, "rows": rows, "truncated": len(fetched) > limit}

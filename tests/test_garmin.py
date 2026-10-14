@@ -150,15 +150,53 @@ def test_daily_stops_on_first_failure_and_resumes(settings, store) -> None:
     assert results["body"].ok  # later streams still run
     assert ("stats", ("2026-10-03",)) not in fake.calls
     state = {s["stream"]: s for s in store.sync_states()}["daily"]
-    assert state["cursor"] == "2026-10-01"  # last fully synced day
+    assert state["cursor"] == "2026-10-01/partial"  # last fully synced day
     assert "2026-10-02" in state["last_error"]
 
-    # next run resumes from the cursor minus the lookback, not the window start
+    # next run resumes on the day it stopped (no lookback, not the window start)
     later = SyncWindow(date(2026, 1, 1), date(2026, 10, 3))
     fake2 = FakeGarmin()
     make(settings, fake2).sync(store, later)
     days = [args[0] for name, args in fake2.calls if name == "stats"]
-    assert days[0] == "2026-09-24" and days[-1] == "2026-10-03"
+    assert days == ["2026-10-02", "2026-10-03"]
+    assert store.get_cursor("garmin", "daily") == "2026-10-03"  # complete: a normal cursor again
+
+
+class ThrottledGarmin(FakeGarmin):
+    """Allows `budget` days of stats per run, then raises like Garmin's throttle."""
+
+    def __init__(self, budget: int):
+        super().__init__()
+        self.budget = budget
+
+    def get_stats(self, day: str) -> dict:
+        if self.budget == 0:
+            raise ConnectionError("429 Too Many Requests")
+        self.budget -= 1
+        return super().get_stats(day)
+
+
+def test_throttled_backfill_always_moves_forward(settings, store) -> None:
+    # lookback (7 days) is larger than what Garmin allows per run (3 days)
+    window = SyncWindow(date(2026, 9, 1), date(2026, 9, 20))
+    fetched: list[str] = []
+    for _ in range(10):
+        fake = ThrottledGarmin(budget=3)
+        results = {r.stream: r for r in make(settings, fake).sync(store, window)}
+        fetched += [args[0] for name, args in fake.calls if name == "stats"]
+        if results["daily"].ok:
+            break
+    days = sorted({d for d in fetched})
+    assert results["daily"].ok
+    assert days[0] == "2026-09-01" and days[-1] == "2026-09-20" and len(days) == 20
+    assert store.get_cursor("garmin", "daily") == "2026-09-20"
+
+
+def test_partial_cursor_never_skips_or_rewinds_window_start() -> None:
+    window = SyncWindow(date(2026, 9, 1), date(2026, 9, 20))
+    assert window.start_for("2026-09-05/partial", 7, False) == date(2026, 9, 6)
+    assert window.start_for("2026-09-20/partial", 7, False) == date(2026, 9, 20)  # clamped to end
+    assert window.start_for("2026-09-05/partial", 7, True) == date(2026, 9, 1)  # --full restarts
 
 
 def test_login_failure_is_recorded(settings, store) -> None:

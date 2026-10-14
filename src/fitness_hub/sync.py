@@ -96,12 +96,12 @@ def run_sync(
         with sync_lock(settings), Store(settings.db_path) as store:
             for name in names:
                 provider = active[name]
-                if not provider.configured():
-                    emit(f"{name}: skipped (not authorized; run `fitness-hub auth {AUTH_COMMAND[name]}`)")
-                    results.append(SyncResult(name, "*", skipped=True))
-                    continue
-                emit(f"{name}: syncing {window.start} .. {window.end}{' (full)' if full else ''}")
                 try:
+                    if not provider.configured():
+                        emit(f"{name}: skipped (not authorized; run `fitness-hub auth {AUTH_COMMAND[name]}`)")
+                        results.append(SyncResult(name, "*", skipped=True))
+                        continue
+                    emit(f"{name}: syncing {window.start} .. {window.end}{' (full)' if full else ''}")
                     for result in provider.sync(store, window, full):
                         results.append(result)
                         status = f"ERROR: {result.error}" if result.error else "ok"

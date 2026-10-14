@@ -82,6 +82,16 @@ def test_dedupe_keeps_same_source_and_far_apart_rows() -> None:
     assert len(queries.dedupe_activities(rows)) == 3
 
 
+def test_dedupe_links_to_nearest_member_not_first() -> None:
+    rows = [
+        act("strava", "s", "2026-10-13T09:58:00Z", "Ride", distance_m=40000),
+        act("garmin", "g", "2026-10-13T10:00:30Z", "road_biking", distance_m=40000),  # 150 s after strava
+        act("google_health", "x", "2026-10-13T10:01:30Z", "OUTDOOR_BIKE", distance_m=40000),  # 60 s after garmin
+    ]
+    [kept] = queries.dedupe_activities(rows)
+    assert kept["source"] == "garmin" and kept["also_recorded_by"] == ["google_health", "strava"]
+
+
 def test_dedupe_strava_only_and_csv_export() -> None:
     rows = [
         act("strava", "s", "2026-10-13T06:00:00Z", "Ride"),
@@ -203,6 +213,9 @@ def test_run_select_returns_rows(seeded: Store, settings) -> None:
         "ATTACH DATABASE '/tmp/x.db' AS x",
         "SELECT 1; DELETE FROM activities",
         "select 1;drop table activities;",
+        "SELECT ';'; DELETE FROM activities",
+        "SELECT fts3_tokenizer('simple')",
+        "SELECT load_extension('x')",
         "/* hi */ DELETE FROM activities",
         "WITH x AS (SELECT 1) DELETE FROM activities",
         "WITH x AS (SELECT 1) INSERT INTO sync_state (source, stream) VALUES ('a', 'b')",
@@ -216,6 +229,20 @@ def test_run_select_cannot_modify(seeded: Store, sql: str) -> None:
         queries.run_select(seeded.conn, sql)
     assert seeded.row_counts() == before
     assert seeded.conn.execute("SELECT COUNT(*) FROM sync_state").fetchone()[0] == 0
+
+
+def test_run_select_semicolons_inside_literals_are_fine(seeded: Store) -> None:
+    out = queries.run_select(seeded.conn, "SELECT COUNT(*) FROM activities WHERE name LIKE '%;%' -- ; trailing\n;")
+    assert out["rows"] == [[0]]
+
+
+def test_run_select_caps_huge_values(seeded: Store) -> None:
+    with pytest.raises(ValueError, match="too big"):
+        queries.run_select(seeded.conn, "SELECT length(zeroblob(50000000))")
+    with pytest.raises(ValueError):
+        queries.run_select(seeded.conn, "SELECT 'a' LIKE '" + "%a" * 1000 + "'")
+    # limits are restored afterwards
+    assert seeded.conn.execute("SELECT length(zeroblob(50000000))").fetchone()[0] == 50_000_000
 
 
 def test_run_select_time_limit(seeded: Store, monkeypatch: pytest.MonkeyPatch) -> None:

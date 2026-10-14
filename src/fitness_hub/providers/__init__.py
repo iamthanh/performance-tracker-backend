@@ -16,6 +16,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Suffix of a cursor recorded by a stream that stopped partway (e.g. Garmin
+# throttling). The next run resumes on the following day, without the
+# lookback overlap, so a throttled backfill always moves forward.
+PARTIAL_SUFFIX = "/partial"
+
+
+def partial_cursor(day: date) -> str:
+    return day.isoformat() + PARTIAL_SUFFIX
+
 
 @dataclass
 class SyncResult:
@@ -46,14 +55,18 @@ class SyncWindow:
     def start_for(self, cursor: str | None, lookback_days: int, full: bool) -> date:
         """First day a stream must fetch.
 
-        ``full`` or no cursor: the window start. Otherwise the cursor minus the
-        lookback overlap, clamped to the window end (and extended back to an
-        explicit ``--since``).
+        ``full`` or no cursor: the window start. A partial cursor (see
+        :data:`PARTIAL_SUFFIX`): the day after it. Otherwise the cursor minus
+        the lookback overlap. Clamped to the window end, and extended back to
+        an explicit ``--since``.
         """
         last = cursor_date(cursor)
         if full or last is None:
             return self.start
-        start = min(last - timedelta(days=lookback_days), self.end)
+        if cursor and cursor.endswith(PARTIAL_SUFFIX):
+            start = min(last + timedelta(days=1), self.end)
+        else:
+            start = min(last - timedelta(days=lookback_days), self.end)
         if self.explicit_start:
             start = min(start, self.start)
         return start
@@ -64,7 +77,8 @@ class StreamProgress:
     """Mutable progress a stream reports while it runs.
 
     ``cursor`` is persisted on success, and also on failure: a stream only
-    sets it mid-run when everything before it is safely stored.
+    sets it mid-run (as a :func:`partial_cursor`) when everything up to that
+    day is safely stored.
     """
 
     rows: int = 0
