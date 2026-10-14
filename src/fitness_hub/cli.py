@@ -98,8 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", default="127.0.0.1", help="HTTP bind address (loopback only)")
     serve.add_argument("--port", type=int, default=8800)
 
-    api = sub.add_parser("serve-api", help="serve the read API for the web UI on localhost")
-    api.add_argument("--host", default="127.0.0.1", help="bind address (loopback only)")
+    api = sub.add_parser("serve-api", help="serve the read API for the web UI")
+    api.add_argument(
+        "--host",
+        default=None,
+        help="bind address (default API_HOST or 127.0.0.1); 0.0.0.0 serves the local network, without authentication",
+    )
     api.add_argument("--port", type=int, default=8801)
 
     run = sub.add_parser("run", help="daemon: sync every N minutes (optionally also serve MCP over HTTP)")
@@ -269,10 +273,7 @@ def cmd_thresholds(settings: Settings, args: argparse.Namespace) -> int:
 
 def cmd_serve_api(settings: Settings, args: argparse.Namespace) -> int:
     from .api import serve
-    from .mcp_server import check_http_host
 
-    check_http_host(args.host)
-    print(f"fitness-hub API on http://{args.host}:{args.port}/api (docs: /docs). Ctrl-C to stop.", file=sys.stderr)
     serve(settings, host=args.host, port=args.port)
     return 0
 
