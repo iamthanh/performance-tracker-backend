@@ -118,3 +118,14 @@ def test_corrupt_tokens_file_does_not_stop_other_providers(settings) -> None:
     by_source = {r.source: r for r in results}
     assert "corrupt" in by_source["strava"].error
     assert by_source["garmin"].ok and by_source["garmin"].rows == 1
+
+
+def test_provider_crash_error_clears_after_a_clean_run(settings) -> None:
+    crashing = FakeProvider("strava", crash=True)
+    run_sync(settings, sources=["strava"], providers={"strava": crashing}, today=TODAY)
+    with Store(settings.db_path) as store:
+        assert "provider bug" in store.get_state("strava", "sync")["last_error"]
+    crashing.crash = False
+    run_sync(settings, sources=["strava"], providers={"strava": crashing}, today=TODAY)
+    with Store(settings.db_path) as store:
+        assert store.get_state("strava", "sync")["last_error"] is None

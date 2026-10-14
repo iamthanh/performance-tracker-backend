@@ -20,6 +20,8 @@ log = logging.getLogger(__name__)
 
 PROVIDER_NAMES = ("strava", "garmin", "google_health")
 AUTH_COMMAND = {"strava": "strava", "garmin": "garmin", "google_health": "google"}
+# sync_state stream that records a provider crashing outside its own streams.
+CRASH_STREAM = "sync"
 
 
 class SyncInProgress(RuntimeError):
@@ -106,11 +108,13 @@ def run_sync(
                         results.append(result)
                         status = f"ERROR: {result.error}" if result.error else "ok"
                         emit(f"  {name}/{result.stream}: {result.rows} rows, {status}")
+                    if store.get_state(name, CRASH_STREAM):
+                        store.record_sync(name, CRASH_STREAM)  # the provider ran cleanly: clear the old crash
                 except Exception as exc:  # noqa: BLE001 - a provider bug must not stop the others
                     message = describe_error(exc)
                     log.debug("provider %s crashed", name, exc_info=True)
-                    store.record_sync(name, "sync", error=message)
-                    results.append(SyncResult(name, "sync", error=message))
+                    store.record_sync(name, CRASH_STREAM, error=message)
+                    results.append(SyncResult(name, CRASH_STREAM, error=message))
                     emit(f"  {name}: ERROR: {message}")
     finally:
         if owned:

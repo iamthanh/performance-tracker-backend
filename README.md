@@ -12,7 +12,7 @@ Fitbit Web API) into a SQLite database on your machine. It then lets **Claude** 
 
 This repository holds all of the Python side: storage, provider sync, the `fitness-hub` CLI and the MCP server. A read
 API for the web UI will also live here. The UI itself lives in
-[performance-tracker](https://github.com/iamthanh/performance-tracker). The design spec is [PLAN.md](PLAN.md).
+[performance-tracker-ui](https://github.com/iamthanh/performance-tracker-ui). The design spec is [PLAN.md](PLAN.md).
 
 ## Install
 
@@ -129,7 +129,8 @@ in March 2026, and the library's API changes between versions.
 fitness-hub import-garmin-csv ~/Downloads/Activities.csv --distance-unit km --timezone Europe/Berlin
 ```
 
-Use `--distance-unit mi` if your account shows miles. With that setting, ascent is treated as feet. `--timezone` is
+Use `--distance-unit mi` if your account shows miles. With that setting, ascent is treated as feet. Swims are
+exported in metres (yards on imperial accounts), and the importer handles that. `--timezone` is
 the zone the times in the CSV are in. Without it the times have no zone, and matching CSV activities against
 Strava/Google is unreliable.
 
@@ -332,7 +333,8 @@ away. Strava's 429 is never retried, because its window is 15 minutes; the strea
 - OAuth authorization code with scopes `read,activity:read_all,profile:read_all` and redirect
   `http://localhost:8765/callback`. The app's *Authorization Callback Domain* must be `localhost`.
 - The access token is refreshed when it expires within 60 s. **Refresh tokens rotate**, so the newest one is always saved.
-- Uses `GET /athlete/activities?after=…&per_page=200&page=N` until a short page arrives. Summary activities have
+- Uses `GET /athlete/activities?after=…&per_page=200&page=N` until an **empty** page arrives (Strava can return
+  short pages before the end). Summary activities have
   no calories, so `calories` is `NULL` for Strava.
 - Limits are about 100 requests per 15 minutes and 1000 per day. A 429 stops the stream, keeps the rows already
   written and leaves the cursor where it was.
@@ -376,19 +378,25 @@ away. Strava's 429 is never retried, because its window is 15 minutes; the strea
   - `activities`: `get_activities_by_date(start, end)`.
   - `daily`: for each day, `get_stats` (steps, resting HR, stress, body battery, calories, distance, floors, SpO2,
     respiration), `get_sleep_data` (a session with stages plus `sleep_score`) and `get_hrv_data` (`hrv_rmssd_ms`;
-    errors are ignored because many devices have no HRV). It pauses 0.4 s between days and stops at the first failure.
-  - `body`: `get_body_composition(start, end)`; weights arrive in grams and are converted to kg.
+    many devices have no HRV, so HRV errors only skip that day's HRV). It pauses 0.4 s between days.
+    - A day with no data is skipped, so the stream doesn't stall on days before you owned the watch.
+      garminconnect reports such days as "No data received" or a privacy-protected summary.
+    - Throttling, authentication errors and server errors stop the stream at that day.
+  - `body`: `get_body_composition(start, end)`; weights arrive in grams and are converted to kg. Times come from
+    `timestampGMT`, because `date` is local time encoded as epoch ms.
 - **CSV fallback:** in Garmin Connect on the web, go to Activities and choose **Export CSV**, then import the file with
   `import_garmin_csv(store, path, distance_unit="km"|"mi", timezone=None)`. It expects English column names, handles
-  thousands separators and `h:mm:ss` times, and converts miles and feet when `distance_unit` is `mi`. Without a
+  thousands separators and `h:mm:ss` times, reads swim distances as metres or yards, and converts miles and feet
+  when `distance_unit` is `mi`. Without a
   timezone, start times are stored without a zone.
 
 ## Cross-service de-duplication (at read time)
 
 The same workout often shows up two or three times (watch → Garmin → Strava, and the same watch through Google Health).
-`queries.dedupe_activities` groups activities from **different** sources whose start times are within **180 s** of each
-other. It keeps one per group, preferring **garmin > google_health > strava > garmin_export**, and lists the other
-sources in `also_recorded_by`. Source rows are never deleted. `list_activities` de-duplicates unless a `source` is given,
+`queries.dedupe_activities` keeps one activity per workout, preferring **garmin > google_health > strava >
+garmin_export**, and lists the other sources in `also_recorded_by`. An activity from a **different** source is treated
+as a duplicate when it starts within **180 s** of the activity that is kept. Groups are seeded in priority order, so
+they cannot chain into one long group. Source rows are never deleted. `list_activities` de-duplicates unless a `source` is given,
 and `activity_summary` always does, so totals never count a workout twice. Daily metrics are **not** merged, because the
 same metric can legitimately differ between sources.
 
@@ -429,7 +437,7 @@ query never blocks the other tools.
 
 ## Future work
 
-- **Read API for the web UI** ([performance-tracker](https://github.com/iamthanh/performance-tracker)): an
+- **Read API for the web UI** ([performance-tracker-ui](https://github.com/iamthanh/performance-tracker-ui)): an
   authenticated HTTP API in this repo, built on `queries.py`. The MCP HTTP transport is not suitable for this: it has
   no authentication and speaks MCP rather than a normal web API.
 

@@ -93,12 +93,19 @@ def test_two_page_pagination(settings, tokens, store) -> None:
     [result] = make_provider(settings, tokens, fake).sync(store, WINDOW)
     assert result.ok and result.rows == 203
     pages = [int(r.url.params["page"]) for r in fake.activity_requests()]
-    assert pages == [1, 2]
+    assert pages == [1, 2, 3]  # a short page is not the end; only an empty one is
     params = fake.activity_requests()[0].url.params
     assert params["per_page"] == "200"
     assert params["after"] == str(int(1_789_344_000))  # 2026-09-14T00:00:00Z
     assert store.row_counts()["activities"] == 203
     assert store.get_cursor("strava", "activities") == "2026-10-10T07:22:00Z"
+
+
+def test_short_page_before_the_end_does_not_stop_paging(settings, tokens, store) -> None:
+    fake = FakeStrava([[activity(i, day=2) for i in range(197)], [activity(300 + i, day=3) for i in range(4)]])
+    [result] = make_provider(settings, tokens, fake).sync(store, WINDOW)
+    assert result.ok and result.rows == 201
+    assert [int(r.url.params["page"]) for r in fake.activity_requests()] == [1, 2, 3]
 
 
 def test_incremental_rerun_is_idempotent(settings, tokens, store) -> None:

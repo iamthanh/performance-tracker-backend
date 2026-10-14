@@ -28,7 +28,7 @@ from ..config import Settings
 from ..db import Store
 from ..http import ApiError, new_client, request_json
 from ..util import civil_date, parse_duration_s, parse_ts, to_float, ts_to_utc_iso
-from . import StreamProgress, SyncResult, SyncWindow, run_stream
+from . import StreamProgress, SyncResult, SyncWindow, run_day_stream, run_stream
 
 log = logging.getLogger(__name__)
 
@@ -426,7 +426,12 @@ class GoogleHealthProvider:
 
     def daily_rollup(self, data_type: str, start: date, end_exclusive: date) -> list[dict]:
         body = {"range": {"start": civil_datetime(start), "end": civil_datetime(end_exclusive)}, "windowSizeDays": 1}
-        result = self._request("POST", f"/users/me/dataTypes/{data_type}/dataPoints:dailyRollUp", json=body) or {}
+        result = (
+            self._request(
+                "POST", f"/users/me/dataTypes/{data_type}/dataPoints:dailyRollUp", json=body, idempotent=True
+            )
+            or {}
+        )
         return result.get("rollupDataPoints") or []
 
     # -- streams --------------------------------------------------------------------
@@ -477,12 +482,9 @@ class GoogleHealthProvider:
         stream: str,
         body: Callable[[Store, date, date, StreamProgress], None],
     ) -> SyncResult:
-        def func(progress: StreamProgress) -> None:
-            start = window.start_for(store.get_cursor(SOURCE, stream), self.settings.lookback_days, full)
-            body(store, start, window.end, progress)
-            progress.cursor = window.end.isoformat()
-
-        return run_stream(store, SOURCE, stream, func)
+        return run_day_stream(
+            store, SOURCE, stream, window, self.settings.lookback_days, full, lambda s, e, p: body(store, s, e, p)
+        )
 
     def _list_stream(
         self,

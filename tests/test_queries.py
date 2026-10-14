@@ -92,6 +92,16 @@ def test_dedupe_links_to_nearest_member_not_first() -> None:
     assert kept["source"] == "garmin" and kept["also_recorded_by"] == ["google_health", "strava"]
 
 
+def test_dedupe_does_not_chain_beyond_the_window() -> None:
+    rows = [
+        act("garmin", "g", "2026-10-13T07:00:00Z", "road_biking"),
+        act("strava", "s", "2026-10-13T07:02:50Z", "Ride"),  # 170 s after garmin
+        act("google_health", "x", "2026-10-13T07:05:40Z", "OUTDOOR_BIKE"),  # 340 s after garmin
+    ]
+    kept = queries.dedupe_activities(rows)
+    assert [(k["source"], k["also_recorded_by"]) for k in kept] == [("garmin", ["strava"]), ("google_health", [])]
+
+
 def test_dedupe_strava_only_and_csv_export() -> None:
     rows = [
         act("strava", "s", "2026-10-13T06:00:00Z", "Ride"),

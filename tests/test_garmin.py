@@ -313,3 +313,114 @@ def test_parse_hms() -> None:
     assert garmin.parse_hms("02:03") == 123
     assert garmin.parse_hms("00:45.5") == 45.5
     assert garmin.parse_hms("--") is None
+
+
+class GarminConnectConnectionError(Exception):
+    """Same name as garminconnect's exception (the provider matches by class name)."""
+
+
+class GarminConnectAuthenticationError(Exception):
+    pass
+
+
+class GarminConnectTooManyRequestsError(Exception):
+    pass
+
+
+class FlakyGarmin(FakeGarmin):
+    def __init__(self, stats_errors: dict[str, Exception], hrv_errors: dict[str, Exception] | None = None):
+        super().__init__()
+        self.stats_errors = stats_errors
+        self.hrv_errors = hrv_errors or {}
+
+    def get_stats(self, day: str) -> dict:
+        if day in self.stats_errors:
+            self.calls.append(("stats", (day,)))
+            raise self.stats_errors[day]
+        return super().get_stats(day)
+
+    def get_hrv_data(self, day: str) -> dict:
+        if day in self.hrv_errors:
+            raise self.hrv_errors[day]
+        return super().get_hrv_data(day)
+
+
+def test_days_without_data_do_not_stall_the_daily_stream(settings, store) -> None:
+    # garminconnect raises these for a day with no summary (e.g. before the watch was owned)
+    # and for a privacy-protected day: skip the day's stats, keep going.
+    fake = FlakyGarmin(
+        {
+            "2026-10-01": GarminConnectConnectionError("No data received from server"),
+            "2026-10-02": GarminConnectAuthenticationError("Authentication error"),
+        }
+    )
+    results = {r.stream: r for r in make(settings, fake).sync(store, WINDOW)}
+    assert results["daily"].ok
+    days = [args[0] for name, args in fake.calls if name == "stats"]
+    assert days == ["2026-10-01", "2026-10-02", "2026-10-03"]
+    steps = store.conn.execute("SELECT date FROM daily_metrics WHERE metric = 'steps'").fetchall()
+    assert [r[0] for r in steps] == ["2026-10-03"]
+    assert store.row_counts()["sleep_sessions"] == 2  # sleep for the empty days is still stored
+    assert store.get_cursor("garmin", "daily") == "2026-10-03"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        GarminConnectTooManyRequestsError("Rate limit exceeded"),
+        GarminConnectAuthenticationError("Authentication failed: 401"),
+        GarminConnectConnectionError("API client error (500)"),
+    ],
+)
+def test_throttling_auth_and_server_errors_stop_at_that_day(settings, store, error) -> None:
+    fake = FlakyGarmin({"2026-10-02": error})
+    results = {r.stream: r for r in make(settings, fake).sync(store, WINDOW)}
+    assert not results["daily"].ok and "2026-10-02" in results["daily"].error
+    assert store.get_cursor("garmin", "daily") == "2026-10-01/partial"
+
+
+def test_hrv_throttling_stops_but_other_hrv_errors_are_skipped(settings, store) -> None:
+    fake = FlakyGarmin({}, hrv_errors={"2026-10-02": GarminConnectTooManyRequestsError("Rate limit exceeded")})
+    results = {r.stream: r for r in make(settings, fake).sync(store, WINDOW)}
+    assert not results["daily"].ok
+    assert store.get_cursor("garmin", "daily") == "2026-10-01/partial"  # 10-02 will be fetched again
+    # FakeGarmin raises KeyError for HRV on 10-01: that day was still stored
+    assert store.conn.execute("SELECT COUNT(*) FROM daily_metrics WHERE date = '2026-10-01'").fetchone()[0] > 0
+
+
+def test_classify_error() -> None:
+    assert garmin.classify_error(GarminConnectTooManyRequestsError("x")) == "throttled"
+    assert garmin.classify_error(ConnectionError("429 Too Many Requests")) == "throttled"
+    assert garmin.classify_error(GarminConnectConnectionError("No data received from server")) == "no_data"
+    assert garmin.classify_error(GarminConnectAuthenticationError("Authentication error")) == "no_data"
+    assert garmin.classify_error(GarminConnectAuthenticationError("Authentication failed: x")) == "auth"
+    assert garmin.classify_error(GarminConnectConnectionError("timeout")) == "error"
+
+
+def test_body_uses_utc_timestamp_over_local_date() -> None:
+    # `date` is local wall-clock time as epoch ms (UTC-7: 22:00 local on Oct 10);
+    # timestampGMT is the real instant (05:00Z on Oct 11).
+    rows = garmin.map_body(
+        {"dateWeightList": [{"date": 1_791_669_600_000, "timestampGMT": 1_791_694_800_000, "weight": 70000.0}]}
+    )
+    assert rows[0]["ts"] == "2026-10-11T05:00:00Z"
+    assert garmin.map_body({"dateWeightList": [{"date": 1_791_669_600_000, "weight": 70000.0}]})[0]["ts"] == (
+        "2026-10-10T22:00:00Z"
+    )
+
+
+def test_csv_swim_distances_are_metres_or_yards(tmp_path: Path, store) -> None:
+    path = tmp_path / "Activities.csv"
+    path.write_text(
+        "Activity Type,Date,Title,Distance,Calories,Time\n"
+        'Pool Swim,2026-10-02 06:00:00,Swim,"1,500",400,0:30:00\n'
+        "Running,2026-10-03 07:00:00,Run,10.5,650,0:50:00\n",
+        encoding="utf-8",
+    )
+    garmin.import_garmin_csv(store, path)
+    got = dict(store.conn.execute("SELECT activity_type, distance_m FROM activities").fetchall())
+    assert got == {"Pool Swim": 1500.0, "Running": 10500.0}
+    garmin.import_garmin_csv(store, path, distance_unit="mi")
+    got = dict(store.conn.execute("SELECT activity_type, distance_m FROM activities").fetchall())
+    assert got["Pool Swim"] == pytest.approx(1500 * 0.9144)
+    assert got["Running"] == pytest.approx(10.5 * 1609.344)

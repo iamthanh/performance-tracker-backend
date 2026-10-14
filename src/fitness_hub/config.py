@@ -33,8 +33,8 @@ def parse_dotenv(text: str) -> dict[str, str]:
         if not sep or not key:
             continue
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
+        if value[:1] in ("'", '"') and value.find(value[0], 1) != -1:
+            value = value[1 : value.find(value[0], 1)]  # anything after the closing quote is ignored
         elif " #" in value:
             value = value.split(" #", 1)[0].rstrip()
         values[key] = value

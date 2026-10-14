@@ -10,6 +10,7 @@ import json
 import re
 import sqlite3
 import time
+from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -112,10 +113,17 @@ def _priority(source: str) -> int:
 
 
 def dedupe_activities(rows: Iterable[dict[str, Any]], window_s: int = DEDUPE_WINDOW_S) -> list[dict[str, Any]]:
-    """Collapse rows from *different* sources whose start times are within
-    ``window_s`` seconds. Keeps the highest-priority source
-    (garmin > google_health > strava > garmin_export) and lists the others in
-    ``also_recorded_by``. Output is sorted by start time, oldest first."""
+    """Merge rows from *different* sources that record the same workout.
+
+    Rows are visited in source-priority order (garmin > google_health > strava
+    > garmin_export), so each group is seeded by the activity it keeps. A row
+    joins the group whose kept activity starts nearest to it, provided that is
+    within ``window_s`` seconds and the group has no row from the same source;
+    otherwise it starts a new group. Every merged duplicate therefore starts
+    within ``window_s`` of the kept activity, and groups cannot chain. The kept
+    row lists the other sources in ``also_recorded_by``. Output is sorted by
+    start time, oldest first.
+    """
     timed: list[tuple[datetime, dict[str, Any]]] = []
     untimed: list[dict[str, Any]] = []
     for row in rows:
@@ -124,32 +132,28 @@ def dedupe_activities(rows: Iterable[dict[str, Any]], window_s: int = DEDUPE_WIN
             timed.append((ts, row))
         else:
             untimed.append(row)
-    timed.sort(key=lambda item: item[0])
+    timed.sort(key=lambda item: (_priority(item[1]["source"]), item[0]))
 
-    # Each group tracks its latest start time: rows arrive in time order, so the
-    # gap to the nearest member is the gap to that latest one.
-    clusters: list[list[Any]] = []  # [latest_ts, members]
-    open_clusters: list[list[Any]] = []
+    window = timedelta(seconds=window_s)
+    anchors: list[datetime] = []  # start time of each group's kept row, sorted
+    groups: list[list[dict[str, Any]]] = []  # parallel to anchors; first member is kept
     for ts, row in timed:
-        open_clusters = [c for c in open_clusters if (ts - c[0]).total_seconds() <= window_s]
-        best = None
-        for cluster in open_clusters:
-            if any(m["source"] == row["source"] for m in cluster[1]):
+        best: tuple[float, int] | None = None
+        for index in range(bisect_left(anchors, ts - window), bisect_right(anchors, ts + window)):
+            if any(m["source"] == row["source"] for m in groups[index]):
                 continue
-            gap = (ts - cluster[0]).total_seconds()
+            gap = abs((ts - anchors[index]).total_seconds())
             if best is None or gap < best[0]:
-                best = (gap, cluster)
+                best = (gap, index)
         if best is None:
-            cluster = [ts, [row]]
-            clusters.append(cluster)
-            open_clusters.append(cluster)
+            index = bisect_right(anchors, ts)
+            anchors.insert(index, ts)
+            groups.insert(index, [row])
         else:
-            best[1][0] = ts
-            best[1][1].append(row)
+            groups[best[1]].append(row)
 
     result = []
-    for _, members in clusters:
-        members.sort(key=lambda m: _priority(m["source"]))
+    for members in groups:
         keep = dict(members[0])
         keep["also_recorded_by"] = [m["source"] for m in members[1:]]
         result.append(keep)

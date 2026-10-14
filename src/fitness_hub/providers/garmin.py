@@ -25,7 +25,7 @@ from ..auth import AuthError
 from ..config import Settings
 from ..db import Store
 from ..util import daterange, epoch_ms_to_utc_iso, parse_date, to_float, utc_iso
-from . import StreamProgress, SyncResult, SyncWindow, partial_cursor, run_stream
+from . import StreamProgress, SyncResult, SyncWindow, partial_cursor, run_day_stream, run_stream
 
 log = logging.getLogger(__name__)
 
@@ -174,7 +174,9 @@ def map_body(data: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     for entry in data.get("dateWeightList") or []:
         if not isinstance(entry, Mapping):
             continue
-        ts = epoch_ms_to_utc_iso(entry.get("date") or entry.get("timestampGMT"))
+        # `timestampGMT` is the real instant; `date` is local wall-clock time
+        # encoded as epoch ms, so it is only a fallback.
+        ts = epoch_ms_to_utc_iso(entry.get("timestampGMT") or entry.get("date"))
         if not ts:
             continue
         grams = to_float(entry.get("weight"))
@@ -250,12 +252,7 @@ class GarminProvider:
         stream: str,
         body: Callable[[date, date, StreamProgress], None],
     ) -> SyncResult:
-        def func(progress: StreamProgress) -> None:
-            start = window.start_for(store.get_cursor(SOURCE, stream), self.settings.lookback_days, full)
-            body(start, window.end, progress)
-            progress.cursor = window.end.isoformat()
-
-        return run_stream(store, SOURCE, stream, func)
+        return run_day_stream(store, SOURCE, stream, window, self.settings.lookback_days, full, body)
 
     def _activities(self, client: Any, store: Store, start: date, end: date, progress: StreamProgress) -> None:
         items = client.get_activities_by_date(start.isoformat(), end.isoformat()) or []
@@ -272,18 +269,10 @@ class GarminProvider:
         days = list(daterange(start, end))
         for index, day in enumerate(days):
             iso = day.isoformat()
-            try:
-                stats = client.get_stats(iso)
-                sleep_data = client.get_sleep_data(iso)
-            except Exception as exc:
-                # Most likely throttling: stop here; the cursor (last good day) lets
-                # the next run resume instead of starting the backfill over.
-                raise RuntimeError(f"stopped at {iso}: {type(exc).__name__}: {exc}") from exc
-            try:
-                hrv = client.get_hrv_data(iso)
-            except Exception as exc:  # noqa: BLE001 - HRV is absent on many devices
-                log.debug("garmin HRV unavailable for %s: %s", iso, exc)
-                hrv = None
+            stats = _day_call(client.get_stats, iso, stop_on={"throttled", "auth", "error"})
+            sleep_data = _day_call(client.get_sleep_data, iso, stop_on={"throttled", "auth", "error"})
+            # HRV is absent on many devices, so only throttling or auth problems stop the stream.
+            hrv = _day_call(client.get_hrv_data, iso, stop_on={"throttled", "auth"})
             session, sleep_metrics = map_sleep(iso, sleep_data)
             progress.rows += store.upsert_daily_metrics(map_stats(iso, stats) + sleep_metrics + map_hrv(iso, hrv))
             if session:
@@ -295,6 +284,44 @@ class GarminProvider:
     def _body(self, client: Any, store: Store, start: date, end: date, progress: StreamProgress) -> None:
         data = client.get_body_composition(start.isoformat(), end.isoformat())
         progress.rows += store.upsert_body_measurements(map_body(data))
+
+
+def classify_error(exc: BaseException) -> str:
+    """Sort a garminconnect error into ``throttled``, ``auth``, ``no_data`` or ``error``.
+
+    Matched by class name so the library stays an optional import. In
+    garminconnect 0.3, ``get_stats`` raises ``GarminConnectConnectionError("No
+    data received from server")`` for a day without a summary (e.g. before the
+    watch was owned) and ``GarminConnectAuthenticationError("Authentication
+    error")`` for a privacy-protected day; neither is a reason to stop syncing.
+    """
+    name, text = type(exc).__name__, str(exc)
+    if name == "GarminConnectTooManyRequestsError" or "429" in text:
+        return "throttled"
+    if name == "GarminConnectNotFoundError":
+        return "no_data"
+    if name == "GarminConnectConnectionError" and "No data received" in text:
+        return "no_data"
+    if name == "GarminConnectAuthenticationError":
+        return "no_data" if text == "Authentication error" else "auth"
+    return "error"
+
+
+def _day_call(fn: Callable[[str], Any], iso: str, stop_on: set[str]) -> Any:
+    """Call a per-day endpoint; ``None`` when that day has no data. Errors whose
+    kind is in ``stop_on`` stop the stream at this day (the partial cursor makes
+    the next run resume here); other errors only skip this part of the day."""
+    try:
+        return fn(iso)
+    except Exception as exc:  # noqa: BLE001 - classified below
+        kind = classify_error(exc)
+        if kind in stop_on:
+            raise RuntimeError(f"stopped at {iso} ({kind}): {type(exc).__name__}: {exc}") from exc
+        if kind == "error":
+            log.warning("garmin %s failed for %s, skipping it: %s", getattr(fn, "__name__", "call"), iso, exc)
+        else:
+            log.debug("garmin %s: no data for %s (%s)", getattr(fn, "__name__", "call"), iso, exc)
+        return None
 
 
 def authorize(
@@ -353,6 +380,7 @@ def authorize(
 
 _KM_PER_MI = 1.609344
 _M_PER_FT = 0.3048
+_M_PER_YD = 0.9144
 _DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M")
 _TIME_RE = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)$")
 
@@ -394,14 +422,19 @@ def map_csv_row(row: Mapping[str, str], distance_unit: str = "km", tz: ZoneInfo 
         # Zone unknown: stored without a "Z" and read as UTC, so de-duplication
         # against other sources is unreliable (pass a timezone to fix that).
         start = local.strftime("%Y-%m-%dT%H:%M:%S")
+    activity_type = (row.get("Activity Type") or "").strip() or None
     distance = _csv_number(row.get("Distance"))
     ascent = _csv_number(row.get("Total Ascent"))
-    if distance_unit == "mi":
-        distance = distance * _KM_PER_MI * 1000 if distance is not None else None
-        ascent = ascent * _M_PER_FT if ascent is not None else None
-    else:
-        distance = distance * 1000 if distance is not None else None
-    activity_type = (row.get("Activity Type") or "").strip() or None
+    swim = "swim" in (activity_type or "").lower()
+    if distance is not None:
+        # Swims are exported in metres (yards on imperial accounts), e.g. "1,500";
+        # everything else in km (mi).
+        if distance_unit == "mi":
+            distance *= _M_PER_YD if swim else _KM_PER_MI * 1000
+        elif not swim:
+            distance *= 1000
+    if ascent is not None and distance_unit == "mi":
+        ascent *= _M_PER_FT
     return {
         "source": EXPORT_SOURCE,
         "source_id": f"{local.strftime('%Y-%m-%dT%H:%M:%S')}|{activity_type or ''}",

@@ -289,3 +289,110 @@ def test_sync_window_start_for() -> None:
     assert w.start_for("2026-12-01", 7, False) == date(2026, 10, 14)  # clamped to end
     explicit = SyncWindow(date(2026, 1, 1), date(2026, 10, 14), explicit_start=True)
     assert explicit.start_for("2026-10-10", 7, False) == date(2026, 1, 1)
+
+
+def test_dotenv_quoted_value_with_inline_comment() -> None:
+    parsed = parse_dotenv('A="abc123"  # from strava\nB=\'x # y\'\nC=plain # note\nD="unterminated\n')
+    assert parsed == {"A": "abc123", "B": "x # y", "C": "plain", "D": '"unterminated'}
+
+
+def test_token_store_is_safe_across_processes(tokens: TokenStore) -> None:
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        f"""
+        from fitness_hub.auth import TokenStore
+        store = TokenStore({str(tokens.path)!r})
+        for i in range(400):
+            store.save("other", {{"n": i}})
+        """
+    )
+    child = subprocess.Popen([sys.executable, "-c", script])
+    for i in range(400):
+        tokens.save("mine", {"n": i})
+    assert child.wait(60) == 0
+    # without the cross-process lock one side regularly overwrites the other's last write
+    assert tokens.get("mine") == {"n": 399}
+    assert tokens.get("other") == {"n": 399}
+
+
+def test_wait_for_callback_survives_an_idle_connection() -> None:
+    import socket
+    import threading
+    import time
+    import urllib.request
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    results: dict = {}
+    thread = threading.Thread(target=lambda: results.update(params=wait_for_callback(port, "st", timeout=20)))
+    thread.start()
+    idle = None
+    for _ in range(100):
+        try:
+            idle = socket.create_connection(("127.0.0.1", port), timeout=2)  # connects, never sends
+            break
+        except OSError:
+            time.sleep(0.05)
+    assert idle is not None
+    try:
+        started = time.monotonic()
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/callback?state=st&code=c", timeout=5) as resp:
+            assert resp.status == 200
+        thread.join(5)
+        assert results["params"]["code"] == "c"
+        assert time.monotonic() - started < 5
+    finally:
+        idle.close()
+
+
+@pytest.mark.parametrize(
+    ("method", "error", "idempotent", "retried"),
+    [
+        ("GET", httpx.ReadTimeout("slow"), None, True),
+        ("POST", httpx.ReadTimeout("slow"), None, False),  # may have been processed: never replay
+        ("POST", httpx.ConnectError("refused"), None, True),  # never reached the server
+        ("POST", httpx.ReadTimeout("slow"), True, True),  # e.g. Google dailyRollUp
+    ],
+)
+def test_request_json_transport_retry_respects_idempotency(method, error, idempotent, retried) -> None:
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            raise error
+        return json_response({"ok": True})
+
+    sleeps: list[float] = []
+    kwargs = {} if idempotent is None else {"idempotent": idempotent}
+    if retried:
+        assert request_json(mock_client(handler), method, "https://api.test/x", sleep=sleeps.append, **kwargs) == {
+            "ok": True
+        }
+        assert len(calls) == 2
+    else:
+        with pytest.raises(httpx.TransportError):
+            request_json(mock_client(handler), method, "https://api.test/x", sleep=sleeps.append, **kwargs)
+        assert len(calls) == 1
+
+
+def test_request_json_post_only_retries_unprocessed_statuses() -> None:
+    def make(status: int):
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(status) if len(calls) == 1 else json_response({"ok": True})
+
+        return calls, mock_client(handler)
+
+    calls, client = make(502)  # a gateway error may hide a processed request
+    with pytest.raises(ApiError):
+        request_json(client, "POST", "https://api.test/token", sleep=lambda _: None)
+    assert len(calls) == 1
+    calls, client = make(503)
+    assert request_json(client, "POST", "https://api.test/token", sleep=lambda _: None) == {"ok": True}

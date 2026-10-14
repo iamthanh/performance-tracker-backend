@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,17 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError(f"unexpected real HTTP request: {request.method} {request.url}")
 
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", refuse)
+
+
+@pytest.fixture(autouse=True)
+def _restore_logging():
+    """The CLI points the root logger at the current stderr (pytest's capture);
+    restore it so later tests never log into a closed capture stream."""
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    yield
+    root.handlers[:] = handlers
+    root.setLevel(level)
 
 
 @pytest.fixture

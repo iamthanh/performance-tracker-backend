@@ -35,7 +35,7 @@ heart rate in bpm, power in watts, energy in kcal, weight in kg. Timestamps are 
 `local_date`/`date` are YYYY-MM-DD on the athlete's local clock. Sleep is filed under the date it ended.
 
 Sources: {", ".join(SOURCES)} (garmin_export = Garmin CSV import).
-De-duplication: the same workout recorded by several services (start within 180 s) is returned once by \
+De-duplication: the same workout recorded by several services (starting within 180 s of the kept one) is returned once by \
 list_activities (unless `source` is given) and always by activity_summary, preferring \
 garmin > google_health > strava > garmin_export; `also_recorded_by` lists the other sources. \
 `sport` is a normalized family (cycling, running, swimming, ...); activity_type filters accept either \

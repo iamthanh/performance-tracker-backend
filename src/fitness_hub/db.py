@@ -282,6 +282,12 @@ class Store:
 
     # -- sync bookkeeping --------------------------------------------------------
 
+    def get_state(self, source: str, stream: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM sync_state WHERE source = ? AND stream = ?", (source, stream)
+        ).fetchone()
+        return dict(row) if row else None
+
     def get_cursor(self, source: str, stream: str) -> str | None:
         row = self.conn.execute(
             "SELECT cursor FROM sync_state WHERE source = ? AND stream = ?", (source, stream)

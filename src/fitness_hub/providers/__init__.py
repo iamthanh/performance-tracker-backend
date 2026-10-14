@@ -103,6 +103,27 @@ def describe_error(exc: BaseException) -> str:
     return text[:1000]
 
 
+def run_day_stream(
+    store: Store,
+    source: str,
+    stream: str,
+    window: SyncWindow,
+    lookback_days: int,
+    full: bool,
+    body: Callable[[date, date, StreamProgress], None],
+) -> SyncResult:
+    """Run a stream that fetches a day range: start from the stored cursor (see
+    :meth:`SyncWindow.start_for`) and move the cursor to the window end once
+    ``body`` has stored everything."""
+
+    def func(progress: StreamProgress) -> None:
+        start = window.start_for(store.get_cursor(source, stream), lookback_days, full)
+        body(start, window.end, progress)
+        progress.cursor = window.end.isoformat()
+
+    return run_stream(store, source, stream, func)
+
+
 def run_stream(
     store: Store,
     source: str,

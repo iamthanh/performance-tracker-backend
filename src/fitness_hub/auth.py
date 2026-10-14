@@ -7,6 +7,7 @@ atomically). They are never stored in the database and never logged.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import logging
@@ -16,8 +17,8 @@ import tempfile
 import threading
 import time
 import webbrowser
-from collections.abc import Callable
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections.abc import Callable, Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -29,13 +30,37 @@ class AuthError(RuntimeError):
     """Authentication problem the user must fix (message says how)."""
 
 
+@contextlib.contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """Exclusive lock across processes (POSIX flock); a no-op where unsupported."""
+    try:
+        import fcntl
+    except ImportError:  # Windows
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 class TokenStore:
-    """JSON file of per-provider token dicts, owner-read/write only."""
+    """JSON file of per-provider token dicts, owner-read/write only.
+
+    Writes are read-modify-write under a thread lock plus a lock file, so the
+    daemon saving a rotated Strava token and `fitness-hub auth google` in
+    another process never overwrite each other's entries.
+    """
 
     _lock = threading.Lock()
 
     def __init__(self, path: Path | str):
         self.path = Path(path)
+        self._lock_path = self.path.with_name(self.path.name + ".lock")
 
     def load_all(self) -> dict[str, dict[str, Any]]:
         try:
@@ -53,13 +78,13 @@ class TokenStore:
         return dict(value) if isinstance(value, dict) else None
 
     def save(self, provider: str, data: dict[str, Any]) -> None:
-        with self._lock:
+        with self._lock, _file_lock(self._lock_path):
             all_tokens = self.load_all()
             all_tokens[provider] = data
             self._write(all_tokens)
 
     def delete(self, provider: str) -> None:
-        with self._lock:
+        with self._lock, _file_lock(self._lock_path):
             all_tokens = self.load_all()
             if all_tokens.pop(provider, None) is not None:
                 self._write(all_tokens)
@@ -121,6 +146,8 @@ def wait_for_callback(
     result: dict[str, Any] = {}
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = 10  # an idle connection (e.g. a browser preconnect) must not hold a thread forever
+
         def do_GET(self) -> None:  # noqa: N802 - stdlib naming
             parsed = urlparse(self.path)
             if parsed.path != "/callback":
@@ -130,11 +157,11 @@ def wait_for_callback(
             if not secrets.compare_digest(params.get("state", ""), expected_state):
                 self._reply(400, "State mismatch", "Ignoring this request; restart auth.")
                 return
-            result["params"] = params
             if "error" in params:
                 self._reply(400, "Authorization failed", "You can close this tab.")
             else:
                 self._reply(200, "fitness-hub is authorized", "You can close this tab.")
+            result["params"] = params
 
         def _reply(self, code: int, title: str, body: str) -> None:
             payload = _PAGE.format(title=title, body=body).encode("utf-8")
@@ -147,8 +174,11 @@ def wait_for_callback(
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             return  # the query string contains the auth code; keep it out of logs
 
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True  # each connection gets a thread, so one idle socket cannot stall the wait
+
     try:
-        server = HTTPServer((host, port), Handler)
+        server = Server((host, port), Handler)
     except OSError as exc:
         raise AuthError(
             f"cannot listen on {host}:{port} for the OAuth redirect ({exc}); "

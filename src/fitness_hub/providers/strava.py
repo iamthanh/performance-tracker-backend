@@ -186,7 +186,8 @@ class StravaProvider:
                 rows.append(row)
                 latest = max(latest or row["start_time"], row["start_time"])
             progress.rows += store.upsert_activities(rows)
-            if len(batch) < PER_PAGE:
+            # Strava can return short pages before the end; only an empty page is the end.
+            if not batch:
                 break
         # The cursor only moves once every page is stored (an interrupted or
         # rate-limited run re-fetches from the previous cursor next time).
