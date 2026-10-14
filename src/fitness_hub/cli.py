@@ -62,6 +62,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="IANA zone of the Date column (e.g. Europe/Berlin); improves de-duplication",
     )
 
+    strava = sub.add_parser("import-strava-export", help="import an unzipped Strava bulk export (activities + files)")
+    strava.add_argument("path", help="the unzipped export folder (it contains activities.csv)")
+    strava.add_argument(
+        "--timezone",
+        metavar="TZ",
+        help="IANA zone for activities whose file has no usable local time (GPX, Zwift), e.g. America/Los_Angeles",
+    )
+    strava.add_argument("--force", action="store_true", help="re-parse files whose streams are already stored")
+    strava.add_argument("--workers", type=int, default=None, help="parallel file parsers (default: up to 8)")
+
     serve = sub.add_parser("serve-mcp", help="run the MCP server (stdio for Claude, or localhost HTTP)")
     serve.add_argument("--transport", choices=("stdio", "http"), default="stdio")
     serve.add_argument("--host", default="127.0.0.1", help="HTTP bind address (loopback only)")
@@ -152,6 +162,28 @@ def cmd_import(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import_strava(settings: Settings, args: argparse.Namespace) -> int:
+    from .db import Store
+    from .providers.strava_export import import_strava_export
+
+    def progress(done: int, total: int) -> None:
+        if done == total or done % 100 == 0:
+            print(f"  parsed {done}/{total} activity files", file=sys.stderr)
+
+    with Store(settings.db_path) as store:
+        result = import_strava_export(
+            store, args.path, timezone=args.timezone, force=args.force, workers=args.workers, progress=progress
+        )
+    print(
+        f"Imported {result['activities']} Strava activities; streams parsed for {result['streams_imported']} "
+        f"({result['streams_already_stored']} already stored)."
+    )
+    problems = {k: v for k, v in result.items() if k.startswith(("files_", "rows_")) and v}
+    if problems:
+        print("Not imported: " + ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in problems.items()) + " (see -v)")
+    return 0
+
+
 def cmd_serve(settings: Settings, args: argparse.Namespace) -> int:
     from .mcp_server import serve
 
@@ -202,6 +234,7 @@ COMMANDS = {
     "sync": cmd_sync,
     "status": cmd_status,
     "import-garmin-csv": cmd_import,
+    "import-strava-export": cmd_import_strava,
     "serve-mcp": cmd_serve,
     "run": cmd_run,
 }
