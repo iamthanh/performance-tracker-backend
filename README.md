@@ -302,17 +302,29 @@ claude mcp add --transport http fitness-hub http://127.0.0.1:8800/mcp
 
 ```bash
 fitness-hub serve-api                  # http://127.0.0.1:8801/api, interactive docs at /docs
+fitness-hub serve-api --host 0.0.0.0   # LAN mode: also serves other devices on your network
 ```
 
 The [performance-tracker-ui](https://github.com/iamthanh/performance-tracker-ui) reads everything through this API.
-It has **no authentication**, so it only serves this machine:
+It has **no authentication**. By default it serves only this machine:
 
-- It binds only to loopback and refuses any other host.
+- It binds to loopback (`API_HOST`, default `127.0.0.1`).
 - It answers only requests whose `Host` is a loopback name, so a web page cannot reach it through DNS rebinding.
 - Browsers may read responses only from the origins in `API_CORS_ORIGINS` (default: the UI's dev server,
   `http://localhost:5173` and `http://127.0.0.1:5173`).
 - Writes with an `Origin` header must come from one of those or a loopback origin, and JSON bodies need
   `Content-Type: application/json`.
+
+**LAN mode.** With `--host 0.0.0.0` (or `API_HOST=0.0.0.0` in `.env`), or a private address of this machine, it also
+serves your local network, so the UI works from a phone or another computer (see the UI's README). Anyone on the
+network can then read your data and change thresholds, so use it only on a network you trust. In LAN mode:
+
+- `Host` (and the host of a write's `Origin`) may also be a private or link-local IP address, or this machine's host
+  name, bare or `.local`. Other names still get 421, so DNS rebinding stays blocked; add your own names, such as a
+  router DNS entry, to `API_ALLOWED_HOSTS` (comma-separated).
+- It refuses to bind to a public IP address.
+- If a firewall is on, allow port 8801 from your network only (for example
+  `sudo ufw allow from 192.168.1.0/24 to any port 8801 proto tcp`).
 
 Reads use read-only connections. The only writes are threshold overrides, which re-score the affected activities.
 
@@ -566,7 +578,7 @@ query never blocks the other tools.
 6. **Garmin CSV times have no timezone.** Without `--timezone`, matching CSV activities against other sources is unreliable.
 7. Google rollup responses are assumed to fit in one page (no `nextPageToken` handling for `dailyRollUp`).
 8. The **HTTP transport has no authentication** and is localhost-only.
-9. Single user and local only. Nothing is written back to the providers, and no GPS or FIT streams are stored.
+9. Single user, on your machine or home network. Nothing is written back to the providers, and no GPS or FIT streams are stored.
 
 ## Future work
 

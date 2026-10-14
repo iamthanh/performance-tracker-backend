@@ -90,6 +90,10 @@ class Settings:
     garmin_activities: bool = False
     # Browser origins allowed to call the read API (the UI's dev server by default).
     api_cors_origins: tuple[str, ...] = ("http://localhost:5173", "http://127.0.0.1:5173")
+    # Bind address of `serve-api`; a non-loopback one (e.g. 0.0.0.0) serves the local network.
+    api_host: str = "127.0.0.1"
+    # Extra Host names the API answers to in LAN mode (besides private IPs and this machine's name).
+    api_allowed_hosts: tuple[str, ...] = ()
 
     @property
     def db_path(self) -> Path:
@@ -140,4 +144,6 @@ class Settings:
             api_cors_origins=tuple(o.strip().rstrip("/") for o in merged["API_CORS_ORIGINS"].split(",") if o.strip())
             if merged.get("API_CORS_ORIGINS")
             else cls.api_cors_origins,
+            api_host=opt("API_HOST") or cls.api_host,
+            api_allowed_hosts=tuple(h.strip().lower() for h in (opt("API_ALLOWED_HOSTS") or "").split(",") if h.strip()),
         )
