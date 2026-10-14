@@ -31,6 +31,9 @@ def _setup_logging(verbose: bool, command: str | None) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+_THRESHOLD_METRICS = {"ftp": "ftp_w", "threshold-hr": "threshold_hr", "max-hr": "max_hr", "resting-hr": "resting_hr"}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fitness-hub",
@@ -78,16 +81,16 @@ def build_parser() -> argparse.ArgumentParser:
     analyze = sub.add_parser("analyze", help="compute TSS, NP, zones, power curves and auto FTP from stored streams")
     analyze.add_argument("--full", action="store_true", help="re-analyse every activity, not only new ones")
 
-    ftp = sub.add_parser("thresholds", help="show or override FTP and threshold HR over time")
+    ftp = sub.add_parser("thresholds", help="show or override FTP, threshold HR, max HR and resting HR over time")
     ftp_sub = ftp.add_subparsers(dest="action", metavar="ACTION")
     ftp_sub.add_parser("list", help="every dated value, manual and auto")
     ftp_set = ftp_sub.add_parser("set", help="set a manual value from a date on (re-scores affected activities)")
-    ftp_set.add_argument("metric", choices=("ftp", "threshold-hr"))
+    ftp_set.add_argument("metric", choices=tuple(_THRESHOLD_METRICS))
     ftp_set.add_argument("value", type=float)
     ftp_set.add_argument("--from", dest="effective_date", required=True, metavar="YYYY-MM-DD")
     ftp_set.add_argument("--note")
     ftp_del = ftp_sub.add_parser("delete", help="remove a manual value")
-    ftp_del.add_argument("metric", choices=("ftp", "threshold-hr"))
+    ftp_del.add_argument("metric", choices=tuple(_THRESHOLD_METRICS))
     ftp_del.add_argument("--from", dest="effective_date", required=True, metavar="YYYY-MM-DD")
 
     serve = sub.add_parser("serve-mcp", help="run the MCP server (stdio for Claude, or localhost HTTP)")
@@ -234,8 +237,6 @@ def cmd_analyze(settings: Settings, args: argparse.Namespace) -> int:
     return _analyze(settings, full=args.full)
 
 
-_THRESHOLD_METRICS = {"ftp": "ftp_w", "threshold-hr": "threshold_hr"}
-
 
 def cmd_thresholds(settings: Settings, args: argparse.Namespace) -> int:
     from .db import Store
@@ -258,7 +259,7 @@ def cmd_thresholds(settings: Settings, args: argparse.Namespace) -> int:
         return 0
     print(f"{'METRIC':<14} {'FROM':<11} {'ORIGIN':<7} {'VALUE':>6}  NOTE")
     for r in rows:
-        print(f"{r['metric']:<14} {r['effective_date']:<11} {r['origin']:<7} {r['value']:>6.0f}  {r['note'] or ''}")
+        print(f"{r['metric']:<14} {r['effective_date']:<11} {r['origin']:<7} {r['value']:>6g}  {r['note'] or ''}")
     return 0
 
 

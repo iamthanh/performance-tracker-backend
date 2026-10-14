@@ -2,24 +2,35 @@
 
 Per activity (``activity_metrics``, ``power_curve``):
 
-- The streams are laid on a 1 Hz *timer* clock: a value is held across a gap of
-  up to ``MAX_GAP_S`` seconds (smart recording, dropouts); longer gaps are
-  pauses and are left out. Missing power counts as 0 W (coasting).
+- The streams are laid on a 1 Hz *timer* clock. A gap of up to ``MAX_GAP_S``
+  seconds is filled by holding the previous value (smart recording, dropouts);
+  so is a longer gap that the athlete covered at ``MOVING_SPEED_MPS`` or more
+  (sparse GPS-watch recording). Other gaps are pauses and are left out. Missing
+  power counts as 0 W (coasting); heart rate outside ``MIN_HR_BPM`` to
+  ``MAX_HR_BPM`` (a strap that lost contact, sensor spikes) counts as missing.
+- Power is only used when at least ``MIN_POWER_SHARE`` of the timer seconds
+  have power above 0 W, so a dying power meter does not set the ride's TSS.
 - Threshold-independent values: average/max power, normalized power (30 s
-  rolling average, 4th-power mean), work, HR stats, best 20-minute HR, Pw:HR
-  decoupling, the mean-maximal power curve, and power/HR histograms.
-- Threshold-dependent values, from the stored histograms so a new FTP never
-  needs the streams again: intensity factor, TSS, variability index,
-  efficiency factor, time in Coggan power zones and Friel HR zones.
+  rolling average, 4th-power mean), work, variability index, HR stats, best
+  20-minute HR, efficiency factor, Pw:HR decoupling, the mean-maximal power
+  curve and power/HR histograms. Power curve and best 20-minute values never
+  join efforts across a pause.
+- Threshold-dependent values, from the stored histograms so a new threshold
+  never needs the streams again: intensity factor, TSS and time in Coggan power
+  zones and Friel HR zones.
 
-TSS is power-based for cycling (``seconds * NP * IF / (FTP * 3600) * 100``)
-and an HR estimate otherwise (``hours * (avg HR / threshold HR)^2 * 100``).
+TSS is power-based for cycling (``seconds * NP * IF / (FTP * 3600) * 100``).
+Otherwise it is an HR-based TSS from Banister's TRIMP, scaled so that an hour at
+threshold heart rate scores 100; its intensity factor is the one that gives the
+same TSS (``sqrt(TSS / (hours * 100))``).
 
 Thresholds (``athlete_settings``): ``auto`` rows are recomputed on every run
-(FTP = 95 % of the best 20-minute cycling power, threshold HR = 95 % of the best
-20-minute cycling heart rate, both over the trailing ``AUTO_WINDOW_DAYS``). The
-value for a date is the latest entry on or before it, ``manual`` winning a tie;
-before the first entry, the first entry applies.
+from rides over the trailing ``AUTO_WINDOW_DAYS``: FTP = 95 % of the best
+20-minute power, threshold HR = the best 20-minute heart rate, max HR = the
+third-highest best-30-second heart rate of any activity. Resting HR has no auto value (``DEFAULT_RESTING_HR``).
+A ``manual`` value holds from its date until the next manual value, unless the
+automatic value later rises above it (a new best effort); before the first
+value, the first one applies.
 """
 
 from __future__ import annotations
@@ -28,7 +39,8 @@ import json
 import logging
 import math
 import sqlite3
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right, insort
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -45,43 +57,83 @@ log = logging.getLogger(__name__)
 ANALYSIS_VERSION = 1
 BATCH = 200
 MAX_GAP_S = 5
+MOVING_SPEED_MPS = 1.0
+MAX_MOVING_GAP_S = 600
+MIN_HR_BPM = 30  # below: a strap that lost contact
+MAX_HR_BPM = 220  # above: sensor noise (cadence lock, static spikes)
+MIN_POWER_SHARE = 0.25
 NP_WINDOW_S = 30
 DECOUPLING_MIN_S = 600
-# A year, so the estimate does not sink in blocks without all-out efforts.
-AUTO_WINDOW_DAYS = 365
-AUTO_FACTOR = 0.95
+DECOUPLING_MAX_PCT = 50.0
+AUTO_WINDOW_DAYS = 365  # a year, so the estimate does not sink in blocks without all-out efforts
+AUTO_WARMUP_DAYS = 28  # the first auto value uses the first four weeks of efforts, not just the first ride
 AUTO_DURATION_S = 1200
+FTP_FACTOR = 0.95
+MAX_HR_WINDOW_S = 30
+MAX_HR_RANK = 3  # the third-highest activity max: one or two noisy sessions do not set it
+DEFAULT_RESTING_HR = 50.0
+THRESHOLD_OF_MAX_HR = 0.92  # typical; used when max HR is unknown or not above threshold HR
 POWER_CURVE_DURATIONS = (
     1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 420, 600, 720, 900, 1200,
     1800, 2400, 3600, 5400, 7200, 10800, 14400, 18000,
 )  # fmt: skip
 
-# Upper bounds (inclusive) as a fraction of the threshold; the last zone is open-ended.
-POWER_ZONES = (
-    ("Z1 Active recovery", 0.55),
-    ("Z2 Endurance", 0.75),
-    ("Z3 Tempo", 0.90),
-    ("Z4 Threshold", 1.05),
-    ("Z5 VO2max", 1.20),
-    ("Z6 Anaerobic", 1.50),
-    ("Z7 Neuromuscular", math.inf),
-)
-HR_ZONES = (
-    ("Z1 Recovery", 0.80),
-    ("Z2 Aerobic", 0.89),
-    ("Z3 Tempo", 0.93),
-    ("Z4 Sub-threshold", 0.99),
-    ("Z5a Super-threshold", 1.02),
-    ("Z5b Aerobic capacity", 1.06),
-    ("Z5c Anaerobic capacity", math.inf),
-)
+
+@dataclass(frozen=True)
+class Zones:
+    """Zone names and boundaries as fractions of a threshold. ``inclusive``: a
+    value equal to a boundary belongs to the lower zone (Coggan's "up to 55 %");
+    otherwise to the upper one (Friel's "81 % and above")."""
+
+    names: tuple[str, ...]
+    bounds: tuple[float, ...]  # len(names) - 1 boundaries between consecutive zones
+    inclusive: bool
+
+    def index(self, value: float, threshold: float) -> int:
+        side = "left" if self.inclusive else "right"
+        return int(np.searchsorted([b * threshold for b in self.bounds], value, side=side))
+
+    def upper_values(self, threshold: float) -> list[int | None]:
+        """The highest whole value (W or bpm) in each zone; ``None`` for the open top zone."""
+        out: list[int | None] = []
+        for b in self.bounds:
+            limit = b * threshold
+            out.append(math.floor(limit) if self.inclusive else math.ceil(limit) - 1)
+        return [*out, None]
+
+
+POWER_ZONES = Zones(
+    ("Z1 Active recovery", "Z2 Endurance", "Z3 Tempo", "Z4 Threshold", "Z5 VO2max", "Z6 Anaerobic",
+     "Z7 Neuromuscular"),
+    (0.55, 0.75, 0.90, 1.05, 1.20, 1.50),
+    inclusive=True,
+)  # fmt: skip
+HR_ZONES = Zones(
+    ("Z1 Recovery", "Z2 Aerobic", "Z3 Tempo", "Z4 Sub-threshold", "Z5a Super-threshold", "Z5b Aerobic capacity",
+     "Z5c Anaerobic capacity"),
+    (0.81, 0.90, 0.94, 1.00, 1.03, 1.07),
+    inclusive=False,
+)  # fmt: skip
 
 
 # -- per-activity, threshold-independent ---------------------------------------------------
 
 
-def timer_series(streams: Mapping[str, list[Any]], channels: Iterable[str]) -> dict[str, np.ndarray]:
-    """``{channel: 1 Hz float array}`` on the timer clock (NaN where a value is missing)."""
+def _channel(streams: Mapping[str, list[Any]], name: str) -> np.ndarray | None:
+    values = streams.get(name)
+    if values is None:
+        return None
+    return np.array([np.nan if v is None else v for v in values], dtype=float)
+
+
+def timer_series(
+    streams: Mapping[str, list[Any]], channels: Iterable[str], *, keep_pauses: bool = False
+) -> dict[str, np.ndarray]:
+    """``{channel: 1 Hz float array}`` on the timer clock (NaN where a value is missing).
+
+    With ``keep_pauses`` the paused seconds are kept as NaN instead of being left
+    out, so rolling windows cannot join efforts across a stop.
+    """
     t = np.asarray(streams.get("time") or [], dtype=float)
     if t.size == 0:
         return {c: np.empty(0) for c in channels}
@@ -89,19 +141,33 @@ def timer_series(streams: Mapping[str, list[Any]], channels: Iterable[str]) -> d
     sec = np.round(t[order] - t[order][0]).astype(np.int64)
     keep = np.concatenate(([True], np.diff(sec) > 0))  # one sample per second
     sec = sec[keep]
-    repeats = np.ones(sec.size, dtype=np.int64)
     gaps = np.diff(sec)
-    hold = gaps <= MAX_GAP_S
-    repeats[:-1][hold] = gaps[hold]
-    index = np.repeat(np.arange(sec.size), repeats)
+    moving = gaps <= MAX_GAP_S
+    distance = _channel(streams, "distance")
+    if distance is not None:
+        travelled = np.diff(distance[order][keep])
+        with np.errstate(invalid="ignore"):
+            covered = np.nan_to_num(travelled / gaps, nan=0.0) >= MOVING_SPEED_MPS
+        moving |= covered & (gaps <= MAX_MOVING_GAP_S)
+    held = np.ones(sec.size, dtype=np.int64)
+    held[:-1][moving] = gaps[moving]
+    paused = np.zeros(sec.size, dtype=np.int64)
+    if keep_pauses:
+        paused[:-1][~moving] = gaps[~moving] - 1
+    # Each sample covers its own second plus held seconds (a copy of it) and paused seconds (NaN).
+    span = held + paused
+    index = np.repeat(np.arange(sec.size), span)
+    offset = np.arange(index.size) - np.repeat(np.cumsum(span) - span, span)  # position within each span
+    is_pause = offset >= np.repeat(held, span)
     out = {}
     for c in channels:
-        values = streams.get(c)
+        values = _channel(streams, c)
         if values is None:
             out[c] = np.full(index.size, np.nan)
             continue
-        arr = np.array([np.nan if v is None else v for v in values], dtype=float)[order][keep]
-        out[c] = arr[index]
+        series = values[order][keep][index]
+        series[is_pause] = np.nan
+        out[c] = series
     return out
 
 
@@ -117,8 +183,8 @@ def normalized_power(power: np.ndarray) -> float | None:
 
 
 def power_curve(power: np.ndarray, durations: Iterable[int] = POWER_CURVE_DURATIONS) -> dict[int, float]:
-    """Best average power for each duration that fits in the activity."""
-    c = np.concatenate(([0.0], np.cumsum(power)))
+    """Best average power for each duration that fits in the activity (NaN counts as 0 W)."""
+    c = np.concatenate(([0.0], np.cumsum(np.nan_to_num(power, nan=0.0))))
     return {d: float(np.max(c[d:] - c[:-d]) / d) for d in durations if d <= power.size}
 
 
@@ -145,87 +211,123 @@ def _histogram(values: np.ndarray) -> dict[str, int]:
 
 
 def decoupling(power: np.ndarray, hr: np.ndarray) -> float | None:
-    """Pw:HR drift in percent: (first-half ratio - second-half ratio) / first-half ratio."""
-    if power.size < DECOUPLING_MIN_S:
+    """Pw:HR drift in percent, (first-half ratio - second-half ratio) / first-half ratio,
+    over the seconds that have heart rate. ``None`` when it would not mean anything:
+    too short, too little HR, nearly no power, or an implausible drift."""
+    valid = ~np.isnan(hr)
+    if valid.sum() < DECOUPLING_MIN_S or valid.sum() < 0.8 * hr.size:
         return None
-    half = power.size // 2
+    p, h = power[valid], hr[valid]
+    half = p.size // 2
     ratios = []
-    for p, h in ((power[:half], hr[:half]), (power[half:], hr[half:])):
-        h = h[~np.isnan(h)]
-        if h.size < 0.8 * p.size or h.mean() <= 0:
+    for part_p, part_h in ((p[:half], h[:half]), (p[half:], h[half:])):
+        if np.mean(part_p > 0) < MIN_POWER_SHARE:
             return None
-        ratios.append(p.mean() / h.mean())
-    if ratios[0] <= 0:
-        return None
-    return float((ratios[0] - ratios[1]) / ratios[0] * 100)
+        ratios.append(part_p.mean() / part_h.mean())
+    value = (ratios[0] - ratios[1]) / ratios[0] * 100
+    return float(value) if abs(value) <= DECOUPLING_MAX_PCT else None
 
 
 def base_metrics(streams: Mapping[str, list[Any]]) -> tuple[dict[str, Any], dict[int, float]]:
     """Threshold-independent metrics and the power curve of one activity."""
     series = timer_series(streams, ("power", "heart_rate"))
+    paused = timer_series(streams, ("power", "heart_rate"), keep_pauses=True)
+    for s in (series, paused):
+        hr_values = s["heart_rate"]
+        with np.errstate(invalid="ignore"):
+            hr_values[(hr_values < MIN_HR_BPM) | (hr_values > MAX_HR_BPM)] = np.nan
     raw_power, hr = series["power"], series["heart_rate"]
-    has_power = bool(np.any(raw_power > 0))
-    has_hr = bool(np.any(hr > 0))
+    has_power = raw_power.size > 0 and float(np.mean(raw_power > 0)) >= MIN_POWER_SHARE
+    has_hr = bool(np.any(~np.isnan(hr)))
     metrics: dict[str, Any] = {"timer_s": float(raw_power.size)}
     curve: dict[int, float] = {}
     if has_power:
         power = np.nan_to_num(raw_power, nan=0.0)
+        np_w = normalized_power(power)
+        avg_w = float(power.mean())
         metrics.update(
-            avg_power_w=float(power.mean()),
+            avg_power_w=avg_w,
             max_power_w=float(power.max()),
-            normalized_power_w=normalized_power(power),
+            normalized_power_w=np_w,
             work_kj=float(power.sum() / 1000),
+            variability_index=np_w / avg_w if np_w and avg_w else None,
             power_hist=_histogram(power),
         )
-        curve = power_curve(power)
-        if has_hr:
-            metrics["decoupling_pct"] = decoupling(power, hr)
+        curve = power_curve(paused["power"])
     if has_hr:
-        valid = hr[~np.isnan(hr)]
+        avg_hr = float(np.nanmean(hr))
         metrics.update(
-            avg_hr=float(valid.mean()),
-            max_hr=float(valid.max()),
-            hr_20min_bpm=best_average(hr, AUTO_DURATION_S),
+            avg_hr=avg_hr,
+            max_hr=best_average(paused["heart_rate"], MAX_HR_WINDOW_S, min_coverage=1.0),
+            hr_20min_bpm=best_average(paused["heart_rate"], AUTO_DURATION_S),
             hr_hist=_histogram(hr),
         )
+        if has_power:
+            np_w = metrics["normalized_power_w"]
+            metrics["efficiency_factor"] = np_w / avg_hr if np_w else None
+            metrics["decoupling_pct"] = decoupling(np.nan_to_num(raw_power, nan=0.0), hr)
     return metrics, curve
 
 
 # -- threshold-dependent --------------------------------------------------------------
 
 
-def zone_seconds(hist: Mapping[str, int] | None, threshold: float | None, zones: tuple) -> list[int] | None:
+def zone_seconds(hist: Mapping[str, int] | None, threshold: float | None, zones: Zones) -> list[int] | None:
     if not hist or not threshold:
         return None
-    bounds = [upper * threshold for _, upper in zones[:-1]]
-    seconds = [0] * len(zones)
+    seconds = [0] * len(zones.names)
     for value, count in hist.items():
-        seconds[np.searchsorted(bounds, float(value), side="left")] += count
+        seconds[zones.index(float(value), threshold)] += count
     return seconds
 
 
-def threshold_metrics(
-    base: Mapping[str, Any], cycling: bool, ftp: float | None, lthr: float | None
-) -> dict[str, Any]:
+def _trimp_weight(hr: float, resting: float, maximum: float) -> float:
+    reserve = min(max((hr - resting) / (maximum - resting), 0.0), 1.0)
+    return reserve * 0.64 * math.exp(1.92 * reserve)
+
+
+def hr_tss(
+    hist: Mapping[str, int] | None, timer_s: float, lthr: float | None, max_hr: float | None, resting_hr: float
+) -> float | None:
+    """TRIMP-based TSS: the activity's TRIMP over an hour at threshold heart rate, x 100."""
+    if not hist or not lthr or not timer_s or lthr <= resting_hr:
+        return None
+    if not max_hr or max_hr <= lthr:
+        max_hr = lthr / THRESHOLD_OF_MAX_HR
+    total = sum(hist.values())
+    per_second = sum(_trimp_weight(float(v), resting_hr, max_hr) * n for v, n in hist.items()) / total
+    return timer_s * per_second / (3600 * _trimp_weight(lthr, resting_hr, max_hr)) * 100
+
+
+@dataclass(frozen=True)
+class Thresholds:
+    ftp_w: float | None = None
+    threshold_hr: float | None = None
+    max_hr: float | None = None
+    resting_hr: float | None = None
+
+
+def threshold_metrics(base: Mapping[str, Any], cycling: bool, th: Thresholds) -> dict[str, Any]:
     timer_s = base.get("timer_s") or 0.0
-    np_w, avg_w, avg_hr = base.get("normalized_power_w"), base.get("avg_power_w"), base.get("avg_hr")
+    np_w = base.get("normalized_power_w")
     out: dict[str, Any] = {
-        "ftp_w": ftp,
-        "threshold_hr": lthr,
+        "ftp_w": th.ftp_w,
+        "threshold_hr": th.threshold_hr,
         "intensity_factor": None,
         "tss": None,
         "tss_method": None,
-        "variability_index": np_w / avg_w if np_w and avg_w else None,
-        "efficiency_factor": np_w / avg_hr if np_w and avg_hr else None,
-        "power_zone_s": zone_seconds(base.get("power_hist"), ftp, POWER_ZONES),
-        "hr_zone_s": zone_seconds(base.get("hr_hist"), lthr, HR_ZONES),
+        "power_zone_s": zone_seconds(base.get("power_hist"), th.ftp_w, POWER_ZONES),
+        "hr_zone_s": zone_seconds(base.get("hr_hist"), th.threshold_hr, HR_ZONES),
     }
-    if cycling and np_w and ftp:
-        intensity = np_w / ftp
-        out.update(intensity_factor=intensity, tss=timer_s * np_w * intensity / (ftp * 3600) * 100, tss_method="power")
-    elif avg_hr and lthr and timer_s:
-        intensity = avg_hr / lthr
-        out.update(intensity_factor=intensity, tss=timer_s / 3600 * intensity**2 * 100, tss_method="hr")
+    if cycling and np_w and th.ftp_w:
+        intensity = np_w / th.ftp_w
+        out.update(intensity_factor=intensity, tss=timer_s * np_w * intensity / (th.ftp_w * 3600) * 100,
+                   tss_method="power")  # fmt: skip
+        return out
+    resting = th.resting_hr or DEFAULT_RESTING_HR
+    tss = hr_tss(base.get("hr_hist"), timer_s, th.threshold_hr, th.max_hr, resting)
+    if tss is not None:
+        out.update(intensity_factor=math.sqrt(tss / (timer_s / 3600 * 100)), tss=tss, tss_method="hr")
     return out
 
 
@@ -236,42 +338,67 @@ def threshold_metrics(
 class Timeline:
     """Dated values of one setting, resolved as described in the module docstring."""
 
-    dates: list[str] = field(default_factory=list)
-    values: list[float] = field(default_factory=list)
+    manual: list[tuple[str, float]] = field(default_factory=list)  # sorted by date
+    auto: list[tuple[str, float]] = field(default_factory=list)
 
     @classmethod
     def from_rows(cls, rows: Iterable[tuple[str, str, float]]) -> Timeline:
-        best: dict[str, tuple[int, float]] = {}
+        manual, auto = [], []
         for effective_date, origin, value in rows:
-            rank = 1 if origin == "manual" else 0
-            if effective_date not in best or rank > best[effective_date][0]:
-                best[effective_date] = (rank, value)
-        dates = sorted(best)
-        return cls(dates, [best[d][1] for d in dates])
+            (manual if origin == "manual" else auto).append((effective_date, value))
+        return cls(sorted(manual), sorted(auto))
+
+    @staticmethod
+    def _latest(entries: list[tuple[str, float]], day: str) -> tuple[str, float] | None:
+        i = bisect_right(entries, (day, math.inf)) - 1
+        return entries[i] if i >= 0 else None
 
     def at(self, day: str) -> float | None:
-        if not self.dates:
-            return None
-        i = bisect_right(self.dates, day) - 1
-        return self.values[max(i, 0)]
+        manual, auto = self._latest(self.manual, day), self._latest(self.auto, day)
+        if manual is None and auto is None:
+            first = min(self.manual[:1] + self.auto[:1], default=None)
+            return first[1] if first else None
+        if manual is None:
+            return auto[1] if auto else None
+        # The manual value holds unless an automatic value after it rose above it (a new best).
+        surpassed = any(manual[0] < d <= day and v > manual[1] for d, v in self.auto)
+        return auto[1] if surpassed and auto else manual[1]
 
 
 def auto_thresholds(
-    points: Iterable[tuple[str, float | None]], window_days: int = AUTO_WINDOW_DAYS
+    points: Iterable[tuple[str, float | None]],
+    factor: float = 1.0,
+    window_days: int = AUTO_WINDOW_DAYS,
+    warmup_days: int = AUTO_WARMUP_DAYS,
+    rank: int = 1,
 ) -> list[tuple[str, float]]:
-    """``[(local_date, best 20-min value)]`` -> change points of ``95 % x best in the
-    trailing window``, evaluated on each activity date (values rounded to whole units)."""
-    by_date: dict[str, float] = {}
-    for day, value in points:
-        if value and value > 0:
-            by_date[day] = max(by_date.get(day, 0.0), value)
-    days = sorted(by_date)
-    changes: list[tuple[str, float]] = []
-    for day in days:
+    """``[(local_date, best value of an activity)]`` -> change points of ``factor x``
+    the ``rank``-th highest value in the trailing window (the highest there is if
+    fewer), evaluated on each activity date and rounded to whole units. The first
+    value is taken once ``warmup_days`` of efforts are in and is dated back to
+    the first activity."""
+    entries = sorted((day, value) for day, value in points if value and value > 0)
+    if not entries:
+        return []
+    first = entries[0][0]
+    warm_until = (parse_date(first) + timedelta(days=warmup_days - 1)).isoformat()
+
+    def pick(values: list[float]) -> float:
+        return float(round(values[-min(rank, len(values))] * factor))
+
+    changes = [(first, pick(sorted(v for d, v in entries if d <= warm_until)))]
+    window: deque[tuple[str, float]] = deque()
+    ordered: list[float] = []  # the window's values, sorted
+    for i, (day, value) in enumerate(entries):
+        window.append((day, value))
+        insort(ordered, value)
         start = (parse_date(day) - timedelta(days=window_days - 1)).isoformat()
-        best = max(v for d, v in by_date.items() if start <= d <= day)
-        value = float(round(best * AUTO_FACTOR))
-        if not changes or changes[-1][1] != value:
+        while window[0][0] < start:
+            ordered.pop(bisect_left(ordered, window.popleft()[1]))
+        if day <= warm_until or (i + 1 < len(entries) and entries[i + 1][0] == day):
+            continue  # still warming up, or more activities on the same day
+        value = pick(ordered)
+        if changes[-1][1] != value:
             changes.append((day, value))
     return changes
 
@@ -283,15 +410,21 @@ def _load_timeline(conn: sqlite3.Connection, metric: str) -> Timeline:
     return Timeline.from_rows((r[0], r[1], r[2]) for r in rows)
 
 
-def _replace_auto(store: Store, metric: str, changes: list[tuple[str, float]]) -> None:
+def _replace_auto(store: Store, metric: str, changes: list[tuple[str, float]], note: str) -> None:
     now = now_utc_iso()
     with store.conn:
         store.conn.execute("DELETE FROM athlete_settings WHERE metric = ? AND origin = 'auto'", (metric,))
         store.conn.executemany(
             "INSERT INTO athlete_settings (metric, effective_date, origin, value, note, updated_at) "
             "VALUES (?, ?, 'auto', ?, ?, ?)",
-            [(metric, d, v, f"95% of best 20 min, trailing {AUTO_WINDOW_DAYS} days", now) for d, v in changes],
+            [(metric, d, v, note, now) for d, v in changes],
         )
+
+
+def thresholds_on(conn: sqlite3.Connection, day: date | str) -> Thresholds:
+    """The thresholds in effect on ``day``."""
+    iso = day.isoformat() if isinstance(day, date) else parse_date(day).isoformat()
+    return Thresholds(**{m: _load_timeline(conn, m).at(iso) for m in ("ftp_w", "threshold_hr", "max_hr", "resting_hr")})
 
 
 # -- pipeline -------------------------------------------------------------------------------
@@ -299,28 +432,34 @@ def _replace_auto(store: Store, metric: str, changes: list[tuple[str, float]]) -
 # New streams, changed streams (another timestamp or size than the ones analysed),
 # an older analysis version, or everything with ``full``.
 _PENDING_SQL = """
-SELECT s.source, s.source_id, s.encoding, s.data, s.updated_at
+SELECT s.source, s.source_id
 FROM activity_streams s
 LEFT JOIN activity_metrics m USING (source, source_id)
 WHERE m.source IS NULL OR m.analysis_version < ? OR m.streams_updated_at IS NOT s.updated_at
    OR m.streams_bytes IS NOT length(s.data) OR ?
 ORDER BY s.source, s.source_id
 """
+_METRIC_THRESHOLDS = ("ftp_w", "threshold_hr", "max_hr", "resting_hr")
 
 
 def analyze(store: Store, *, full: bool = False, progress: Callable[[int, int], None] | None = None) -> dict[str, int]:
     """Bring ``activity_metrics``, ``power_curve`` and the auto thresholds up to date.
 
     Only activities whose streams are new or changed (or all, with ``full``) are
-    read; every activity whose thresholds changed is re-scored from its stored row.
+    read; every activity whose thresholds, date or sport changed is re-scored
+    from its stored row.
     """
     conn = store.conn
     pending = conn.execute(_PENDING_SQL, (ANALYSIS_VERSION, 1 if full else 0)).fetchall()
     fresh: set[tuple[str, str]] = set()
     batch: list[dict[str, Any]] = []
-    for i, (source, source_id, encoding, data, streams_updated_at) in enumerate(pending, start=1):
+    for i, (source, source_id) in enumerate(pending, start=1):
+        encoding, data, streams_updated_at = conn.execute(
+            "SELECT encoding, data, updated_at FROM activity_streams WHERE source = ? AND source_id = ?",
+            (source, source_id),
+        ).fetchone()
         metrics, curve = base_metrics(decode_streams(encoding, data))
-        # The threshold-dependent columns stay empty until the rescoring pass below.
+        # The threshold-dependent columns stay empty until the re-scoring pass below.
         batch.append(
             {
                 "source": source,
@@ -339,35 +478,45 @@ def analyze(store: Store, *, full: bool = False, progress: Callable[[int, int], 
         if progress:
             progress(i, len(pending))
     store.upsert_activity_metrics(batch)
+    batch.clear()
 
     activities = conn.execute(
         """
-        SELECT m.source, m.source_id, a.local_date, a.activity_type, m.hr_20min_bpm, p.watts AS best_20min_w
+        SELECT m.source, m.source_id, a.local_date, a.activity_type, m.hr_20min_bpm, m.max_hr,
+               p.watts AS best_20min_w
         FROM activity_metrics m
         JOIN activities a USING (source, source_id)
         LEFT JOIN power_curve p ON p.source = m.source AND p.source_id = m.source_id AND p.duration_s = ?
         """,
         (AUTO_DURATION_S,),
     ).fetchall()
-    dates = {(r["source"], r["source_id"]): r["local_date"] for r in activities}
-    cycling = {(r["source"], r["source_id"]) for r in activities if sport_family(r["activity_type"]) == "cycling"}
-    rides = [r for r in activities if (r["source"], r["source_id"]) in cycling]
-    _replace_auto(store, "ftp_w", auto_thresholds((r["local_date"], r["best_20min_w"]) for r in rides))
-    _replace_auto(store, "threshold_hr", auto_thresholds((r["local_date"], r["hr_20min_bpm"]) for r in rides))
-    ftp, lthr = _load_timeline(conn, "ftp_w"), _load_timeline(conn, "threshold_hr")
+    info = {(r["source"], r["source_id"]): (r["local_date"], sport_family(r["activity_type"])) for r in activities}
+    rides = [r for r in activities if sport_family(r["activity_type"]) == "cycling"]
+    window = f"trailing {AUTO_WINDOW_DAYS} days"
+    _replace_auto(store, "ftp_w", auto_thresholds(((r["local_date"], r["best_20min_w"]) for r in rides), FTP_FACTOR),
+                  f"95% of best 20 min power, {window}")  # fmt: skip
+    _replace_auto(store, "threshold_hr", auto_thresholds((r["local_date"], r["hr_20min_bpm"]) for r in rides),
+                  f"best 20 min heart rate, {window}")  # fmt: skip
+    _replace_auto(store, "max_hr",
+                  auto_thresholds(((r["local_date"], r["max_hr"]) for r in activities), rank=MAX_HR_RANK),
+                  f"third-highest best 30 s heart rate, {window}")  # fmt: skip
+    timelines = {m: _load_timeline(conn, m) for m in _METRIC_THRESHOLDS}
 
     rescored = 0
     for row in conn.execute("SELECT * FROM activity_metrics").fetchall():
         key = (row["source"], row["source_id"])
-        if key not in dates:
+        if key not in info:
             continue  # streams without an activity row: no date to look thresholds up for
-        want_ftp, want_lthr = ftp.at(dates[key]), lthr.at(dates[key])
-        if key not in fresh and row["ftp_w"] == want_ftp and row["threshold_hr"] == want_lthr:
+        local_date, sport = info[key]
+        th = Thresholds(**{m: timelines[m].at(local_date) for m in _METRIC_THRESHOLDS})
+        scored_with = (local_date, sport, th.ftp_w, th.threshold_hr, th.max_hr, th.resting_hr)
+        if key not in fresh and row["scored_with"] == json.dumps(scored_with):
             continue
         base = dict(row)
         for column in ("power_hist", "hr_hist"):
             base[column] = json.loads(base[column]) if base[column] else None
-        batch.append({**base, **threshold_metrics(base, key in cycling, want_ftp, want_lthr)})
+        update = threshold_metrics(base, sport == "cycling", th)
+        batch.append({**base, **update, "scored_with": json.dumps(scored_with)})
         rescored += 1
         if len(batch) >= BATCH:
             store.upsert_activity_metrics(batch)
@@ -376,12 +525,6 @@ def analyze(store: Store, *, full: bool = False, progress: Callable[[int, int], 
     return {
         "analysed": len(fresh),
         "rescored": rescored,
-        "ftp_changes": len(ftp.dates),
-        "threshold_hr_changes": len(lthr.dates),
+        "ftp_changes": len(timelines["ftp_w"].manual) + len(timelines["ftp_w"].auto),
+        "threshold_hr_changes": len(timelines["threshold_hr"].manual) + len(timelines["threshold_hr"].auto),
     }
-
-
-def thresholds_on(conn: sqlite3.Connection, day: date | str) -> dict[str, float | None]:
-    """FTP and threshold HR in effect on ``day``."""
-    iso = day.isoformat() if isinstance(day, date) else parse_date(day).isoformat()
-    return {metric: _load_timeline(conn, metric).at(iso) for metric in ("ftp_w", "threshold_hr")}

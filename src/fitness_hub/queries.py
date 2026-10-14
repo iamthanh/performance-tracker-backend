@@ -11,7 +11,7 @@ import re
 import sqlite3
 import time
 from bisect import bisect_left, bisect_right
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -112,11 +112,16 @@ def _priority(source: str) -> int:
         return len(SOURCE_PRIORITY)
 
 
-def dedupe_activities(rows: Iterable[dict[str, Any]], window_s: int = DEDUPE_WINDOW_S) -> list[dict[str, Any]]:
+def dedupe_activities(
+    rows: Iterable[dict[str, Any]],
+    window_s: int = DEDUPE_WINDOW_S,
+    rank: Callable[[dict[str, Any]], Any] | None = None,
+) -> list[dict[str, Any]]:
     """Merge rows from *different* sources that record the same workout.
 
     Rows are visited in source-priority order (garmin > google_health > strava
-    > garmin_export), so each group is seeded by the activity it keeps. A row
+    > garmin_export, or ``rank`` when given: lowest first), so each group is
+    seeded by the activity it keeps. A row
     joins the group whose kept activity starts nearest to it, provided that is
     within ``window_s`` seconds and the group has no row from the same source;
     otherwise it starts a new group. Every merged duplicate therefore starts
@@ -132,7 +137,8 @@ def dedupe_activities(rows: Iterable[dict[str, Any]], window_s: int = DEDUPE_WIN
             timed.append((ts, row))
         else:
             untimed.append(row)
-    timed.sort(key=lambda item: (_priority(item[1]["source"]), item[0]))
+    order = rank or (lambda r: _priority(r["source"]))
+    timed.sort(key=lambda item: (order(item[1]), item[0]))
 
     window = timedelta(seconds=window_s)
     anchors: list[datetime] = []  # start time of each group's kept row, sorted
@@ -343,17 +349,18 @@ _METRIC_SUMMARY_COLUMNS = (
 )
 
 
-def _scored_activities(conn: sqlite3.Connection, end: str | None = None) -> list[dict[str, Any]]:
-    """Activities with a TSS, de-duplicated across sources, oldest first."""
-    sql = (
-        "SELECT a.source, a.source_id, a.start_time, a.local_date, a.activity_type, m.tss "
-        "FROM activity_metrics m JOIN activities a USING (source, source_id) WHERE m.tss IS NOT NULL"
-    )
-    params: list[Any] = []
-    if end:
-        sql += " AND a.local_date <= ?"
-        params.append(end)
-    return dedupe_activities(dict(r) for r in conn.execute(sql, params))
+def _activities_with_tss(conn: sqlite3.Connection, end: str) -> list[dict[str, Any]]:
+    """Every workout up to ``end``, de-duplicated across sources. When several copies
+    exist, a scored one is kept, so ``tss`` is ``None`` only if no copy was scored."""
+    rows = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT a.source, a.source_id, a.start_time, a.local_date, a.activity_type, m.tss "
+            "FROM activities a LEFT JOIN activity_metrics m USING (source, source_id) WHERE a.local_date <= ?",
+            (end,),
+        )
+    ]
+    return dedupe_activities(rows, rank=lambda r: (r["tss"] is None, _priority(r["source"])))
 
 
 def training_load(
@@ -363,39 +370,56 @@ def training_load(
 
     CTL and ATL are exponentially weighted averages of daily TSS, seeded at 0 on
     the first scored day. TSB for a day is the previous day's CTL - ATL (form
-    going into that day), as TrainingPeaks shows it. Defaults to the last 90 days.
+    going into that day), as TrainingPeaks shows it. ``unscored`` counts the
+    day's workouts without a TSS (no streams to analyse, e.g. synced from an
+    API rather than imported), which the load does not include. Defaults to the
+    last 90 days.
     """
     start, end = _date_range(start_date, end_date, 90, today)
     end = end or (today or date.today()).isoformat()
-    daily: dict[str, float] = {}
-    for row in _scored_activities(conn, end):
-        daily[row["local_date"]] = daily.get(row["local_date"], 0.0) + row["tss"]
-    if not daily:
+    tss: dict[str, float] = {}
+    unscored: dict[str, int] = {}
+    for row in _activities_with_tss(conn, end):
+        if row["tss"] is None:
+            unscored[row["local_date"]] = unscored.get(row["local_date"], 0) + 1
+        else:
+            tss[row["local_date"]] = tss.get(row["local_date"], 0.0) + row["tss"]
+    if not tss and not unscored:
         return []
-    day, last = date.fromisoformat(min(daily)), date.fromisoformat(end)
+    first = min([*tss, *unscored, *([start] if start else [])])
+    day, last = date.fromisoformat(first), date.fromisoformat(end)
     ctl = atl = 0.0
     out = []
     while day <= last:
         iso = day.isoformat()
-        tss = daily.get(iso, 0.0)
+        load = tss.get(iso, 0.0)
         tsb = ctl - atl
-        ctl += (tss - ctl) / CTL_DAYS
-        atl += (tss - atl) / ATL_DAYS
+        ctl += (load - ctl) / CTL_DAYS
+        atl += (load - atl) / ATL_DAYS
         if start is None or iso >= start:
             out.append(
-                {"date": iso, "tss": round(tss, 1), "ctl": round(ctl, 1), "atl": round(atl, 1), "tsb": round(tsb, 1)}
-            )
+                {"date": iso, "tss": round(load, 1), "ctl": round(ctl, 1), "atl": round(atl, 1),
+                 "tsb": round(tsb, 1), "unscored": unscored.get(iso, 0)}
+            )  # fmt: skip
         day += timedelta(days=1)
     return out
 
 
 def best_power_curve(
-    conn: sqlite3.Connection, start_date: str | None = None, end_date: str | None = None
+    conn: sqlite3.Connection,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    activity_type: str | None = "cycling",
 ) -> list[dict[str, Any]]:
     """Best average power per duration across activities in the date range (all time by
-    default), each with the activity that set it."""
+    default) of one sport (cycling by default; ``None`` for all), each with the
+    activity that set it."""
     start, end = _date_range(start_date, end_date, None)
     clauses, params = [], []
+    type_sql, type_params = _type_clause(activity_type)
+    if type_sql:
+        clauses.append(type_sql.replace("activity_type", "a.activity_type"))
+        params.extend(type_params)
     if start:
         clauses.append("a.local_date >= ?")
         params.append(start)
@@ -431,10 +455,10 @@ def activity_analysis(conn: sqlite3.Connection, source: str, source_id: str) -> 
         seconds = json.loads(row[column]) if row[column] else None
         result[key] = (
             [
-                {"zone": name, "upper": None if upper == float("inf") else round(upper * threshold), "seconds": s}
-                for (name, upper), s in zip(zones, seconds, strict=True)
+                {"zone": name, "upper": upper, "seconds": s}
+                for name, upper, s in zip(zones.names, zones.upper_values(threshold), seconds, strict=True)
             ]
-            if seconds
+            if seconds and threshold
             else None
         )
     result["power_curve"] = [

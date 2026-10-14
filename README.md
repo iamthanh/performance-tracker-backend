@@ -92,34 +92,53 @@ to 8). About 1,700 activities take a couple of minutes.
 ### Training analysis (TSS, NP, FTP, fitness/fatigue/form)
 
 The import runs the analysis at the end; `fitness-hub analyze` runs it again (only new or changed activities;
-`--full` for all). About 1,700 activities take ~10 s. For each activity with streams it computes:
+`--full` for all). About 1,700 activities take ~15 s. After upgrading from a version without the analysis, run
+`fitness-hub analyze` once: until then `training_load` is empty. For each activity with streams it computes:
 
 - normalized power, intensity factor, TSS, variability index, efficiency factor (NP / avg HR), work (kJ), Pw:HR
   decoupling, time in Coggan power zones and Friel HR zones, and the best average power for 1 s to 5 h;
-- TSS from power for rides (`seconds × NP × IF / (FTP × 3600) × 100`), otherwise an HR estimate
-  (`hours × (avg HR / threshold HR)² × 100`).
+- TSS from power for rides (`seconds × NP × IF / (FTP × 3600) × 100`). Otherwise (runs, rides without a working power
+  meter) an HR-based TSS: Banister's TRIMP, scaled so that an hour at threshold heart rate scores 100. On rides that
+  have both, it agrees with power TSS at the median.
 
-Streams are put on a 1 Hz timer clock: values are held across gaps of up to 5 s, longer gaps are pauses and left out,
-and missing power counts as 0 W. Normalized power agrees with Wahoo head units to within about 2 W.
+How the streams are read:
 
-**Thresholds.** FTP and threshold HR are detected automatically: 95 % of the best 20-minute power (or heart rate) on a
-ride in the trailing 365 days. They only fall when your best efforts age out after a year, so after a long block
-without hard efforts they read low.
-Override them from a date on:
+- They are put on a 1 Hz timer clock. Gaps of up to 5 s are filled with the previous value, and so are longer gaps
+  covered at 1 m/s or more (watches that record every few seconds). Other gaps are pauses and are left out.
+- Missing power counts as 0 W. Heart rate below 30 bpm (a strap that lost contact) or above 220 bpm (sensor spikes)
+  counts as missing.
+- Power is only used when at least 25 % of the ride has power above 0 W, so a dying power meter does not set the TSS.
+- Peak powers and best 20-minute values never join efforts across a pause.
+- Normalized power is the standard 30 s / 4th-power calculation. On the rides tested it was a median of 1.6 W below
+  the Wahoo head unit's own value.
+
+**Thresholds.** Detected automatically from rides in the trailing 365 days:
+
+- FTP: 95 % of the best 20-minute power.
+- Threshold HR: the best 20-minute heart rate.
+- Max HR: the third-highest best-30-second heart rate of any activity, so one or two noisy sessions don't set it.
+- The first values use your first four weeks of rides.
+- Resting HR, used by the HR-based TSS, defaults to 50 bpm. If max HR is unknown or not above threshold HR, threshold
+  HR is taken as 92 % of max.
+
+Set your own from a date on:
 
 ```bash
 fitness-hub thresholds set ftp 250 --from 2026-09-01 --note "ramp test"
 fitness-hub thresholds set threshold-hr 168 --from 2026-09-01
+fitness-hub thresholds set resting-hr 48 --from 2026-01-01
 fitness-hub thresholds list
 fitness-hub thresholds delete ftp --from 2026-09-01
 ```
 
-The value for a date is the latest entry on or before it (manual wins a tie with an automatic one); before the first
-entry, the first one applies. Changing a threshold re-scores the affected activities from their stored results, without
-reading the streams again.
+A manual value holds until your next manual value, unless the automatic value later rises above it (a new best
+effort). Before the first value, the first one applies. Changing a threshold re-scores the affected activities from
+their stored results, without reading the streams again.
 
 **Fitness, fatigue, form** (MCP `training_load`): daily TSS, CTL (42-day exponentially weighted average), ATL (7-day)
-and TSB, the previous day's CTL − ATL, as on TrainingPeaks' Performance Management Chart.
+and TSB, the previous day's CTL − ATL, as on TrainingPeaks' Performance Management Chart. Only activities with
+imported streams have a TSS; each day also reports `unscored` workouts, so you can tell when the load is understated
+(for example, new rides that have not been imported yet).
 
 ### Strava API (needs a Strava subscription)
 
@@ -354,10 +373,10 @@ local clock. Every row keeps the provider payload in `raw` and an `updated_at` s
 | `body_measurements` | `(source, ts, metric)` | `value, raw` |
 | `sync_state` | `(source, stream)` | `cursor, last_attempt, last_success, last_error, rows_upserted` |
 | `activity_streams` | `(source, source_id)` | `channels` (JSON list), `sample_count, encoding, data` (zlib-compressed JSON `{channel: [values]}`), `meta` |
-| `activity_metrics` | `(source, source_id)` | Threshold-independent: `timer_s, avg_power_w, max_power_w, normalized_power_w, work_kj, avg_hr, max_hr, hr_20min_bpm, decoupling_pct, power_hist, hr_hist`. With the thresholds in effect that day: `ftp_w, threshold_hr, intensity_factor, tss, tss_method, variability_index, efficiency_factor, power_zone_s, hr_zone_s`. Plus `analysis_version, streams_updated_at, streams_bytes` |
+| `activity_metrics` | `(source, source_id)` | Threshold-independent: `timer_s, avg_power_w, max_power_w, normalized_power_w, work_kj, variability_index, avg_hr, max_hr` (best 30 s)`, hr_20min_bpm, efficiency_factor, decoupling_pct, power_hist, hr_hist`. With the thresholds in effect that day: `ftp_w, threshold_hr, intensity_factor, tss, tss_method, variability_index, efficiency_factor, power_zone_s, hr_zone_s`. Plus `analysis_version, streams_updated_at, streams_bytes` |
 | `daily_series` | `(source, date, series)` | `channels, sample_count, encoding, data`: intraday samples, `{"time": [epoch s], "heart_rate": [bpm]}` for series `heart_rate` |
 | `power_curve` | `(source, source_id, duration_s)` | `watts`: the best average power over `duration_s` in that activity |
-| `athlete_settings` | `(metric, effective_date, origin)` | `value, note`. Metrics `ftp_w, threshold_hr, max_hr`; origin `manual` or `auto`. A value applies from its date until the next one |
+| `athlete_settings` | `(metric, effective_date, origin)` | `value, note`. Metrics `ftp_w, threshold_hr, max_hr, resting_hr`; origin `manual` or `auto` (see Training analysis for how they combine) |
 
 **Schema versions.** The version is kept in `PRAGMA user_version`. Opening the database applies any missing migrations
 (`db.MIGRATIONS`), each in one transaction. A database created before versioning counts as version 1, and a database

@@ -11,6 +11,7 @@ payload in ``raw`` and every write is ``INSERT ... ON CONFLICT DO UPDATE``.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import time
@@ -203,6 +204,7 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             efficiency_factor REAL,
             power_zone_s TEXT,               -- JSON array: seconds spent in each power zone
             hr_zone_s TEXT,                  -- JSON array: seconds spent in each HR zone
+            scored_with TEXT,                -- JSON [local_date, sport, thresholds...] the values above used
             updated_at TEXT NOT NULL,
             PRIMARY KEY (source, source_id)
         )
@@ -211,7 +213,7 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
 }
 
 STREAM_ENCODING = "zlib+json"
-ATHLETE_SETTINGS = ("ftp_w", "threshold_hr", "max_hr")
+ATHLETE_SETTINGS = ("ftp_w", "threshold_hr", "max_hr", "resting_hr")
 SETTING_ORIGINS = ("manual", "auto")
 
 DATA_TABLES = ("activities", "daily_metrics", "sleep_sessions", "body_measurements")
@@ -295,6 +297,7 @@ _METRIC_COLUMNS = (
     "efficiency_factor",
     "power_zone_s",
     "hr_zone_s",
+    "scored_with",
 )
 _METRIC_JSON_COLUMNS = ("power_hist", "hr_hist", "power_zone_s", "hr_zone_s")
 _SERIES_COLUMNS = ("source", "date", "series", "channels", "sample_count", "encoding", "data")
@@ -613,9 +616,12 @@ class Store:
             raise ValueError(f"unknown athlete setting {metric!r}; expected one of {', '.join(ATHLETE_SETTINGS)}")
         if origin not in SETTING_ORIGINS:
             raise ValueError(f"origin must be one of {', '.join(SETTING_ORIGINS)}")
+        value = float(value)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{metric} must be a positive number, got {value!r}")
         effective_date = parse_date(effective_date, "effective_date").isoformat()
         with self.conn:
-            self.conn.execute(_SQL_SETTING, (metric, effective_date, origin, float(value), note, now_utc_iso()))
+            self.conn.execute(_SQL_SETTING, (metric, effective_date, origin, value, note, now_utc_iso()))
 
     def delete_athlete_setting(self, metric: str, effective_date: str, origin: str = "manual") -> bool:
         effective_date = parse_date(effective_date, "effective_date").isoformat()
