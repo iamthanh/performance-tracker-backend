@@ -291,6 +291,14 @@ local clock. Every row keeps the provider payload in `raw` and an `updated_at` s
 | `sleep_sessions` | `(source, source_id)` | `start_time, end_time, local_date` (the date the sleep **ended**), `minutes_asleep, minutes_awake, minutes_deep, minutes_light, minutes_rem, is_main, raw` |
 | `body_measurements` | `(source, ts, metric)` | `value, raw` |
 | `sync_state` | `(source, stream)` | `cursor, last_attempt, last_success, last_error, rows_upserted` |
+| `activity_streams` | `(source, source_id)` | `channels` (JSON list), `sample_count, encoding, data` (zlib-compressed JSON `{channel: [values]}`), `meta` |
+| `activity_metrics` | `(source, source_id)` | `analysis_version, ftp_w, threshold_hr, normalized_power_w, intensity_factor, tss, tss_method, variability_index, efficiency_factor, work_kj, decoupling_pct, power_zone_s, hr_zone_s` |
+| `power_curve` | `(source, source_id, duration_s)` | `watts`: the best average power over `duration_s` in that activity |
+| `athlete_settings` | `(metric, effective_date, origin)` | `value, note`. Metrics `ftp_w, threshold_hr, max_hr`; origin `manual` or `auto`. A value applies from its date until the next one |
+
+**Schema versions.** The version is kept in `PRAGMA user_version`. Opening the database applies any missing migrations
+(`db.MIGRATIONS`), each in one transaction. A database created before versioning counts as version 1, and a database
+newer than the installed fitness-hub is refused rather than misread.
 
 **Sources:** `strava`, `garmin`, `google_health`, `garmin_export` (CSV import).
 
@@ -451,4 +459,3 @@ From the plan, in priority order:
 6. Token encryption at rest (OS keychain).
 7. Derived training-load, sleep-regularity and HRV-baseline views.
 8. Webhook-driven Google Health sync.
-9. Schema migrations (`PRAGMA user_version`) before the first breaking schema change.

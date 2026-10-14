@@ -49,7 +49,12 @@ moving_s, distance_m, elevation_gain_m, avg_hr, max_hr, avg_power_w, calories, r
 daily_metrics(source, date, metric, value, raw, updated_at), sleep_sessions(source, source_id, start_time, \
 end_time, local_date, minutes_asleep, minutes_awake, minutes_deep, minutes_light, minutes_rem, is_main, raw, \
 updated_at), body_measurements(source, ts, metric, value, raw, updated_at), sync_state(source, stream, cursor, \
-last_attempt, last_success, last_error, rows_upserted). `raw` holds the provider JSON (use json_extract). \
+last_attempt, last_success, last_error, rows_upserted), activity_metrics(source, source_id, analysis_version, \
+ftp_w, threshold_hr, normalized_power_w, intensity_factor, tss, tss_method, variability_index, efficiency_factor, \
+work_kj, decoupling_pct, power_zone_s, hr_zone_s, updated_at), power_curve(source, source_id, duration_s, watts, \
+updated_at), athlete_settings(metric, effective_date, origin, value, note, updated_at), activity_streams(source, \
+source_id, channels, sample_count, encoding, data, meta, updated_at; data is a compressed blob, not queryable). \
+`raw` holds the provider JSON (use json_extract). \
 query_sql does NOT de-duplicate activities.
 
 If data looks stale, check sync_status; sync_now fetches new data (it can take minutes and uses \
