@@ -315,14 +315,17 @@ It has **no authentication**. By default it serves only this machine:
 - Writes with an `Origin` header must come from one of those or a loopback origin, and JSON bodies need
   `Content-Type: application/json`.
 
-**LAN mode.** With `--host 0.0.0.0` (or `API_HOST=0.0.0.0` in `.env`), or a private address of this machine, it also
-serves your local network, so the UI works from a phone or another computer (see the UI's README). Anyone on the
-network can then read your data and change thresholds, so use it only on a network you trust. In LAN mode:
+**LAN mode.** With `--host 0.0.0.0` (or `API_HOST=0.0.0.0` in `.env`) it also serves your local network, so the UI
+works from a phone or another computer (see the UI's README). Anyone on the network can then read your data and change
+thresholds, so use it only on a network you trust. In LAN mode:
 
-- `Host` (and the host of a write's `Origin`) may also be a private or link-local IP address, or this machine's host
-  name, bare or `.local`. Other names still get 421, so DNS rebinding stays blocked; add your own names, such as a
-  router DNS entry, to `API_ALLOWED_HOSTS` (comma-separated).
-- It refuses to bind to a public IP address.
+- It answers only clients whose address is loopback, private (10/8, 172.16/12, 192.168/16, fc00::/7) or
+  link-local (403 otherwise), even if the machine also has a public IPv4 or IPv6 address.
+- `Host` (and the host of a write's `Origin`) may also be one of those IP addresses, or this machine's host name, bare
+  or `.local`. Other names still get 421, so DNS rebinding stays blocked; add your own names, such as a router DNS
+  entry, to `API_ALLOWED_HOSTS` (comma-separated).
+- It refuses to bind to a public IP address. Prefer `0.0.0.0`: bound to one private address only, it no longer listens
+  on 127.0.0.1, which is where the UI's proxy looks (set the UI's `FITNESS_HUB_API` to match).
 - If a firewall is on, allow port 8801 from your network only (for example
   `sudo ufw allow from 192.168.1.0/24 to any port 8801 proto tcp`).
 

@@ -17,7 +17,17 @@ with warnings.catch_warnings():
     from fastapi.testclient import TestClient
 
 from fitness_hub.analysis import analyze
-from fitness_hub.api import check_bind_host, create_app, host_allowed, host_name, machine_host_names, serve
+from fitness_hub.api import (
+    check_bind_host,
+    create_app,
+    host_allowed,
+    host_name,
+    is_lan_bind,
+    lan_urls,
+    machine_host_names,
+    origin_host,
+    serve,
+)
 from fitness_hub.config import Settings
 from fitness_hub.db import Store
 from fitness_hub.queries import downsample
@@ -231,47 +241,89 @@ def test_api_cors_origins_setting(tmp_path) -> None:
 
 
 def test_serve_refuses_public_bind_addresses(settings: Settings) -> None:
-    for host in ("8.8.8.8", "2001:4860:4860::8888", "example.com"):
+    for host in ("8.8.8.8", "2001:4860:4860::8888", "example.com", "198.18.0.1", "240.0.0.1", "0.0.0.1",
+                 "2001:0:1234::1", "fe80::1"):  # benchmarking, reserved, "this network", Teredo, link-local
         with pytest.raises(ValueError):
             serve(settings, host=host)
-    for host in ("127.0.0.1", "localhost", "::1", "0.0.0.0", "::", "192.168.1.124", "10.0.0.2", "fe80::1"):
+    with pytest.raises(ValueError, match="public"):
+        serve(dataclasses.replace(settings, api_host="8.8.8.8"))  # API_HOST, not only --host
+    for host in ("127.0.0.1", "localhost", "::1", "0.0.0.0", "::", "192.168.1.124", "10.0.0.2", "fd00::2"):
         check_bind_host(host)
 
 
-def test_lan_mode_serves_local_network_hosts(settings: Settings) -> None:
-    lan = TestClient(create_app(dataclasses.replace(settings, api_host="0.0.0.0", api_allowed_hosts=("nas.home",))),
-                     base_url=BASE)  # fmt: skip
-    name = sorted(machine_host_names())[0]
-    for host in ("192.168.1.124:8801", "10.1.2.3", "172.16.0.9:5173", "[fd9b::1]:8801", "[fe80::1]", "localhost:5173",
-                 f"{name}:5173", "nas.home"):  # fmt: skip
+def test_lan_mode_is_any_bind_beyond_loopback() -> None:
+    assert [is_lan_bind(h) for h in ("127.0.0.1", "127.0.0.2", "localhost", "[::1]", "0.0.0.0", "::", "192.168.1.5")] \
+        == [False, False, False, False, True, True, True]  # fmt: skip
+
+
+@pytest.fixture
+def machine(monkeypatch: pytest.MonkeyPatch) -> str:
+    monkeypatch.setattr(socket, "gethostname", lambda: "Box.home.arpa")
+    return "box"
+
+
+def lan_client(settings: Settings, peer: str = "192.168.1.50", **changes: object) -> TestClient:
+    app = create_app(dataclasses.replace(settings, api_host="0.0.0.0", **changes))  # type: ignore[arg-type]
+    return TestClient(app, base_url=BASE, client=(peer, 50000))
+
+
+def test_lan_mode_serves_local_network_hosts(settings: Settings, machine: str) -> None:
+    lan = lan_client(settings, api_allowed_hosts=("nas.home", "pc.lan:8801", "[fd00::9]"))
+    for host in ("192.168.1.124:8801", "10.1.2.3", "172.16.0.9:5173", "[fd9b::1]:8801", "[fe80::1%25eth0]",
+                 "[::ffff:192.168.0.2]:8801", "localhost:5173", "LOCALHOST.", "box:5173", "Box.local", "box.local.",
+                 "nas.home", "pc.lan", "[fd00::9]:1"):  # fmt: skip
         assert lan.get("/api/health", headers={"Host": host}).status_code == 200, host
-    # DNS rebinding still sends the attacker's name; public addresses are not the local network.
-    for host in ("attacker.example", "8.8.8.8:8801", "0.0.0.0:8801", "100.64.0.1", "evil.local"):
+    # DNS rebinding still sends the attacker's name; public and odd addresses are not the local network.
+    for host in ("attacker.example", "8.8.8.8:8801", "0.0.0.0:8801", "0.0.0.1", "198.18.0.1", "100.64.0.1",
+                 "evil.local", "box.home.arpa", ""):  # fmt: skip
         refused = lan.get("/api/health", headers={"Host": host})
         assert refused.status_code == 421 and "API_ALLOWED_HOSTS" in refused.json()["detail"], host
+
+
+def test_lan_mode_writes(settings: Settings, machine: str) -> None:
+    lan = lan_client(settings)
     body = {"metric": "ftp_w", "effective_date": "2026-09-02", "value": 123}
-    phone = {"Host": "192.168.1.124:5173", "Origin": "http://192.168.1.124:5173"}
-    assert lan.post("/api/thresholds", json=body, headers=phone).status_code == 201
-    evil = {"Host": "192.168.1.124:5173", "Origin": "https://evil.example"}
-    assert lan.post("/api/thresholds", json=body, headers=evil).status_code == 403
-    # Loopback mode keeps refusing LAN names, and says how to allow them.
-    local = TestClient(create_app(settings), base_url=BASE)
-    refused = local.get("/api/health", headers={"Host": "192.168.1.124:8801"})
+    for origin in ("http://192.168.1.124:5173", "http://box.local:5173", "http://[fd00::1]:5173"):
+        assert lan.post("/api/thresholds", json=body, headers={"Origin": origin}).status_code == 201, origin
+    for origin in ("https://evil.example", "null", "http://8.8.8.8", "http://evil.local"):
+        assert lan.post("/api/thresholds", json=body, headers={"Origin": origin}).status_code == 403, origin
+
+
+def test_lan_mode_refuses_clients_outside_the_local_network(settings: Settings) -> None:
+    """A Host header can say anything; the peer address cannot."""
+    for peer in ("8.8.8.8", "2001:4860::1", "100.64.0.1", "testclient"):
+        response = lan_client(settings, peer=peer).get("/api/health", headers={"Host": "192.168.1.124:8801"})
+        assert response.status_code == 403, peer
+    for peer in ("127.0.0.1", "::1", "192.168.1.50", "fd00::5", "::ffff:10.0.0.7"):
+        assert lan_client(settings, peer=peer).get("/api/health").status_code == 200, peer
+
+
+def test_loopback_mode_refuses_lan_names(client: TestClient, settings: Settings, machine: str) -> None:
+    refused = client.get("/api/health", headers={"Host": "192.168.1.124:8801"})
     assert refused.status_code == 421 and "--host 0.0.0.0" in refused.json()["detail"]
-    assert local.post("/api/thresholds", json=body, headers={"Origin": "http://192.168.1.124:5173"}).status_code == 403
+    allowed_names = TestClient(create_app(dataclasses.replace(settings, api_allowed_hosts=("nas.home",))), base_url=BASE)
+    for host in ("nas.home", "box.local"):
+        assert allowed_names.get("/api/health", headers={"Host": host}).status_code == 421, host
+    body = {"metric": "ftp_w", "effective_date": "2026-09-02", "value": 123}
+    assert client.post("/api/thresholds", json=body, headers={"Origin": "http://192.168.1.124:5173"}).status_code == 403
 
 
-def test_host_allowed() -> None:
+def test_host_helpers(machine: str) -> None:
     assert host_allowed("localhost", lan=False) and not host_allowed("192.168.0.2", lan=False)
     assert host_allowed("::ffff:192.168.0.2", lan=True) and not host_allowed("::ffff:8.8.8.8", lan=True)
-    assert host_allowed("100.101.102.103", lan=True, extra={"100.101.102.103"})  # e.g. a Tailscale address
+    assert machine_host_names() == {"box", "box.local"}
+    assert [origin_host(o) for o in ("http://[::1]:5173", "HTTP://Box.Local:1/", "null", "http://a.b:80@10.0.0.1")] \
+        == ["::1", "box.local", "", "10.0.0.1"]  # fmt: skip
+    assert lan_urls("192.168.1.9", 8801) == ["http://192.168.1.9:8801"]
+    assert lan_urls("fd00::2", 8801) == ["http://[fd00::2]:8801"]
+    assert lan_urls("0.0.0.0", 8801)[-1] == "http://box.local:8801"
 
 
 def test_api_host_settings(tmp_path) -> None:
     base = {"FITNESS_HUB_HOME": str(tmp_path)}
     default = Settings.from_env(base, cwd=tmp_path)
     assert (default.api_host, default.api_allowed_hosts) == ("127.0.0.1", ())
-    lan = Settings.from_env({**base, "API_HOST": "0.0.0.0", "API_ALLOWED_HOSTS": "NAS.home, pc.lan"}, cwd=tmp_path)
+    lan = Settings.from_env({**base, "API_HOST": "0.0.0.0", "API_ALLOWED_HOSTS": "NAS.home, pc.lan."}, cwd=tmp_path)
     assert (lan.api_host, lan.api_allowed_hosts) == ("0.0.0.0", ("nas.home", "pc.lan"))
 
 

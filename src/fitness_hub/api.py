@@ -2,7 +2,8 @@
 
 Local by default: it binds to loopback and has no authentication. Started on
 a non-loopback address (``serve-api --host 0.0.0.0`` or ``API_HOST``) it also
-serves the local network ("LAN mode"), still without authentication.
+serves the local network ("LAN mode"), still without authentication, and
+answers only clients whose address is loopback, private or link-local (403).
 Protections against other web pages in the browser:
 
 - Requests whose ``Host`` is not an allowed name are refused (421), so a web
@@ -32,6 +33,7 @@ from collections.abc import Awaitable, Callable, Collection, Iterator
 from contextlib import closing
 from dataclasses import asdict
 from typing import Annotated, Any, Literal, get_args
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,7 +44,7 @@ from . import __version__, queries
 from .analysis import analyze, thresholds_on
 from .config import Settings
 from .db import ATHLETE_SETTINGS, Store, open_readonly, schema_version
-from .mcp_server import LOOPBACK_HOSTS, is_loopback, normalize_host
+from .mcp_server import LOOPBACK_HOSTS, normalize_host
 from .util import InputError, parse_date
 
 DateQuery = Annotated[str | None, Query(description="YYYY-MM-DD (local date), inclusive")]
@@ -76,40 +78,62 @@ def host_name(value: str) -> str:
 
 
 def origin_host(origin: str) -> str:
-    return host_name(origin.split("://", 1)[-1].split("/", 1)[0])
-
-
-def _ip(name: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """``"http://192.168.1.5:5173"`` -> ``"192.168.1.5"``; ``""`` for an opaque origin (``"null"``)."""
     try:
-        return ipaddress.ip_address(name.split("%", 1)[0])  # drop an IPv6 zone ("fe80::1%eth0")
+        return (urlsplit(origin.strip()).hostname or "").rstrip(".")
+    except ValueError:
+        return ""
+
+
+IP = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+# The local network, listed explicitly: ipaddress's is_private also covers documentation,
+# benchmarking, reserved and Teredo ranges, some of which are routable.
+LOCAL_NETWORKS = tuple(
+    ipaddress.ip_network(n)
+    for n in ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+              "::1/128", "fc00::/7", "fe80::/10")
+)  # fmt: skip
+
+
+def _ip(name: str) -> IP | None:
+    try:
+        ip = ipaddress.ip_address(name.split("%", 1)[0])  # drop an IPv6 zone ("fe80::1%eth0")
     except ValueError:
         return None
+    return ip.ipv4_mapped or ip if isinstance(ip, ipaddress.IPv6Address) else ip
 
 
-def _local_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+def _local_ip(ip: IP) -> bool:
     """Loopback, private (10/8, 172.16/12, 192.168/16, fc00::/7) or link-local."""
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-        ip = ip.ipv4_mapped
-    return ip.is_loopback or ip.is_link_local or (ip.is_private and not ip.is_unspecified)
+    return any(ip in net for net in LOCAL_NETWORKS)
 
 
-def machine_host_names() -> set[str]:
+def machine_host_names() -> frozenset[str]:
     """Names other devices may use for this machine: its host name, bare and as mDNS ``.local``."""
-    names = {n.lower().rstrip(".") for n in (socket.gethostname(), socket.getfqdn()) if n}
-    names |= {f"{n.split('.', 1)[0]}.local" for n in names}
-    return names - {"localhost", "localhost.local"}
+    name = socket.gethostname().lower().split(".", 1)[0]
+    return frozenset() if name in ("", "localhost") else frozenset({name, f"{name}.local"})
 
 
-def host_allowed(name: str, lan: bool, extra: Collection[str] = ()) -> bool:
-    """Whether ``name`` (from Host or Origin) may be served. A DNS-rebinding page sends its own domain."""
+def host_allowed(name: str, lan: bool, names: Collection[str] = ()) -> bool:
+    """Whether ``name`` (from Host or Origin) may be served. A DNS-rebinding page sends its own domain.
+
+    ``names``: in LAN mode, the host names allowed besides loopback and local-network IP addresses.
+    """
+    name = name.rstrip(".")
     if name in LOOPBACK_HOSTS:
         return True
     if not lan:
         return False
     ip = _ip(name)
-    if ip is not None and _local_ip(ip):
-        return True
-    return name in extra or (ip is None and name.rstrip(".") in machine_host_names())
+    return (ip is not None and _local_ip(ip)) or name in names
+
+
+def is_lan_bind(host: str) -> bool:
+    """True when ``host`` listens beyond loopback (0.0.0.0, ::, a private address)."""
+    host = normalize_host(host)
+    ip = _ip(host)
+    return host != "localhost" and not (ip is not None and ip.is_loopback)
 
 
 def check_bind_host(host: str) -> None:
@@ -120,23 +144,32 @@ def check_bind_host(host: str) -> None:
     ip = _ip(host)
     if ip is None:
         raise ValueError(f"bind address {host!r} must be an IP address, e.g. 127.0.0.1 or 0.0.0.0")
+    if ip.is_link_local:
+        raise ValueError(f"cannot bind to the link-local address {host}; use 0.0.0.0")
     if not (ip.is_unspecified or _local_ip(ip)):
         raise ValueError(
             f"refusing to bind to the public address {host}: the API has no authentication "
-            "and would expose your health data. Use 127.0.0.1, a private address or 0.0.0.0 behind a router."
+            "and would expose your health data. Use 127.0.0.1, a private address or 0.0.0.0."
         )
 
 
-def lan_urls(port: int) -> list[str]:
+def _url(host: str, port: int) -> str:
+    return f"http://[{host}]:{port}" if ":" in host else f"http://{host}:{port}"
+
+
+def lan_urls(host: str, port: int) -> list[str]:
     """Best-effort addresses other devices can use (no packets are sent)."""
+    ip = _ip(normalize_host(host))
+    if ip is not None and not ip.is_unspecified:
+        return [_url(str(ip), port)]
     urls = []
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         try:
             s.connect(("192.0.2.1", 9))  # TEST-NET-1: only picks the outgoing interface
-            urls.append(f"http://{s.getsockname()[0]}:{port}")
+            urls.append(_url(s.getsockname()[0], port))
         except OSError:
             pass
-    urls.append(f"http://{socket.gethostname().split('.', 1)[0].lower()}.local:{port}")
+    urls += [_url(n, port) for n in sorted(machine_host_names()) if n.endswith(".local")]
     return urls
 
 
@@ -153,13 +186,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     allowed_origins = {o.rstrip("/") for o in settings.api_cors_origins}
-    lan = not is_loopback(settings.api_host)
-    extra_hosts = frozenset(settings.api_allowed_hosts)
+    lan = is_lan_bind(settings.api_host)
+    # Computed once: host names are looked up on every request.
+    lan_names = machine_host_names() | {host_name(h).rstrip(".") for h in settings.api_allowed_hosts}
 
     @app.middleware("http")
     async def allowed_hosts_only(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        if lan:
+            # The Host header is the client's word; the peer address is not. Through the UI's
+            # proxy the peer is 127.0.0.1, so the UI server must keep outsiders out itself.
+            peer = _ip(request.client.host) if request.client else None
+            if peer is None or not _local_ip(peer):
+                return JSONResponse(status_code=403, content={"detail": "only the local network is served"})
         host = host_name(request.headers.get("host", ""))
-        if not host_allowed(host, lan, extra_hosts):
+        if not host_allowed(host, lan, lan_names):
             detail = (
                 f"Host {host!r} is not served: add it to API_ALLOWED_HOSTS"
                 if lan
@@ -171,7 +211,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             request.method not in ("GET", "HEAD", "OPTIONS")
             and origin
             and origin.rstrip("/") not in allowed_origins
-            and not host_allowed(origin_host(origin), lan, extra_hosts)
+            and not host_allowed(origin_host(origin), lan, lan_names)
         ):
             return JSONResponse(status_code=403, content={"detail": f"writes are not allowed from {origin}"})
         return await call_next(request)
@@ -331,11 +371,12 @@ def serve(settings: Settings, host: str | None = None, port: int = 8801) -> None
     host = normalize_host(host or settings.api_host)
     check_bind_host(host)
     settings = dataclasses.replace(settings, api_host=host)
-    print(f"fitness-hub API on http://{host}:{port}/api (docs: /docs). Ctrl-C to stop.", file=sys.stderr)
-    if not is_loopback(host):
+    print(f"fitness-hub API on {_url(host, port)}/api (docs: /docs). Ctrl-C to stop.", file=sys.stderr)
+    if is_lan_bind(host):
         print(
             "LAN mode, no authentication: anyone on your network can read your data and change thresholds. "
-            f"Try {' or '.join(lan_urls(port))}",
+            f"Try {' or '.join(lan_urls(host, port))}",
             file=sys.stderr,
         )
-    uvicorn.run(create_app(settings), host=host, port=port, log_level="warning")
+    # proxy_headers=False: the peer-address check must not trust X-Forwarded-For.
+    uvicorn.run(create_app(settings), host=host, port=port, log_level="warning", proxy_headers=False)

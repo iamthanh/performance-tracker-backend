@@ -145,5 +145,5 @@ class Settings:
             if merged.get("API_CORS_ORIGINS")
             else cls.api_cors_origins,
             api_host=opt("API_HOST") or cls.api_host,
-            api_allowed_hosts=tuple(h.strip().lower() for h in (opt("API_ALLOWED_HOSTS") or "").split(",") if h.strip()),
+            api_allowed_hosts=tuple(h.strip().lower().rstrip(".") for h in (opt("API_ALLOWED_HOSTS") or "").split(",") if h.strip()),
         )
