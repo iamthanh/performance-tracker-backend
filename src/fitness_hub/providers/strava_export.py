@@ -6,16 +6,21 @@ The archive has ``activities.csv`` (one row per activity) and an
 stored as source ``strava`` under their Strava activity ID, the same key the
 Strava API uses, and each original file is parsed into ``activity_streams``.
 
-``activities.csv`` repeats some column names: the first ``Distance`` is in km
-(or miles), the second in metres; the second ``Elapsed Time`` is the detailed
-one. Times in ``Activity Date`` are UTC. The local date comes from the FIT
-file's local timestamp when there is one, otherwise from ``timezone``.
+``activities.csv`` repeats some column names: the first ``Distance`` is in the
+account's unit (km or miles), the second in metres; the second ``Elapsed
+Time`` is the detailed one. Times in ``Activity Date`` are UTC.
+
+The local date of an activity comes from, in order: the file's own local
+timestamp (FIT), ``timezone``, the date already stored for it, or the UTC date.
+Rows that came from the Strava API are left as they are (their ``raw`` payload
+and ``start_date_local`` are better than the CSV); only their streams are added.
 """
 
 from __future__ import annotations
 
 import csv
 import logging
+import multiprocessing
 import os
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ProcessPoolExecutor
@@ -24,9 +29,9 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from ..activity_files import parse_file
+from ..activity_files import UnsupportedFile, parse_file
 from ..db import Store
-from ..util import to_float, utc_iso
+from ..util import parse_ts, to_float, utc_iso
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +40,7 @@ STREAM = "export"
 BATCH = 50
 _DATE_FORMAT = "%b %d, %Y, %I:%M:%S %p"
 _MAX_START_SKEW_S = 120
+_KM_PER_MI = 1.609344
 
 
 def read_activities_csv(path: Path) -> list[dict[str, str]]:
@@ -66,9 +72,9 @@ def parse_activity_date(value: str) -> datetime:
     return datetime.strptime(value.strip(), _DATE_FORMAT).replace(tzinfo=UTC)
 
 
-def map_csv_row(row: Mapping[str, str]) -> dict[str, Any] | None:
+def map_csv_row(row: Mapping[str, str], distance_unit: str = "km") -> dict[str, Any] | None:
     """One ``activities.csv`` row -> ``activities`` row with a UTC local date
-    (the caller replaces it with the real local date)."""
+    (the importer replaces it with the real local date)."""
     activity_id = (row.get("Activity ID") or "").strip()
     if not activity_id:
         return None
@@ -78,8 +84,9 @@ def map_csv_row(row: Mapping[str, str]) -> dict[str, Any] | None:
         return None
     distance_m = _number(row, "Distance #2")
     if distance_m is None:
-        km = _number(row, "Distance")  # the summary column is km on metric accounts
-        distance_m = km * 1000 if km is not None else None
+        summary = _number(row, "Distance")  # in the account's unit
+        if summary is not None:
+            distance_m = summary * (1000 if distance_unit == "km" else _KM_PER_MI * 1000)
     return {
         "source": SOURCE,
         "source_id": activity_id,
@@ -103,6 +110,8 @@ def _parse_job(path: str) -> dict[str, Any]:
     """Runs in a worker process: parse one file into plain, picklable data."""
     try:
         parsed = parse_file(path)
+    except UnsupportedFile as exc:
+        return {"unsupported": str(exc)}
     except Exception as exc:  # noqa: BLE001 - a broken file must not stop the import
         return {"error": f"{type(exc).__name__}: {exc}"}
     return {
@@ -113,19 +122,14 @@ def _parse_job(path: str) -> dict[str, Any]:
     }
 
 
-def _local_date(start: datetime, offset_s: int | None, tz: ZoneInfo | None) -> str:
-    if offset_s is not None:
-        return (start + timedelta(seconds=offset_s)).date().isoformat()
-    if tz is not None:
-        return start.astimezone(tz).date().isoformat()
-    return start.date().isoformat()
-
-
 def _parsed_in_order(paths: list[str], workers: int) -> Iterator[dict[str, Any]]:
     if workers <= 1 or len(paths) <= 1:
         yield from map(_parse_job, paths)
         return
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    # spawn: the same behaviour on every Python version, and no fork of a process
+    # that holds an open SQLite connection.
+    context = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
         yield from pool.map(_parse_job, paths, chunksize=4)
 
 
@@ -134,6 +138,7 @@ def import_strava_export(
     path: Path | str,
     *,
     timezone: str | None = None,
+    distance_unit: str = "km",
     force: bool = False,
     workers: int | None = None,
     progress: Callable[[int, int], None] | None = None,
@@ -142,9 +147,12 @@ def import_strava_export(
     already stored are not parsed again unless ``force`` is set.
 
     ``timezone`` (IANA name) sets the local date of activities whose file has no
-    local timestamp (GPX, Strava JSON, some older FIT files); without it those
-    use the UTC date.
+    usable local timestamp (GPX, TCX, Strava JSON, Zwift FIT files).
+    ``distance_unit`` is the account's unit, used only for rows whose detailed
+    distance column is empty.
     """
+    if distance_unit not in ("km", "mi"):
+        raise ValueError("distance_unit must be 'km' or 'mi'")
     root = Path(path)
     csv_path = root / "activities.csv"
     if not csv_path.is_file():
@@ -159,7 +167,7 @@ def import_strava_export(
     rows, skipped = [], 0
     files: dict[str, Path] = {}
     for raw in read_activities_csv(csv_path):
-        row = map_csv_row(raw)
+        row = map_csv_row(raw, distance_unit)
         if row is None:
             skipped += 1
             continue
@@ -168,64 +176,89 @@ def import_strava_export(
         if filename:
             files[row["source_id"]] = root / filename
 
-    # Activities whose streams are already stored keep the local offset found last time.
-    known: dict[str, int | None] = {
-        r[0]: r[1]
-        for r in store.conn.execute(
+    # What is already stored: local offsets read from files, local dates, and
+    # which rows came from the Strava API rather than an earlier import.
+    file_offsets: dict[str, int | None] = dict(
+        store.conn.execute(
             "SELECT source_id, json_extract(meta, '$.local_offset_s') FROM activity_streams WHERE source = ?",
             (SOURCE,),
-        )
-    }
-    for row in rows:
-        if row["source_id"] in known:
-            start = datetime.fromisoformat(row["start_time"].replace("Z", "+00:00"))
-            row["local_date"] = _local_date(start, known[row["source_id"]], tz)
+        ).fetchall()
+    )
+    stored_dates: dict[str, str] = {}
+    api_rows: set[str] = set()
+    for source_id, local_date, from_export in store.conn.execute(
+        "SELECT source_id, local_date, json_extract(raw, '$.\"Activity ID\"') IS NOT NULL FROM activities "
+        "WHERE source = ?",
+        (SOURCE,),
+    ):
+        stored_dates[source_id] = local_date
+        if not from_export:
+            api_rows.add(source_id)
 
-    todo = [r for r in rows if r["source_id"] in files and (force or r["source_id"] not in known)]
+    def local_date(row: dict[str, Any], offset_s: int | None) -> str:
+        start = parse_ts(row["start_time"])
+        assert start is not None
+        if offset_s is not None:
+            return (start + timedelta(seconds=offset_s)).date().isoformat()
+        if tz is not None:
+            return start.astimezone(tz).date().isoformat()
+        return stored_dates.get(row["source_id"], row["local_date"])
+
+    for row in rows:
+        row["local_date"] = local_date(row, file_offsets.get(row["source_id"]))
+
+    in_export = {r["source_id"] for r in rows}
+    already = {i for i in file_offsets if i in in_export and i in files}
+    todo = [r for r in rows if r["source_id"] in files and (force or r["source_id"] not in already)]
     missing = [r["source_id"] for r in todo if not files[r["source_id"]].is_file()]
-    todo = [r for r in todo if files[r["source_id"]].is_file()]
-    todo_ids = {r["source_id"] for r in todo}
-    no_file_rows = [r for r in rows if r["source_id"] not in todo_ids]
-    imported = store.upsert_activities(no_file_rows)
     for activity_id in missing:
         log.warning("strava export: file for activity %s is missing: %s", activity_id, files[activity_id])
+    todo = [r for r in todo if files[r["source_id"]].is_file()]
+    todo_ids = {r["source_id"] for r in todo}
 
-    parsed_count = failed = empty = 0
+    imported = 0
+
+    def upsert(batch: list[dict[str, Any]]) -> None:
+        nonlocal imported
+        imported += store.upsert_activities([r for r in batch if r["source_id"] not in api_rows])
+
+    upsert([r for r in rows if r["source_id"] not in todo_ids])
+
+    counts = {"parsed": 0, "failed": 0, "unsupported": 0, "empty": 0}
     workers = workers if workers is not None else min(8, os.cpu_count() or 1)
     batch_rows: list[dict[str, Any]] = []
     batch_streams: list[dict[str, Any]] = []
 
     def flush() -> None:
-        nonlocal imported
-        imported += store.upsert_activities(batch_rows)
+        upsert(batch_rows)
         store.upsert_activity_streams(batch_streams)
         batch_rows.clear()
         batch_streams.clear()
 
     jobs = [str(files[r["source_id"]]) for r in todo]
     for done, (row, result) in enumerate(zip(todo, _parsed_in_order(jobs, workers), strict=True), start=1):
-        start = datetime.fromisoformat(row["start_time"].replace("Z", "+00:00"))
-        if "error" in result:
-            failed += 1
-            log.warning("strava export: could not parse %s: %s", files[row["source_id"]].name, result["error"])
-            row["local_date"] = _local_date(start, None, tz)
+        name = files[row["source_id"]].name
+        if "unsupported" in result:
+            counts["unsupported"] += 1
+            log.info("strava export: skipping %s (%s)", name, result["unsupported"])
+        elif "error" in result:
+            counts["failed"] += 1
+            log.warning("strava export: could not parse %s: %s", name, result["error"])
         else:
             offset = result["local_offset_s"]
             file_start = result["start_time"]
-            if file_start is not None and abs((file_start - start).total_seconds()) > _MAX_START_SKEW_S:
-                log.warning(
-                    "strava export: %s starts at %s but activities.csv says %s",
-                    files[row["source_id"]].name, file_start, start,
-                )
-            row["local_date"] = _local_date(start, offset, tz)
+            start = parse_ts(row["start_time"])
+            if file_start is not None and start and abs((file_start - start).total_seconds()) > _MAX_START_SKEW_S:
+                log.warning("strava export: %s starts at %s but activities.csv says %s", name, file_start, start)
+            row["local_date"] = local_date(row, offset)
             if result["streams"]:
-                meta = {**result["meta"], "file": files[row["source_id"]].name, "local_offset_s": offset}
+                meta = {**result["meta"], "file": name, "local_offset_s": offset}
                 batch_streams.append(
                     {"source": SOURCE, "source_id": row["source_id"], "streams": result["streams"], "meta": meta}
                 )
-                parsed_count += 1
+                counts["parsed"] += 1
             else:
-                empty += 1
+                counts["empty"] += 1
         batch_rows.append(row)
         if len(batch_rows) >= BATCH:
             flush()
@@ -236,10 +269,12 @@ def import_strava_export(
     store.record_sync(SOURCE, STREAM, rows=imported)
     return {
         "activities": imported,
-        "streams_imported": parsed_count,
-        "streams_already_stored": len(known) if not force else 0,
-        "files_without_samples": empty,
-        "files_failed": failed,
+        "api_rows_kept": len(api_rows & in_export),
+        "streams_imported": counts["parsed"],
+        "streams_already_stored": 0 if force else len(already),
+        "files_without_samples": counts["empty"],
+        "files_unsupported": counts["unsupported"],
+        "files_failed": counts["failed"],
         "files_missing": len(missing),
         "rows_skipped": skipped,
     }

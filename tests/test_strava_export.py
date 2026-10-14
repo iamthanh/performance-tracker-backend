@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from fit_builder import ride
-from fitness_hub.activity_files import parse_file, parse_fit, parse_gpx, parse_strava_json
+from fitness_hub.activity_files import parse_file, parse_fit, parse_gpx, parse_strava_json, parse_tcx
 from fitness_hub.cli import main
 from fitness_hub.config import Settings
 from fitness_hub.db import Store, load_streams
@@ -60,9 +60,10 @@ def export(tmp_path: Path) -> Path:
         [
             csv_row("101", "Oct 2, 2026, 1:30:00 AM", "activities/9001.fit.gz"),
             csv_row("102", "Oct 3, 2026, 2:00:00 AM", "activities/9002.fit.gz", name="Zwift - Watopia"),
-            csv_row("103", "Sep 1, 2026, 4:00:00 PM", "activities/9003.gpx"),
-            csv_row("104", "Aug 1, 2026, 4:00:00 PM", ""),  # manual entry, no file
-            csv_row("105", "Jul 1, 2026, 4:00:00 PM", "activities/9005.fit.gz"),  # file missing from the archive
+            # 02:00 UTC is the previous evening in Los Angeles, so these show whether --timezone was applied.
+            csv_row("103", "Sep 2, 2026, 2:00:00 AM", "activities/9003.gpx"),
+            csv_row("104", "Aug 2, 2026, 2:00:00 AM", ""),  # manual entry, no file
+            csv_row("105", "Jul 2, 2026, 2:00:00 AM", "activities/9005.fit.gz"),  # file missing from the archive
         ],
         {
             "activities/9001.fit.gz": gzip.compress(evening_ride),
@@ -128,10 +129,36 @@ def test_parse_file_handles_gzip_and_rejects_unknown(tmp_path: Path) -> None:
     path = tmp_path / "a.gpx.gz"
     path.write_bytes(gzip.compress(GPX))
     assert parse_file(path).sample_count == 2
-    other = tmp_path / "a.tcx.gz"
+    other = tmp_path / "a.kml.gz"
     other.write_bytes(gzip.compress(b"<x/>"))
     with pytest.raises(ValueError, match="unsupported"):
         parse_file(other)
+
+
+def test_parse_tcx() -> None:
+    tcx = b"""<?xml version="1.0"?>
+<TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"
+  xmlns:ns3="http://www.garmin.com/xmlschemas/ActivityExtension/v2">
+ <Activities><Activity Sport="Biking"><Lap StartTime="2026-09-01T16:00:00Z"><Track>
+  <Trackpoint><Time>2026-09-01T16:00:00Z</Time>
+   <Position><LatitudeDegrees>37.1</LatitudeDegrees><LongitudeDegrees>-122.1</LongitudeDegrees></Position>
+   <AltitudeMeters>12.5</AltitudeMeters><DistanceMeters>0</DistanceMeters>
+   <HeartRateBpm><Value>130</Value></HeartRateBpm><Cadence>88</Cadence>
+   <Extensions><ns3:TPX><ns3:Speed>8.5</ns3:Speed><ns3:Watts>210</ns3:Watts></ns3:TPX></Extensions></Trackpoint>
+  <Trackpoint><Time>2026-09-01T16:00:01Z</Time><DistanceMeters>8.5</DistanceMeters></Trackpoint>
+  <Trackpoint><DistanceMeters>9</DistanceMeters></Trackpoint>
+ </Track></Lap></Activity></Activities>
+</TrainingCenterDatabase>"""
+    parsed = parse_tcx(tcx)
+    s = parsed.streams
+    assert s["time"] == [0, 1]  # the point without a time is skipped
+    assert s["power"] == [210, None]
+    assert s["heart_rate"] == [130, None]
+    assert s["cadence"] == [88, None]
+    assert s["speed"] == [8.5, None]
+    assert s["distance"] == [0, 8.5]
+    assert s["lat"] == [37.1, None]
+    assert parsed.meta == {"format": "tcx"}
 
 
 # -- activities.csv -------------------------------------------------------------------
@@ -149,16 +176,17 @@ def test_repeated_headers_are_kept_apart(export: Path) -> None:
 
 
 def test_summary_distance_is_used_when_detail_is_empty(export: Path) -> None:
-    raw = read_activities_csv(export / "activities.csv")[0]
-    assert map_csv_row({**raw, "Distance #2": ""})["distance_m"] == 30000.0
+    raw = {**read_activities_csv(export / "activities.csv")[0], "Distance #2": ""}
+    assert map_csv_row(raw)["distance_m"] == 30000.0
+    assert map_csv_row(raw, distance_unit="mi")["distance_m"] == pytest.approx(48280.3, abs=0.1)
 
 
 def test_not_an_export(tmp_path: Path) -> None:
     (tmp_path / "activities.csv").write_text("a,b\n1,2\n")
     with pytest.raises(ValueError, match="Strava export"):
         read_activities_csv(tmp_path / "activities.csv")
-    with pytest.raises(ValueError, match="no activities.csv"):
-        import_strava_export(Store(tmp_path / "db.sqlite"), tmp_path / "nowhere")
+    with Store(tmp_path / "db.sqlite") as store, pytest.raises(ValueError, match="no activities.csv"):
+        import_strava_export(store, tmp_path / "nowhere")
 
 
 # -- importer -------------------------------------------------------------------------
@@ -171,9 +199,13 @@ def test_import(store: Store, export: Path) -> None:
     assert result["files_missing"] == 1
 
     dates = dict(store.conn.execute("SELECT source_id, local_date FROM activities"))
-    assert dates["101"] == "2026-10-01"  # 01:30 UTC is the evening before in UTC-7 (from the FIT file)
-    assert dates["102"] == "2026-10-02"  # Zwift's bogus offset is ignored; --timezone is used instead
-    assert dates["103"] == "2026-09-01"  # GPX: --timezone
+    assert dates == {
+        "101": "2026-10-01",  # 01:30 UTC is the evening before in UTC-7 (from the FIT file)
+        "102": "2026-10-02",  # Zwift's bogus offset is ignored; --timezone is used instead
+        "103": "2026-09-01",  # GPX: --timezone
+        "104": "2026-08-01",  # no file: --timezone
+        "105": "2026-07-01",  # file missing: --timezone
+    }
 
     streams = load_streams(store.conn, "strava", "101")
     assert streams["power"] == [200] * 60 + [300] * 60
@@ -181,6 +213,8 @@ def test_import(store: Store, export: Path) -> None:
     assert meta["file"] == "9001.fit.gz"
     assert meta["local_offset_s"] == -25200
     assert meta["session"]["threshold_power"] == 250
+    assert meta["session"]["start_time"] == "2026-10-02T01:30:00Z"  # datetimes use the UTC ISO convention
+    assert len(meta["sessions"]) == 1
     assert store.get_state("strava", "export")["rows_upserted"] == 5
 
 
@@ -195,15 +229,45 @@ def test_reimport_skips_parsed_files_and_keeps_local_dates(store: Store, export:
     assert result["streams_imported"] == 0
     assert result["streams_already_stored"] == 3
     after = [tuple(r) for r in store.conn.execute(sql)]
-    # The FIT ride keeps the local date from its stored offset, and no stream row is rewritten.
-    assert after[0][:2] == before[0][:2] == ("101", "2026-10-01")
-    assert [r[2] for r in after] == [r[2] for r in before]
+    # Every local date survives a re-import without --timezone (FIT offset, earlier --timezone,
+    # no file at all), and no stream row is rewritten.
+    assert after == before
+    assert after[0][:2] == ("101", "2026-10-01")
+    assert dict(store.conn.execute("SELECT source_id, local_date FROM activities"))["104"] == "2026-08-01"
     assert store.row_counts()["activities"] == 5
+
+
+def test_rows_from_the_strava_api_are_kept(store: Store, export: Path) -> None:
+    api_raw = {"id": 101, "sport_type": "VirtualRide", "start_date_local": "2026-10-01T18:30:00Z"}
+    store.upsert_activities(
+        [{"source": "strava", "source_id": "101", "start_time": "2026-10-02T01:30:00Z", "local_date": "2026-10-01",
+          "activity_type": "VirtualRide", "raw": api_raw}]  # fmt: skip
+    )
+    result = import_strava_export(store, export, timezone="America/Los_Angeles", workers=1)
+    assert result["api_rows_kept"] == 1
+    assert result["activities"] == 4
+    row = store.conn.execute("SELECT activity_type, raw FROM activities WHERE source_id = '101'").fetchone()
+    assert row["activity_type"] == "VirtualRide"
+    assert json.loads(row["raw"]) == api_raw
+    assert load_streams(store.conn, "strava", "101") is not None  # streams are still added
 
 
 def test_force_reparses(store: Store, export: Path) -> None:
     import_strava_export(store, export, workers=1)
-    assert import_strava_export(store, export, force=True, workers=1)["streams_imported"] == 3
+    result = import_strava_export(store, export, force=True, workers=1)
+    assert result["streams_imported"] == 3
+    assert result["streams_already_stored"] == 0
+
+
+def test_unsupported_files_are_counted_separately(store: Store, export: Path) -> None:
+    rows = read_activities_csv(export / "activities.csv")
+    with (export / "activities.csv").open("a", newline="") as fh:
+        csv.writer(fh).writerow(csv_row("106", "Jun 2, 2026, 2:00:00 AM", "activities/9006.kml"))
+    (export / "activities/9006.kml").write_bytes(b"<kml/>")
+    result = import_strava_export(store, export, workers=1)
+    assert result["files_unsupported"] == 1
+    assert result["files_failed"] == 0
+    assert result["activities"] == len(rows) + 1
 
 
 def test_parallel_import_matches_serial(tmp_path: Path, export: Path) -> None:
@@ -249,3 +313,12 @@ def test_cli(settings: Settings, export: Path, monkeypatch: pytest.MonkeyPatch, 
     out = capsys.readouterr().out
     assert "Imported 5 Strava activities; streams parsed for 3" in out
     assert "files missing: 1" in out
+
+
+def test_cli_fails_when_no_row_can_be_read(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    export = write_export(tmp_path / "localized", [csv_row("1", "2 oct. 2026, 01:30:00", "")], {})
+    monkeypatch.setenv("FITNESS_HUB_HOME", str(settings.home))
+    assert main(["import-strava-export", str(export), "--workers", "1"]) == 1
+    assert "no rows of activities.csv could be read" in capsys.readouterr().err

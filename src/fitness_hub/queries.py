@@ -448,8 +448,9 @@ def validate_select(sql: str) -> str:
 
 
 def _jsonable(value: Any) -> Any:
+    # Stream blobs are compressed and can be hundreds of KB: never dump them into a response.
     if isinstance(value, bytes):
-        return value.hex()
+        return f"<blob {len(value)} bytes>"
     return value
 
 

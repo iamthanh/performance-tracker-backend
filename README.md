@@ -76,12 +76,18 @@ export instead. It includes every activity's original file, so you get per-secon
 fitness-hub import-strava-export ~/Downloads/export_12345678 --timezone America/Los_Angeles
 ```
 
-Activities are stored as source `strava` under their Strava activity ID. Each original file (`.fit.gz`, `.gpx`,
-`.gpx.gz` or the Strava app's `.json`) is parsed into `activity_streams`, in parallel (`--workers`, default up to 8).
-About 1,700 activities take a couple of minutes. A FIT file's own local time sets the activity's local date;
-`--timezone` is used for the rest (GPX files and Zwift rides, whose FIT local time is not a real time zone). Re-running
-the import is safe and quick: files whose streams are already stored are skipped unless you pass `--force`. To pick up
-new activities, request a fresh archive and import it again.
+Activities are stored as source `strava` under their Strava activity ID. Each original file (`.fit`, `.gpx`, `.tcx`
+or the Strava app's `.json`, gzipped or not) is parsed into `activity_streams`, in parallel (`--workers`, default up
+to 8). About 1,700 activities take a couple of minutes.
+
+- **Local dates** come from the FIT file's own local time. Otherwise `--timezone` is used (GPX/TCX files, and Zwift
+  rides, whose FIT local time is not a real time zone). Without either, the date stored by an earlier import is kept,
+  and a new activity gets its UTC date.
+- **Imperial accounts:** pass `--distance-unit mi`. It only matters for rows whose detailed distance is missing.
+- **Re-running is safe and quick:** files whose streams are already stored are skipped unless you pass `--force`. To
+  pick up new activities, request a fresh archive and import it again.
+- **Activities synced from the Strava API are kept as they are** (their payload is richer than the CSV); the import only
+  adds their streams.
 
 ### Strava API (needs a Strava subscription)
 

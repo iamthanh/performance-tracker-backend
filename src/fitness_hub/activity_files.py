@@ -1,4 +1,4 @@
-"""Parse recorded activity files (FIT, GPX, Strava app JSON) into per-sample streams.
+"""Parse recorded activity files (FIT, GPX, TCX, Strava app JSON) into per-sample streams.
 
 Each parser returns a ``ParsedActivity``: aligned channels (index ``i`` is the
 same moment in every channel), a ``meta`` dict of file-level details (device,
@@ -42,21 +42,30 @@ class ParsedActivity:
         return len(self.streams.get("time", ()))
 
 
+class UnsupportedFile(ValueError):
+    """The file type is not one this module can parse."""
+
+
+SUPPORTED_SUFFIXES = (".fit", ".gpx", ".tcx", ".json")
+
+
 def parse_file(path: Path | str) -> ParsedActivity:
-    """Parse ``.fit``, ``.gpx`` or Strava ``.json``, optionally gzipped."""
+    """Parse ``.fit``, ``.gpx``, ``.tcx`` or Strava ``.json``, optionally gzipped."""
     path = Path(path)
     name = path.name.lower()
     gz = name.endswith(".gz")
     stem = name[:-3] if gz else name
+    if not stem.endswith(SUPPORTED_SUFFIXES):
+        raise UnsupportedFile(f"unsupported activity file type: {path.name}")
     with path.open("rb") as raw:
         data = gzip.decompress(raw.read()) if gz else raw.read()
     if stem.endswith(".fit"):
         return parse_fit(io.BytesIO(data))
     if stem.endswith(".gpx"):
         return parse_gpx(data)
-    if stem.endswith(".json"):
-        return parse_strava_json(json.loads(data))
-    raise ValueError(f"unsupported activity file type: {path.name}")
+    if stem.endswith(".tcx"):
+        return parse_tcx(data)
+    return parse_strava_json(json.loads(data))
 
 
 def _build(samples: list[dict[str, Any]], start: datetime) -> dict[str, list[Any]]:
@@ -177,8 +186,8 @@ def parse_fit(fileobj: IO[bytes]) -> ParsedActivity:
                         "temperature": values.get("temperature"),
                     }
                 )
-            elif name == "session" and "session" not in meta:
-                meta["session"] = _pick(values, _SESSION_FIELDS)
+            elif name == "session":
+                meta.setdefault("sessions", []).append(_pick(values, _SESSION_FIELDS))
             elif name == "lap":
                 meta["laps"].append(_pick(values, _LAP_FIELDS))
             elif name == "activity":
@@ -193,6 +202,8 @@ def parse_fit(fileobj: IO[bytes]) -> ParsedActivity:
                 meta["device"] = values["product_name"]
             elif name in ("zones_target", "user_profile"):
                 meta.setdefault("thresholds", {}).update(_pick(values, _THRESHOLD_FIELDS))
+    if meta.get("sessions"):
+        meta["session"] = meta["sessions"][0]  # most files have exactly one
     samples.sort(key=lambda s: s["ts"])
     if not samples:
         return ParsedActivity(start_time=None, streams={}, meta=meta, local_offset_s=local_offset)
@@ -243,6 +254,50 @@ def parse_gpx(data: bytes) -> ParsedActivity:
         return ParsedActivity(start_time=None, streams={}, meta={"format": "gpx"})
     start = samples[0]["ts"]
     return ParsedActivity(start_time=start, streams=_build(samples, start), meta={"format": "gpx"})
+
+
+# -- TCX ------------------------------------------------------------------------------
+
+
+def _child_text(element: ET.Element, *path: str) -> str | None:
+    """Text of the first descendant chain matching ``path`` (local names, any namespace)."""
+    current: ET.Element | None = element
+    for tag in path:
+        current = next((c for c in current if _local(c.tag) == tag), None) if current is not None else None
+    return current.text if current is not None else None
+
+
+def parse_tcx(data: bytes) -> ParsedActivity:
+    """Garmin Training Center XML trackpoints, including the ``TPX`` speed/watts extension."""
+    root = ET.fromstring(data)
+    samples = []
+    for point in root.iter():
+        if _local(point.tag) != "Trackpoint":
+            continue
+        ts = parse_ts(_child_text(point, "Time"))
+        if ts is None:
+            continue
+        sample: dict[str, Any] = {
+            "ts": ts,
+            "lat": _num(_child_text(point, "Position", "LatitudeDegrees")),
+            "lng": _num(_child_text(point, "Position", "LongitudeDegrees")),
+            "altitude": _num(_child_text(point, "AltitudeMeters")),
+            "distance": _num(_child_text(point, "DistanceMeters")),
+            "heart_rate": _num(_child_text(point, "HeartRateBpm", "Value")),
+            "cadence": _num(_child_text(point, "Cadence")),
+        }
+        for child in point.iter():
+            tag = _local(child.tag)
+            if tag == "Watts":
+                sample["power"] = _num(child.text)
+            elif tag == "Speed":
+                sample["speed"] = _num(child.text)
+        samples.append(sample)
+    samples.sort(key=lambda s: s["ts"])
+    if not samples:
+        return ParsedActivity(start_time=None, streams={}, meta={"format": "tcx"})
+    start = samples[0]["ts"]
+    return ParsedActivity(start_time=start, streams=_build(samples, start), meta={"format": "tcx"})
 
 
 # -- Strava app JSON ------------------------------------------------------------------

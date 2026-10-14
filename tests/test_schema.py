@@ -17,7 +17,7 @@ from fitness_hub.db import (
 )
 from fitness_hub.queries import run_select
 
-V2_TABLES = {"activity_streams", "activity_metrics", "power_curve", "athlete_settings"}
+V2_TABLES = {"activity_streams", "activity_metrics", "power_curve", "daily_series", "athlete_settings"}
 
 
 def _tables(conn: sqlite3.Connection) -> set[str]:
@@ -80,6 +80,8 @@ def test_newer_database_is_refused(tmp_path: Path) -> None:
     conn.close()
     with pytest.raises(RuntimeError, match="newer than this fitness-hub"):
         connect(path)
+    with pytest.raises(RuntimeError, match="newer than this fitness-hub"):
+        open_readonly(path)
 
 
 @pytest.mark.parametrize("existing", [True, False])
@@ -194,7 +196,7 @@ def test_athlete_settings(store: Store) -> None:
     store.set_athlete_setting("ftp_w", "2026-09-01", 265)  # same key: updated, not duplicated
     rows = store.conn.execute("SELECT origin, value, note FROM athlete_settings ORDER BY origin").fetchall()
     assert [tuple(r) for r in rows] == [("auto", 250.0, None), ("manual", 265.0, None)]
-    assert store.delete_athlete_setting("ftp_w", "2026-09-01") is True
+    assert store.delete_athlete_setting("ftp_w", "2026-09-01T00:00:00") is True  # normalized like set
     assert store.delete_athlete_setting("ftp_w", "2026-09-01") is False
     with pytest.raises(ValueError, match="unknown athlete setting"):
         store.set_athlete_setting("vo2", "2026-09-01", 55)
@@ -208,5 +210,10 @@ def test_query_sql_reads_new_tables(store: Store) -> None:
     store.replace_power_curve("strava", "1", {60: 400})
     result = run_select(store.conn, "SELECT duration_s, watts FROM power_curve")
     assert result["rows"] == [[60, 400.0]]
+    store.upsert_activity_streams([{"source": "strava", "source_id": "1", "streams": STREAMS}])
+    result = run_select(store.conn, "SELECT sample_count, data FROM activity_streams")
+    count, data = result["rows"][0]
+    assert count == 4
+    assert data.startswith("<blob ") and data.endswith(" bytes>")  # never the blob itself
     with pytest.raises(ValueError, match="only a single SELECT"):
         run_select(store.conn, "DELETE FROM power_curve")

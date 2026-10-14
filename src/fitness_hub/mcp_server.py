@@ -55,6 +55,7 @@ work_kj, decoupling_pct, power_zone_s, hr_zone_s, updated_at), power_curve(sourc
 updated_at), athlete_settings(metric, effective_date, origin, value, note, updated_at), activity_streams(source, \
 source_id, channels, sample_count, encoding, data, meta, updated_at) and daily_series(source, date, series, channels, \
 sample_count, encoding, data, updated_at; all-day heart rate); their `data` is a compressed blob, not queryable. \
+activity_metrics, power_curve and athlete_settings are filled by the training analysis and may be empty. \
 `raw` holds the provider JSON (use json_extract). \
 query_sql does NOT de-duplicate activities.
 

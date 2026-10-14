@@ -69,6 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TZ",
         help="IANA zone for activities whose file has no usable local time (GPX, Zwift), e.g. America/Los_Angeles",
     )
+    strava.add_argument(
+        "--distance-unit", choices=("km", "mi"), default="km", help="your Strava account's distance unit"
+    )
     strava.add_argument("--force", action="store_true", help="re-parse files whose streams are already stored")
     strava.add_argument("--workers", type=int, default=None, help="parallel file parsers (default: up to 8)")
 
@@ -172,15 +175,26 @@ def cmd_import_strava(settings: Settings, args: argparse.Namespace) -> int:
 
     with Store(settings.db_path) as store:
         result = import_strava_export(
-            store, args.path, timezone=args.timezone, force=args.force, workers=args.workers, progress=progress
+            store,
+            args.path,
+            timezone=args.timezone,
+            distance_unit=args.distance_unit,
+            force=args.force,
+            workers=args.workers,
+            progress=progress,
         )
     print(
         f"Imported {result['activities']} Strava activities; streams parsed for {result['streams_imported']} "
         f"({result['streams_already_stored']} already stored)."
     )
+    if result["api_rows_kept"]:
+        print(f"Kept {result['api_rows_kept']} activities synced from the Strava API as they were (streams added).")
     problems = {k: v for k, v in result.items() if k.startswith(("files_", "rows_")) and v}
     if problems:
         print("Not imported: " + ", ".join(f"{k.replace('_', ' ')}: {v}" for k, v in problems.items()) + " (see -v)")
+    if result["rows_skipped"] and not (result["activities"] or result["api_rows_kept"]):
+        print("error: no rows of activities.csv could be read (unexpected date format?)", file=sys.stderr)
+        return 1
     return 0
 
 

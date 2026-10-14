@@ -16,10 +16,11 @@ import sqlite3
 import time
 import zlib
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .util import now_utc_iso, parse_date
+from .util import now_utc_iso, parse_date, utc_iso
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS activities (
@@ -274,10 +275,16 @@ _SQL_SERIES = _upsert_sql("daily_series", _SERIES_COLUMNS, ("source", "date", "s
 _SQL_SETTING = _upsert_sql("athlete_settings", _SETTING_COLUMNS, ("metric", "effective_date", "origin"))
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return utc_iso(value)
+    return str(value)
+
+
 def _raw(value: Any) -> str | None:
     if value is None or isinstance(value, str):
         return value
-    return json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
+    return json.dumps(value, separators=(",", ":"), sort_keys=True, default=_json_default)
 
 
 def encode_streams(streams: Mapping[str, Sequence[Any]]) -> tuple[list[str], int, bytes]:
@@ -360,6 +367,16 @@ def schema_version(conn: sqlite3.Connection) -> int:
     return conn.execute("PRAGMA user_version").fetchone()[0]
 
 
+def _check_not_newer(conn: sqlite3.Connection) -> int:
+    current = schema_version(conn)
+    if current > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"database schema version {current} is newer than this fitness-hub supports ({SCHEMA_VERSION}); "
+            "upgrade fitness-hub"
+        )
+    return current
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Bring a database that has ``SCHEMA`` applied up to ``SCHEMA_VERSION``.
 
@@ -368,12 +385,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     write lock, so two processes opening the database at once (the daemon and
     the MCP server) apply each migration only once.
     """
-    current = schema_version(conn)
-    if current > SCHEMA_VERSION:
-        raise RuntimeError(
-            f"database schema version {current} is newer than this fitness-hub supports ({SCHEMA_VERSION}); "
-            "upgrade fitness-hub"
-        )
+    current = _check_not_newer(conn)
     for target in range(max(current, 1) + 1, SCHEMA_VERSION + 1):
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -398,7 +410,12 @@ def open_readonly(path: Path | str) -> sqlite3.Connection:
         connect(path).close()
     conn = _connect_ro(path)
     present = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    if not present.issuperset((*DATA_TABLES, "sync_state")) or schema_version(conn) < SCHEMA_VERSION:
+    try:
+        current = _check_not_newer(conn)
+    except RuntimeError:
+        conn.close()
+        raise
+    if not present.issuperset((*DATA_TABLES, "sync_state")) or current < SCHEMA_VERSION:
         conn.close()
         connect(path).close()  # apply the schema and any migrations, then reopen read-only
         conn = _connect_ro(path)
@@ -554,6 +571,7 @@ class Store:
             self.conn.execute(_SQL_SETTING, (metric, effective_date, origin, float(value), note, now_utc_iso()))
 
     def delete_athlete_setting(self, metric: str, effective_date: str, origin: str = "manual") -> bool:
+        effective_date = parse_date(effective_date, "effective_date").isoformat()
         with self.conn:
             cursor = self.conn.execute(
                 "DELETE FROM athlete_settings WHERE metric = ? AND effective_date = ? AND origin = ?",
