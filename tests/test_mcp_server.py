@@ -27,6 +27,9 @@ EXPECTED_TOOLS = {
     "get_sleep",
     "get_body_measurements",
     "query_sql",
+    "training_load",
+    "power_curve",
+    "get_activity_analysis",
     "sync_now",
 }
 

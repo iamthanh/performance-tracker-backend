@@ -319,6 +319,134 @@ def activity_summary(
     }
 
 
+# -- training load, power curve, per-activity analysis ----------------------------------
+
+CTL_DAYS = 42
+ATL_DAYS = 7
+_METRIC_SUMMARY_COLUMNS = (
+    "timer_s",
+    "avg_power_w",
+    "max_power_w",
+    "normalized_power_w",
+    "work_kj",
+    "avg_hr",
+    "max_hr",
+    "hr_20min_bpm",
+    "decoupling_pct",
+    "ftp_w",
+    "threshold_hr",
+    "intensity_factor",
+    "tss",
+    "tss_method",
+    "variability_index",
+    "efficiency_factor",
+)
+
+
+def _scored_activities(conn: sqlite3.Connection, end: str | None = None) -> list[dict[str, Any]]:
+    """Activities with a TSS, de-duplicated across sources, oldest first."""
+    sql = (
+        "SELECT a.source, a.source_id, a.start_time, a.local_date, a.activity_type, m.tss "
+        "FROM activity_metrics m JOIN activities a USING (source, source_id) WHERE m.tss IS NOT NULL"
+    )
+    params: list[Any] = []
+    if end:
+        sql += " AND a.local_date <= ?"
+        params.append(end)
+    return dedupe_activities(dict(r) for r in conn.execute(sql, params))
+
+
+def training_load(
+    conn: sqlite3.Connection, start_date: str | None = None, end_date: str | None = None, today: date | None = None
+) -> list[dict[str, Any]]:
+    """Daily TSS with fitness (CTL, 42-day), fatigue (ATL, 7-day) and form (TSB).
+
+    CTL and ATL are exponentially weighted averages of daily TSS, seeded at 0 on
+    the first scored day. TSB for a day is the previous day's CTL - ATL (form
+    going into that day), as TrainingPeaks shows it. Defaults to the last 90 days.
+    """
+    start, end = _date_range(start_date, end_date, 90, today)
+    end = end or (today or date.today()).isoformat()
+    daily: dict[str, float] = {}
+    for row in _scored_activities(conn, end):
+        daily[row["local_date"]] = daily.get(row["local_date"], 0.0) + row["tss"]
+    if not daily:
+        return []
+    day, last = date.fromisoformat(min(daily)), date.fromisoformat(end)
+    ctl = atl = 0.0
+    out = []
+    while day <= last:
+        iso = day.isoformat()
+        tss = daily.get(iso, 0.0)
+        tsb = ctl - atl
+        ctl += (tss - ctl) / CTL_DAYS
+        atl += (tss - atl) / ATL_DAYS
+        if start is None or iso >= start:
+            out.append(
+                {"date": iso, "tss": round(tss, 1), "ctl": round(ctl, 1), "atl": round(atl, 1), "tsb": round(tsb, 1)}
+            )
+        day += timedelta(days=1)
+    return out
+
+
+def best_power_curve(
+    conn: sqlite3.Connection, start_date: str | None = None, end_date: str | None = None
+) -> list[dict[str, Any]]:
+    """Best average power per duration across activities in the date range (all time by
+    default), each with the activity that set it."""
+    start, end = _date_range(start_date, end_date, None)
+    clauses, params = [], []
+    if start:
+        clauses.append("a.local_date >= ?")
+        params.append(start)
+    if end:
+        clauses.append("a.local_date <= ?")
+        params.append(end)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = f"""
+        SELECT duration_s, watts, source, source_id, local_date, name FROM (
+            SELECT p.duration_s, p.watts, p.source, p.source_id, a.local_date, a.name,
+                   ROW_NUMBER() OVER (PARTITION BY p.duration_s ORDER BY p.watts DESC, a.local_date) AS rank
+            FROM power_curve p JOIN activities a USING (source, source_id) {where}
+        ) WHERE rank = 1 ORDER BY duration_s
+    """
+    return [{**dict(r), "watts": round(r["watts"], 1)} for r in conn.execute(sql, params)]
+
+
+def activity_analysis(conn: sqlite3.Connection, source: str, source_id: str) -> dict[str, Any] | None:
+    """Computed metrics, zones and power curve of one activity (``None`` if not analysed)."""
+    from .analysis import HR_ZONES, POWER_ZONES  # analysis imports this module
+
+    row = conn.execute(
+        "SELECT * FROM activity_metrics WHERE source = ? AND source_id = ?", (source, str(source_id))
+    ).fetchone()
+    if row is None:
+        return None
+    result: dict[str, Any] = {"source": source, "source_id": str(source_id)}
+    result.update({c: row[c] for c in _METRIC_SUMMARY_COLUMNS})
+    for key, column, zones, threshold in (
+        ("power_zones", "power_zone_s", POWER_ZONES, row["ftp_w"]),
+        ("hr_zones", "hr_zone_s", HR_ZONES, row["threshold_hr"]),
+    ):
+        seconds = json.loads(row[column]) if row[column] else None
+        result[key] = (
+            [
+                {"zone": name, "upper": None if upper == float("inf") else round(upper * threshold), "seconds": s}
+                for (name, upper), s in zip(zones, seconds, strict=True)
+            ]
+            if seconds
+            else None
+        )
+    result["power_curve"] = [
+        {"duration_s": d, "watts": round(w, 1)}
+        for d, w in conn.execute(
+            "SELECT duration_s, watts FROM power_curve WHERE source = ? AND source_id = ? ORDER BY duration_s",
+            (source, str(source_id)),
+        )
+    ]
+    return result
+
+
 # -- daily metrics, sleep, body ---------------------------------------------------------
 
 

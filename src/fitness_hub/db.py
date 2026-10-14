@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 """
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # MIGRATIONS[v] upgrades a database from version v - 1 to v. Each one runs in a
 # single transaction together with the ``user_version`` bump.
@@ -172,6 +172,42 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    # activity_metrics gains the threshold-independent results (so a new FTP only
+    # needs the stored row, not the streams). Nothing wrote the v2 table yet.
+    3: (
+        "DROP TABLE activity_metrics",
+        """
+        CREATE TABLE activity_metrics (
+            source TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            analysis_version INTEGER NOT NULL,
+            streams_updated_at TEXT,         -- the activity_streams row this was computed from
+            streams_bytes INTEGER,
+            timer_s REAL,                    -- seconds analysed (pauses longer than a few seconds left out)
+            avg_power_w REAL,
+            max_power_w REAL,
+            normalized_power_w REAL,
+            work_kj REAL,
+            avg_hr REAL,
+            max_hr REAL,
+            hr_20min_bpm REAL,               -- best 20-minute average heart rate
+            decoupling_pct REAL,             -- Pw:HR drift, first half vs second half
+            power_hist TEXT,                 -- JSON {watts: seconds}
+            hr_hist TEXT,                    -- JSON {bpm: seconds}
+            ftp_w REAL,                      -- thresholds the values below were computed with
+            threshold_hr REAL,
+            intensity_factor REAL,
+            tss REAL,
+            tss_method TEXT,                 -- power | hr; NULL when no TSS could be computed
+            variability_index REAL,
+            efficiency_factor REAL,
+            power_zone_s TEXT,               -- JSON array: seconds spent in each power zone
+            hr_zone_s TEXT,                  -- JSON array: seconds spent in each HR zone
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source, source_id)
+        )
+        """,
+    ),
 }
 
 STREAM_ENCODING = "zlib+json"
@@ -237,19 +273,30 @@ _METRIC_COLUMNS = (
     "source",
     "source_id",
     "analysis_version",
+    "streams_updated_at",
+    "streams_bytes",
+    "timer_s",
+    "avg_power_w",
+    "max_power_w",
+    "normalized_power_w",
+    "work_kj",
+    "avg_hr",
+    "max_hr",
+    "hr_20min_bpm",
+    "decoupling_pct",
+    "power_hist",
+    "hr_hist",
     "ftp_w",
     "threshold_hr",
-    "normalized_power_w",
     "intensity_factor",
     "tss",
     "tss_method",
     "variability_index",
     "efficiency_factor",
-    "work_kj",
-    "decoupling_pct",
     "power_zone_s",
     "hr_zone_s",
 )
+_METRIC_JSON_COLUMNS = ("power_hist", "hr_hist", "power_zone_s", "hr_zone_s")
 _SERIES_COLUMNS = ("source", "date", "series", "channels", "sample_count", "encoding", "data")
 _SETTING_COLUMNS = ("metric", "effective_date", "origin", "value", "note")
 _BODY_COLUMNS = ("source", "ts", "metric", "value", "raw")
@@ -537,7 +584,7 @@ class Store:
             if not row.get("source") or not row.get("source_id") or row.get("analysis_version") is None:
                 raise ValueError("activity metrics row missing source/source_id/analysis_version")
             values = [row.get(c) for c in _METRIC_COLUMNS]
-            for column in ("power_zone_s", "hr_zone_s"):
+            for column in _METRIC_JSON_COLUMNS:
                 i = _METRIC_COLUMNS.index(column)
                 values[i] = _raw(values[i])
             params.append((*values, now))

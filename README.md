@@ -89,6 +89,37 @@ to 8). About 1,700 activities take a couple of minutes.
 - **Activities synced from the Strava API are kept as they are** (their payload is richer than the CSV); the import only
   adds their streams.
 
+### Training analysis (TSS, NP, FTP, fitness/fatigue/form)
+
+The import runs the analysis at the end; `fitness-hub analyze` runs it again (only new or changed activities;
+`--full` for all). About 1,700 activities take ~10 s. For each activity with streams it computes:
+
+- normalized power, intensity factor, TSS, variability index, efficiency factor (NP / avg HR), work (kJ), Pw:HR
+  decoupling, time in Coggan power zones and Friel HR zones, and the best average power for 1 s to 5 h;
+- TSS from power for rides (`seconds × NP × IF / (FTP × 3600) × 100`), otherwise an HR estimate
+  (`hours × (avg HR / threshold HR)² × 100`).
+
+Streams are put on a 1 Hz timer clock: values are held across gaps of up to 5 s, longer gaps are pauses and left out,
+and missing power counts as 0 W. Normalized power agrees with Wahoo head units to within about 2 W.
+
+**Thresholds.** FTP and threshold HR are detected automatically: 95 % of the best 20-minute power (or heart rate) on a
+ride in the trailing 90 days. They only fall when your best efforts age out, so without hard efforts they read low.
+Override them from a date on:
+
+```bash
+fitness-hub thresholds set ftp 250 --from 2026-09-01 --note "ramp test"
+fitness-hub thresholds set threshold-hr 168 --from 2026-09-01
+fitness-hub thresholds list
+fitness-hub thresholds delete ftp --from 2026-09-01
+```
+
+The value for a date is the latest entry on or before it (manual wins a tie with an automatic one); before the first
+entry, the first one applies. Changing a threshold re-scores the affected activities from their stored results, without
+reading the streams again.
+
+**Fitness, fatigue, form** (MCP `training_load`): daily TSS, CTL (42-day exponentially weighted average), ATL (7-day)
+and TSB, the previous day's CTL − ATL, as on TrainingPeaks' Performance Management Chart.
+
 ### Strava API (needs a Strava subscription)
 
 1. Create an API application at <https://www.strava.com/settings/api>. Set **Authorization Callback Domain** to
@@ -227,6 +258,9 @@ Then ask, for example:
 | `get_sleep` | Sleep sessions by wake-up date; default last 30 days, main sleep only |
 | `get_body_measurements` | Weight (kg) and body fat (%); default last 90 days |
 | `query_sql` | One read-only `SELECT`/`WITH` query (at most 1000 rows, 1 MB per value, about 10 s; runs in a worker thread, so other tools stay responsive). Writes, `PRAGMA`, `ATTACH` and multiple statements are rejected |
+| `training_load` | Daily TSS, fitness (CTL), fatigue (ATL) and form (TSB); default last 90 days |
+| `power_curve` | Best average power per duration (1 s to 5 h) in a date range, with the activity that set it |
+| `get_activity_analysis` | One activity's NP, IF, TSS, VI, EF, decoupling, zones, thresholds used and power curve |
 | `sync_now` | Runs a sync and returns its log. It blocks, and `full=true` can hit rate limits |
 
 Units: metres, seconds, bpm, watts, kcal, kg (summaries use km and hours). Timestamps are UTC, and dates are your local
@@ -319,7 +353,7 @@ local clock. Every row keeps the provider payload in `raw` and an `updated_at` s
 | `body_measurements` | `(source, ts, metric)` | `value, raw` |
 | `sync_state` | `(source, stream)` | `cursor, last_attempt, last_success, last_error, rows_upserted` |
 | `activity_streams` | `(source, source_id)` | `channels` (JSON list), `sample_count, encoding, data` (zlib-compressed JSON `{channel: [values]}`), `meta` |
-| `activity_metrics` | `(source, source_id)` | `analysis_version, ftp_w, threshold_hr, normalized_power_w, intensity_factor, tss, tss_method, variability_index, efficiency_factor, work_kj, decoupling_pct, power_zone_s, hr_zone_s` |
+| `activity_metrics` | `(source, source_id)` | Threshold-independent: `timer_s, avg_power_w, max_power_w, normalized_power_w, work_kj, avg_hr, max_hr, hr_20min_bpm, decoupling_pct, power_hist, hr_hist`. With the thresholds in effect that day: `ftp_w, threshold_hr, intensity_factor, tss, tss_method, variability_index, efficiency_factor, power_zone_s, hr_zone_s`. Plus `analysis_version, streams_updated_at, streams_bytes` |
 | `daily_series` | `(source, date, series)` | `channels, sample_count, encoding, data`: intraday samples, `{"time": [epoch s], "heart_rate": [bpm]}` for series `heart_rate` |
 | `power_curve` | `(source, source_id, duration_s)` | `watts`: the best average power over `duration_s` in that activity |
 | `athlete_settings` | `(metric, effective_date, origin)` | `value, note`. Metrics `ftp_w, threshold_hr, max_hr`; origin `manual` or `auto`. A value applies from its date until the next one |

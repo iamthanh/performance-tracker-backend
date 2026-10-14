@@ -191,6 +191,34 @@ def create_server(
         return _dump({"count": len(rows), "rows": rows})
 
     @mcp.tool(annotations=READ_ONLY, structured_output=False)
+    async def training_load(
+        start_date: Annotated[str | None, Field(description="YYYY-MM-DD; default 90 days before end_date")] = None,
+        end_date: DateArg = None,
+    ) -> str:
+        """Daily TSS with fitness (CTL, 42-day), fatigue (ATL, 7-day) and form (TSB = yesterday's CTL - ATL),
+        like TrainingPeaks' Performance Management Chart. De-duplicated across services."""
+        rows = await read(lambda c: queries.training_load(c, start_date, end_date))
+        return _dump({"count": len(rows), "days": rows})
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=False)
+    async def power_curve(
+        start_date: Annotated[str | None, Field(description="YYYY-MM-DD; default all time")] = None,
+        end_date: DateArg = None,
+    ) -> str:
+        """Best average power (W) for each duration from 1 s to 5 h in the date range, with the activity
+        that set it (mean-maximal power curve)."""
+        return _dump(await read(lambda c: queries.best_power_curve(c, start_date, end_date)))
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=False)
+    async def get_activity_analysis(
+        source: Annotated[str, Field(description="Source of the activity, e.g. strava")],
+        source_id: Annotated[str, Field(description="The activity id within that source")],
+    ) -> str:
+        """Computed metrics of one activity: NP, IF, TSS (and whether from power or HR), VI, EF, Pw:HR
+        decoupling, work, time in power and HR zones, the FTP / threshold HR used, and its power curve."""
+        return _dump(await read(lambda c: queries.activity_analysis(c, source, source_id)))
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=False)
     async def query_sql(
         sql: Annotated[str, Field(description="A single SELECT or WITH query (SQLite dialect)")],
         limit: Annotated[int, Field(ge=1, le=1000, description="Max rows returned")] = 200,
