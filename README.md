@@ -48,6 +48,7 @@ mkdir -p ~/.fitness-hub && cp .env.example ~/.fitness-hub/.env && chmod 600 ~/.f
 | `OAUTH_PORT` | `8765` | Local OAuth redirect port; must match the registered redirect URI |
 | `BACKFILL_DAYS` | `365` | History fetched on the first sync |
 | `LOOKBACK_DAYS` | `7` | Overlap re-fetched on every sync, to pick up late edits |
+| `GARMIN_ACTIVITIES` | `false` | Also sync workouts from Garmin. Off by default: workouts come from Strava, Garmin supplies daily health data |
 
 Files in `FITNESS_HUB_HOME`:
 
@@ -62,7 +63,27 @@ Files in `FITNESS_HUB_HOME`:
 
 You only need to authorize the services you use. Sources that are not authorized are skipped.
 
-### Strava
+### Strava bulk export (no API access needed)
+
+Since June 2026 Strava's API needs a paid Strava subscription. Without one, import your history from Strava's own
+export instead. It includes every activity's original file, so you get per-second power, heart rate, cadence and GPS:
+
+1. On strava.com go to **Settings → My Account → Download or Delete Your Account → Request your archive**. The
+   email with the download link usually comes within a few hours.
+2. Unzip it and run:
+
+```bash
+fitness-hub import-strava-export ~/Downloads/export_12345678 --timezone America/Los_Angeles
+```
+
+Activities are stored as source `strava` under their Strava activity ID. Each original file (`.fit.gz`, `.gpx`,
+`.gpx.gz` or the Strava app's `.json`) is parsed into `activity_streams`, in parallel (`--workers`, default up to 8).
+About 1,700 activities take a couple of minutes. A FIT file's own local time sets the activity's local date;
+`--timezone` is used for the rest (GPX files and Zwift rides, whose FIT local time is not a real time zone). Re-running
+the import is safe and quick: files whose streams are already stored are skipped unless you pass `--force`. To pick up
+new activities, request a fresh archive and import it again.
+
+### Strava API (needs a Strava subscription)
 
 1. Create an API application at <https://www.strava.com/settings/api>. Set **Authorization Callback Domain** to
    `localhost`.
@@ -293,6 +314,7 @@ local clock. Every row keeps the provider payload in `raw` and an `updated_at` s
 | `sync_state` | `(source, stream)` | `cursor, last_attempt, last_success, last_error, rows_upserted` |
 | `activity_streams` | `(source, source_id)` | `channels` (JSON list), `sample_count, encoding, data` (zlib-compressed JSON `{channel: [values]}`), `meta` |
 | `activity_metrics` | `(source, source_id)` | `analysis_version, ftp_w, threshold_hr, normalized_power_w, intensity_factor, tss, tss_method, variability_index, efficiency_factor, work_kj, decoupling_pct, power_zone_s, hr_zone_s` |
+| `daily_series` | `(source, date, series)` | `channels, sample_count, encoding, data`: intraday samples, `{"time": [epoch s], "heart_rate": [bpm]}` for series `heart_rate` |
 | `power_curve` | `(source, source_id, duration_s)` | `watts`: the best average power over `duration_s` in that activity |
 | `athlete_settings` | `(metric, effective_date, origin)` | `value, note`. Metrics `ftp_w, threshold_hr, max_hr`; origin `manual` or `auto`. A value applies from its date until the next one |
 
@@ -383,10 +405,11 @@ away. Strava's 429 is never retried, because its window is 15 minutes; the strea
 - `fitness-hub auth garmin` asks for your email, password and MFA code once and saves only the session tokens.
   Later runs call `Garmin().login(token_dir)`. If login fails, the result is a `login` stream error.
 - Streams:
-  - `activities`: `get_activities_by_date(start, end)`.
+  - `activities`: `get_activities_by_date(start, end)`, only with `GARMIN_ACTIVITIES=true`.
   - `daily`: for each day, `get_stats` (steps, resting HR, stress, body battery, calories, distance, floors, SpO2,
-    respiration), `get_sleep_data` (a session with stages plus `sleep_score`) and `get_hrv_data` (`hrv_rmssd_ms`;
-    many devices have no HRV, so HRV errors only skip that day's HRV). It pauses 0.4 s between days.
+    respiration), `get_sleep_data` (a session with stages plus `sleep_score`), `get_hrv_data` (`hrv_rmssd_ms`) and
+    `get_heart_rates` (all-day heart rate, about one sample every two minutes, stored in `daily_series`). Many devices
+    have no HRV, so HRV and all-day HR errors only skip that part of the day. It pauses 0.4 s between days.
     - A day with no data is skipped, so the stream doesn't stall on days before you owned the watch.
       garminconnect reports such days as "No data received" or a privacy-protected summary.
     - Throttling, authentication errors and server errors stop the stream at that day.

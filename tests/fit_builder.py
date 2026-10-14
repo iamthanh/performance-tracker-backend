@@ -16,7 +16,10 @@ _FORMATS = {ENUM: "B", SINT8: "b", UINT8: "B", UINT16: "H", SINT32: "i", UINT32:
 
 # global message number -> {field name: (field number, base type)}
 MESSAGES = {
-    "file_id": (0, {"type": (0, ENUM), "manufacturer": (1, UINT16), "product": (2, UINT16), "time_created": (4, UINT32)}),
+    "file_id": (
+        0,
+        {"type": (0, ENUM), "manufacturer": (1, UINT16), "product": (2, UINT16), "time_created": (4, UINT32)},
+    ),
     "record": (
         20,
         {
@@ -101,7 +104,8 @@ def ride(
 ) -> bytes:
     """A 1 Hz ride with the given power samples, plus session, lap and activity messages."""
     t0 = fit_time(start)
-    msgs: list[tuple[str, dict[str, int]]] = [("file_id", {"type": 4, "manufacturer": 32, "product": 31, "time_created": t0})]
+    file_id = {"type": 4, "manufacturer": 32, "product": 31, "time_created": t0}
+    msgs: list[tuple[str, dict[str, int]]] = [("file_id", file_id)]
     for i, w in enumerate(watts):
         record = {
             "timestamp": t0 + i,

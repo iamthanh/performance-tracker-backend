@@ -53,7 +53,8 @@ last_attempt, last_success, last_error, rows_upserted), activity_metrics(source,
 ftp_w, threshold_hr, normalized_power_w, intensity_factor, tss, tss_method, variability_index, efficiency_factor, \
 work_kj, decoupling_pct, power_zone_s, hr_zone_s, updated_at), power_curve(source, source_id, duration_s, watts, \
 updated_at), athlete_settings(metric, effective_date, origin, value, note, updated_at), activity_streams(source, \
-source_id, channels, sample_count, encoding, data, meta, updated_at; data is a compressed blob, not queryable). \
+source_id, channels, sample_count, encoding, data, meta, updated_at) and daily_series(source, date, series, channels, \
+sample_count, encoding, data, updated_at; all-day heart rate); their `data` is a compressed blob, not queryable. \
 `raw` holds the provider JSON (use json_extract). \
 query_sql does NOT de-duplicate activities.
 

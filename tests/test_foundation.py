@@ -277,6 +277,15 @@ def test_config_rejects_bad_int(tmp_path: Path) -> None:
         Settings.from_env({"FITNESS_HUB_HOME": str(tmp_path), "LOOKBACK_DAYS": "seven"}, cwd=tmp_path)
 
 
+def test_garmin_activities_flag(tmp_path: Path) -> None:
+    base = {"FITNESS_HUB_HOME": str(tmp_path)}
+    assert Settings.from_env(base, cwd=tmp_path).garmin_activities is False
+    assert Settings.from_env({**base, "GARMIN_ACTIVITIES": "true"}, cwd=tmp_path).garmin_activities is True
+    assert Settings.from_env({**base, "GARMIN_ACTIVITIES": "0"}, cwd=tmp_path).garmin_activities is False
+    with pytest.raises(ConfigError, match="GARMIN_ACTIVITIES"):
+        Settings.from_env({**base, "GARMIN_ACTIVITIES": "sometimes"}, cwd=tmp_path)
+
+
 def test_parse_dotenv_ignores_noise() -> None:
     assert parse_dotenv("# c\n\nNOEQUALS\nA=1\nB=\"two words\"\n") == {"A": "1", "B": "two words"}
 

@@ -147,6 +147,19 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         )
         """,
         """
+        CREATE TABLE daily_series (
+            source TEXT NOT NULL,
+            date TEXT NOT NULL,              -- athlete's local date
+            series TEXT NOT NULL,            -- e.g. heart_rate
+            channels TEXT NOT NULL,          -- JSON array of the channel names in data
+            sample_count INTEGER NOT NULL,
+            encoding TEXT NOT NULL,
+            data BLOB NOT NULL,              -- {"time": [epoch s, ...], <series>: [value, ...]}
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source, date, series)
+        )
+        """,
+        """
         CREATE TABLE athlete_settings (
             metric TEXT NOT NULL,
             effective_date TEXT NOT NULL,    -- applies from this local date until the next entry
@@ -236,6 +249,7 @@ _METRIC_COLUMNS = (
     "power_zone_s",
     "hr_zone_s",
 )
+_SERIES_COLUMNS = ("source", "date", "series", "channels", "sample_count", "encoding", "data")
 _SETTING_COLUMNS = ("metric", "effective_date", "origin", "value", "note")
 _BODY_COLUMNS = ("source", "ts", "metric", "value", "raw")
 
@@ -256,6 +270,7 @@ _SQL_DAILY = _upsert_sql("daily_metrics", _DAILY_COLUMNS, ("source", "date", "me
 _SQL_BODY = _upsert_sql("body_measurements", _BODY_COLUMNS, ("source", "ts", "metric"))
 _SQL_STREAMS = _upsert_sql("activity_streams", _STREAM_COLUMNS, ("source", "source_id"))
 _SQL_METRICS = _upsert_sql("activity_metrics", _METRIC_COLUMNS, ("source", "source_id"))
+_SQL_SERIES = _upsert_sql("daily_series", _SERIES_COLUMNS, ("source", "date", "series"))
 _SQL_SETTING = _upsert_sql("athlete_settings", _SETTING_COLUMNS, ("metric", "effective_date", "origin"))
 
 
@@ -291,6 +306,14 @@ def load_streams(conn: sqlite3.Connection, source: str, source_id: str) -> dict[
     """The stored channels of one activity, or ``None`` if it has no streams."""
     row = conn.execute(
         "SELECT encoding, data FROM activity_streams WHERE source = ? AND source_id = ?", (source, source_id)
+    ).fetchone()
+    return decode_streams(row[0], row[1]) if row else None
+
+
+def load_daily_series(conn: sqlite3.Connection, source: str, day: str, series: str) -> dict[str, list[Any]] | None:
+    """One day's intraday series (``{"time": [...], series: [...]}``), or ``None``."""
+    row = conn.execute(
+        "SELECT encoding, data FROM daily_series WHERE source = ? AND date = ? AND series = ?", (source, day, series)
     ).fetchone()
     return decode_streams(row[0], row[1]) if row else None
 
@@ -472,6 +495,22 @@ class Store:
             return 0
         with self.conn:
             self.conn.executemany(_SQL_STREAMS, params)
+        return len(params)
+
+    def upsert_daily_series(self, rows: Iterable[Mapping[str, Any]]) -> int:
+        """Rows are ``{source, date, series, streams: {"time": [...], series: [...]}}``."""
+        now = now_utc_iso()
+        params = []
+        for row in rows:
+            if not row.get("source") or not row.get("date") or not row.get("series"):
+                raise ValueError("daily series row missing source/date/series")
+            channels, count, blob = encode_streams(row.get("streams") or {})
+            params.append((row["source"], row["date"], row["series"], json.dumps(channels), count, STREAM_ENCODING,
+                           blob, now))  # fmt: skip
+        if not params:
+            return 0
+        with self.conn:
+            self.conn.executemany(_SQL_SERIES, params)
         return len(params)
 
     def upsert_activity_metrics(self, rows: Iterable[Mapping[str, Any]]) -> int:

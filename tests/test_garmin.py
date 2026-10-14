@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import date
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from fitness_hub.auth import AuthError
+from fitness_hub.db import load_daily_series
 from fitness_hub.providers import SyncWindow
 from fitness_hub.providers import garmin
 
@@ -84,6 +86,15 @@ class FakeGarmin:
             raise KeyError("no HRV on this device")
         return {"hrvSummary": {"calendarDate": day, "lastNightAvg": 45}}
 
+    def get_heart_rates(self, day: str) -> dict:
+        if day == "2026-10-02":
+            raise KeyError("no all-day HR for this day")
+        midnight_ms = 1_790_812_800_000 + (int(day[-2:]) - 1) * 86_400_000  # 2026-10-01T00:00Z
+        return {
+            "heartRateValueDescriptors": [{"key": "timestamp", "index": 0}, {"key": "heartrate", "index": 1}],
+            "heartRateValues": [[midnight_ms + 240_000, 58], [midnight_ms, 60], [midnight_ms + 120_000, None]],
+        }
+
     def get_body_composition(self, start: str, end: str) -> dict:
         self.calls.append(("body", (start, end)))
         return {
@@ -94,8 +105,9 @@ class FakeGarmin:
         }
 
 
-def make(settings, fake: FakeGarmin, sleeps: list | None = None) -> garmin.GarminProvider:
+def make(settings, fake: FakeGarmin, sleeps: list | None = None, activities: bool = True) -> garmin.GarminProvider:
     sleep = sleeps.append if sleeps is not None else (lambda _: None)
+    settings = dataclasses.replace(settings, garmin_activities=activities)
     return garmin.GarminProvider(settings, client_factory=lambda: fake, sleep=sleep)
 
 
@@ -138,8 +150,35 @@ def test_sync_end_to_end(settings, store) -> None:
     body = {(r["ts"], r["metric"]): r["value"] for r in store.conn.execute("SELECT * FROM body_measurements")}
     assert body[("2026-10-02T06:00:00Z", "weight_kg")] == pytest.approx(72.45)  # grams -> kg
     assert body[("2026-10-02T06:00:00Z", "body_fat_pct")] == 17.9
+
+    # All-day HR: sorted by time, empty samples dropped; a failing day only loses its HR.
+    hr = load_daily_series(store.conn, "garmin", "2026-10-01", "heart_rate")
+    assert hr == {"time": [1_790_812_800, 1_790_813_040], "heart_rate": [60, 58]}
+    assert load_daily_series(store.conn, "garmin", "2026-10-02", "heart_rate") is None
+    assert load_daily_series(store.conn, "garmin", "2026-10-03", "heart_rate") is not None
     assert len(body) == 3
     assert store.get_cursor("garmin", "daily") == "2026-10-03"
+
+
+def test_activities_are_skipped_by_default(settings, store) -> None:
+    fake = FakeGarmin()
+    results = make(settings, fake, activities=False).sync(store, WINDOW)
+    assert [r.stream for r in results] == ["daily", "body"]
+    assert not any(name == "activities" for name, _ in fake.calls)
+    assert store.row_counts()["activities"] == 0
+
+
+def test_map_heart_rates() -> None:
+    swapped = {
+        "heartRateValueDescriptors": [{"key": "heartrate", "index": 0}, {"key": "timestamp", "index": 1}],
+        "heartRateValues": [[61, 1_790_812_800_000], "junk", [None, 1_790_812_920_000]],
+    }
+    row = garmin.map_heart_rates("2026-10-01", swapped)
+    assert row["streams"] == {"time": [1_790_812_800], "heart_rate": [61]}
+    assert row["series"] == "heart_rate" and row["source"] == "garmin"
+    assert garmin.map_heart_rates("2026-10-01", {"heartRateValues": None}) is None
+    assert garmin.map_heart_rates("2026-10-01", {"heartRateValues": [[1, None]]}) is None
+    assert garmin.map_heart_rates("2026-10-01", None) is None
 
 
 def test_daily_stops_on_first_failure_and_resumes(settings, store) -> None:

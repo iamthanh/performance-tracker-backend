@@ -20,6 +20,7 @@ def test_methods_used_by_the_provider_exist() -> None:
         "get_stats",
         "get_sleep_data",
         "get_hrv_data",
+        "get_heart_rates",
         "get_body_composition",
         "get_full_name",
     ):

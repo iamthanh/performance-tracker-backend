@@ -63,6 +63,17 @@ def _int(env: Mapping[str, str], key: str, default: int, minimum: int = 0) -> in
     return value
 
 
+def _bool(env: Mapping[str, str], key: str, default: bool) -> bool:
+    raw = (env.get(key) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{key} must be true or false, got {raw!r}")
+
+
 @dataclass(frozen=True)
 class Settings:
     home: Path
@@ -75,6 +86,8 @@ class Settings:
     oauth_port: int = 8765
     backfill_days: int = 365
     lookback_days: int = 7
+    # Workouts come from Strava by default; Garmin supplies daily health data.
+    garmin_activities: bool = False
 
     @property
     def db_path(self) -> Path:
@@ -121,4 +134,5 @@ class Settings:
             oauth_port=_int(merged, "OAUTH_PORT", 8765, minimum=1),
             backfill_days=_int(merged, "BACKFILL_DAYS", 365),
             lookback_days=_int(merged, "LOOKBACK_DAYS", 7),
+            garmin_activities=_bool(merged, "GARMIN_ACTIVITIES", False),
         )
