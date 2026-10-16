@@ -144,7 +144,8 @@ def test_health_data(client: TestClient) -> None:
 
 def test_thresholds_read_set_delete(client: TestClient) -> None:
     current = client.get("/api/thresholds", params={"on": "2026-09-05"}).json()
-    assert current["in_effect"]["ftp_w"] == 238 and any(v["origin"] == "auto" for v in current["values"])
+    # Auto FTP: an hour at 250 W (ride 1) proves 250 W.
+    assert current["in_effect"]["ftp_w"] == 250 and any(v["origin"] == "auto" for v in current["values"])
     created = client.post(
         "/api/thresholds", json={"metric": "ftp_w", "effective_date": "2026-09-02", "value": 210, "note": "test"}
     )
@@ -181,7 +182,7 @@ def test_writes_from_other_origins_are_refused(client: TestClient) -> None:
     # A cross-site "simple" request cannot set Content-Type: application/json, and is rejected without it.
     plain = client.post("/api/thresholds", content=json.dumps(body), headers={"Content-Type": "text/plain"})
     assert plain.status_code == 422
-    assert client.get("/api/thresholds", params={"on": "2026-09-05"}).json()["in_effect"]["ftp_w"] == 238
+    assert client.get("/api/thresholds", params={"on": "2026-09-05"}).json()["in_effect"]["ftp_w"] == 250
     for origin in ("http://localhost:5173", "http://127.0.0.1:8801"):  # the UI, and the API's own /docs page
         ok = client.post("/api/thresholds", json=body, headers={"Origin": origin})
         assert ok.status_code == 201

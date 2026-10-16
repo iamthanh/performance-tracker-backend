@@ -25,9 +25,13 @@ threshold heart rate scores 100; its intensity factor is the one that gives the
 same TSS (``sqrt(TSS / (hours * 100))``).
 
 Thresholds (``athlete_settings``): ``auto`` rows are recomputed on every run
-from rides over the trailing ``AUTO_WINDOW_DAYS``: FTP = 95 % of the best
-20-minute power, threshold HR = the best 20-minute heart rate, max HR = the
-third-highest best-30-second heart rate of any activity. Resting HR has no auto value (``DEFAULT_RESTING_HR``).
+from rides over the trailing ``AUTO_WINDOW_DAYS``. FTP is estimated from the
+whole power curve (``auto_ftp``): the critical power of the best 3- to
+30-minute efforts, never below the best hour, falling by at most
+``FTP_DECLINE_PER_WEEK`` so it does not drop off a cliff when a big effort
+ages out of the window. Threshold HR = the best 20-minute heart rate, max HR =
+the third-highest best-30-second heart rate of any activity. Resting HR has no
+auto value (``DEFAULT_RESTING_HR``).
 A ``manual`` value holds from its date until the next manual value, unless the
 automatic value later rises above it (a new best effort); before the first
 value, the first one applies.
@@ -68,7 +72,14 @@ DECOUPLING_MAX_PCT = 50.0
 AUTO_WINDOW_DAYS = 365  # a year, so the estimate does not sink in blocks without all-out efforts
 AUTO_WARMUP_DAYS = 28  # the first auto value uses the first four weeks of efforts, not just the first ride
 AUTO_DURATION_S = 1200
-FTP_FACTOR = 0.95
+FTP_FACTOR = 0.95  # FTP from the best 20 minutes, when the efforts do not support a critical-power fit
+# Critical power (CP) is fitted to the best efforts between these durations: work = CP * t + W'.
+CP_MIN_S = 180
+CP_MAX_S = 1800
+CP_SHORT_S = 420  # the fit needs an effort this short or shorter ...
+CP_LONG_S = 720  # ... and one this long or longer, or it is an extrapolation
+FTP_HOUR_S = 3600  # an hour at X W proves an FTP of at least X
+FTP_DECLINE_PER_WEEK = 0.01  # at most: fitness fades gradually, it does not vanish when an effort turns 366 days old
 MAX_HR_WINDOW_S = 30
 MAX_HR_RANK = 3  # the third-highest activity max: one or two noisy sessions do not set it
 DEFAULT_RESTING_HR = 50.0
@@ -403,6 +414,101 @@ def auto_thresholds(
     return changes
 
 
+def critical_power(best: Mapping[int, float]) -> tuple[float, float] | None:
+    """``(CP, W')`` fitted by least squares to work = CP * t + W' over the best efforts of
+    ``CP_MIN_S`` to ``CP_MAX_S``; None without both a short and a long effort, or for a fit
+    that makes no physiological sense (W' or CP not positive)."""
+    points = sorted((t, w) for t, w in best.items() if CP_MIN_S <= t <= CP_MAX_S and w > 0)
+    if len(points) < 3 or points[0][0] > CP_SHORT_S or points[-1][0] < CP_LONG_S:
+        return None
+    t = np.array([p[0] for p in points], dtype=float)
+    work = np.array([p[0] * p[1] for p in points])
+    cp, w_prime = np.linalg.lstsq(np.vstack([t, np.ones_like(t)]).T, work, rcond=None)[0]
+    return (float(cp), float(w_prime)) if cp > 0 and w_prime > 0 else None
+
+
+def estimate_ftp(best: Mapping[int, float]) -> float | None:
+    """FTP from a power-duration envelope (best watts by duration): critical power, or 95 % of the
+    best 20 minutes when there is no fit; never below the best hour."""
+    fit = critical_power(best)
+    base = fit[0] if fit else (best[AUTO_DURATION_S] * FTP_FACTOR if best.get(AUTO_DURATION_S) else None)
+    hour = best.get(FTP_HOUR_S)
+    return max(v for v in (base, hour) if v) if base or hour else None
+
+
+FTP_CURVE_DURATIONS = tuple(d for d in POWER_CURVE_DURATIONS if CP_MIN_S <= d <= CP_MAX_S or d == FTP_HOUR_S)
+
+
+def auto_ftp(
+    rides: Iterable[tuple[str, Mapping[int, float]]],
+    window_days: int = AUTO_WINDOW_DAYS,
+    warmup_days: int = AUTO_WARMUP_DAYS,
+    decline_per_week: float = FTP_DECLINE_PER_WEEK,
+) -> list[tuple[str, float]]:
+    """``[(local_date, {duration_s: best watts})]`` per ride -> FTP change points.
+
+    On each ride date the trailing window's best power per duration is taken and
+    ``estimate_ftp`` applied. The FTP rises at once with a better estimate but falls
+    by at most ``decline_per_week``. The first value uses ``warmup_days`` of rides and
+    is dated back to the first ride (like ``auto_thresholds``)."""
+    entries = sorted(((day, curve) for day, curve in rides if curve), key=lambda e: e[0])
+    if not entries:
+        return []
+    first = entries[0][0]
+    warm_until = (parse_date(first) + timedelta(days=warmup_days - 1)).isoformat()
+    window: deque[tuple[str, Mapping[int, float]]] = deque()
+    ordered: dict[int, list[float]] = {d: [] for d in FTP_CURVE_DURATIONS}  # each duration's values, sorted
+
+    def envelope() -> dict[int, float]:
+        return {d: values[-1] for d, values in ordered.items() if values}
+
+    changes: list[tuple[str, float]] = []
+    current: tuple[str, float] | None = None  # (date, unrounded FTP)
+    for i, (day, curve) in enumerate(entries):
+        window.append((day, curve))
+        for d, w in curve.items():
+            if d in ordered:
+                insort(ordered[d], w)
+        start = (parse_date(day) - timedelta(days=window_days - 1)).isoformat()
+        while window[0][0] < start:
+            for d, w in window.popleft()[1].items():
+                if d in ordered:
+                    ordered[d].pop(bisect_left(ordered[d], w))
+        following = entries[i + 1][0] if i + 1 < len(entries) else None
+        if following is not None and (following == day or following <= warm_until):
+            continue  # more rides on the same day, or still warming up
+        estimate = estimate_ftp(envelope())
+        if estimate is None:
+            continue
+        if current is None:
+            value, dated = estimate, first
+        else:
+            weeks = (parse_date(day) - parse_date(current[0])).days / 7
+            value, dated = max(estimate, current[1] * (1 - decline_per_week * weeks)), day
+        current = (day, value)
+        if not changes or changes[-1][1] != round(value):
+            changes.append((dated, float(round(value))))
+    return changes
+
+
+def _ride_curves(conn: sqlite3.Connection) -> list[tuple[str, dict[int, float]]]:
+    """Each ride's best power at the durations ``auto_ftp`` uses."""
+    marks = ",".join("?" * len(FTP_CURVE_DURATIONS))
+    rows = conn.execute(
+        f"""
+        SELECT a.source, a.source_id, a.local_date, a.activity_type, p.duration_s, p.watts
+        FROM power_curve p JOIN activities a USING (source, source_id)
+        WHERE p.duration_s IN ({marks})
+        """,
+        FTP_CURVE_DURATIONS,
+    ).fetchall()
+    curves: dict[tuple[str, str], tuple[str, dict[int, float]]] = {}
+    for r in rows:
+        if sport_family(r["activity_type"]) == "cycling":
+            curves.setdefault((r["source"], r["source_id"]), (r["local_date"], {}))[1][r["duration_s"]] = r["watts"]
+    return list(curves.values())
+
+
 def _load_timeline(conn: sqlite3.Connection, metric: str) -> Timeline:
     rows = conn.execute(
         "SELECT effective_date, origin, value FROM athlete_settings WHERE metric = ?", (metric,)
@@ -482,19 +588,17 @@ def analyze(store: Store, *, full: bool = False, progress: Callable[[int, int], 
 
     activities = conn.execute(
         """
-        SELECT m.source, m.source_id, a.local_date, a.activity_type, m.hr_20min_bpm, m.max_hr,
-               p.watts AS best_20min_w
+        SELECT m.source, m.source_id, a.local_date, a.activity_type, m.hr_20min_bpm, m.max_hr
         FROM activity_metrics m
         JOIN activities a USING (source, source_id)
-        LEFT JOIN power_curve p ON p.source = m.source AND p.source_id = m.source_id AND p.duration_s = ?
-        """,
-        (AUTO_DURATION_S,),
+        """
     ).fetchall()
     info = {(r["source"], r["source_id"]): (r["local_date"], sport_family(r["activity_type"])) for r in activities}
     rides = [r for r in activities if sport_family(r["activity_type"]) == "cycling"]
     window = f"trailing {AUTO_WINDOW_DAYS} days"
-    _replace_auto(store, "ftp_w", auto_thresholds(((r["local_date"], r["best_20min_w"]) for r in rides), FTP_FACTOR),
-                  f"95% of best 20 min power, {window}")  # fmt: skip
+    _replace_auto(store, "ftp_w", auto_ftp(_ride_curves(conn)),
+                  f"critical power of best 3-30 min efforts (at least the best hour), {window}; "
+                  f"falls at most {FTP_DECLINE_PER_WEEK:.0%} a week")  # fmt: skip
     _replace_auto(store, "threshold_hr", auto_thresholds((r["local_date"], r["hr_20min_bpm"]) for r in rides),
                   f"best 20 min heart rate, {window}")  # fmt: skip
     _replace_auto(store, "max_hr",
