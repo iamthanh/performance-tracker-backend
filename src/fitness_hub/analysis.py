@@ -27,14 +27,15 @@ same TSS (``sqrt(TSS / (hours * 100))``).
 Thresholds (``athlete_settings``): ``auto`` rows are recomputed on every run
 from rides over the trailing ``AUTO_WINDOW_DAYS``. FTP is estimated from the
 whole power curve (``auto_ftp``): the critical power of the best 3- to
-30-minute efforts, never below the best hour, falling by at most
-``FTP_DECLINE_PER_WEEK`` so it does not drop off a cliff when a big effort
-ages out of the window. Threshold HR = the best 20-minute heart rate, max HR =
+30-minute efforts, never below the best hour, rising only with a new best and
+falling by at most ``FTP_DECLINE_PER_WEEK`` so it does not drop off a cliff
+when a big effort ages out of the window. Threshold HR = the best 20-minute heart rate, max HR =
 the third-highest best-30-second heart rate of any activity. Resting HR has no
 auto value (``DEFAULT_RESTING_HR``).
 A ``manual`` value holds from its date until the next manual value, unless the
-automatic value later rises above it (a new best effort); before the first
-value, the first one applies.
+automatic value later rises above it (a new best effort; an automatic value
+easing down from higher up does not count); before the first value, the first
+one applies.
 """
 
 from __future__ import annotations
@@ -77,7 +78,8 @@ FTP_FACTOR = 0.95  # FTP from the best 20 minutes, when the efforts do not suppo
 CP_MIN_S = 180
 CP_MAX_S = 1800
 CP_SHORT_S = 420  # the fit needs an effort this short or shorter ...
-CP_LONG_S = 720  # ... and one this long or longer, or it is an extrapolation
+CP_LONG_S = 1200  # ... and one this long or longer, or it is an extrapolation
+W_PRIME_RANGE_J = (5000.0, 40000.0)  # outside it the fit is not physiological (flat or odd curve): fall back
 FTP_HOUR_S = 3600  # an hour at X W proves an FTP of at least X
 FTP_DECLINE_PER_WEEK = 0.01  # at most: fitness fades gradually, it does not vanish when an effort turns 366 days old
 MAX_HR_WINDOW_S = 30
@@ -371,8 +373,12 @@ class Timeline:
             return first[1] if first else None
         if manual is None:
             return auto[1] if auto else None
-        # The manual value holds unless an automatic value after it rose above it (a new best).
-        surpassed = any(manual[0] < d <= day and v > manual[1] for d, v in self.auto)
+        # The manual value holds unless an automatic value after it *rose* above it (a new best);
+        # an automatic value easing down from higher up does not count.
+        surpassed = any(
+            manual[0] < d <= day and v > manual[1] and (i == 0 or v > self.auto[i - 1][1])
+            for i, (d, v) in enumerate(self.auto)
+        )
         return auto[1] if surpassed and auto else manual[1]
 
 
@@ -417,14 +423,16 @@ def auto_thresholds(
 def critical_power(best: Mapping[int, float]) -> tuple[float, float] | None:
     """``(CP, W')`` fitted by least squares to work = CP * t + W' over the best efforts of
     ``CP_MIN_S`` to ``CP_MAX_S``; None without both a short and a long effort, or for a fit
-    that makes no physiological sense (W' or CP not positive)."""
+    that makes no physiological sense (CP not positive, W' outside ``W_PRIME_RANGE_J``, as
+    for a flat curve from steady riding without short all-out efforts)."""
     points = sorted((t, w) for t, w in best.items() if CP_MIN_S <= t <= CP_MAX_S and w > 0)
     if len(points) < 3 or points[0][0] > CP_SHORT_S or points[-1][0] < CP_LONG_S:
         return None
     t = np.array([p[0] for p in points], dtype=float)
     work = np.array([p[0] * p[1] for p in points])
     cp, w_prime = np.linalg.lstsq(np.vstack([t, np.ones_like(t)]).T, work, rcond=None)[0]
-    return (float(cp), float(w_prime)) if cp > 0 and w_prime > 0 else None
+    low, high = W_PRIME_RANGE_J
+    return (float(cp), float(w_prime)) if cp > 0 and low <= w_prime <= high else None
 
 
 def estimate_ftp(best: Mapping[int, float]) -> float | None:
@@ -448,9 +456,10 @@ def auto_ftp(
     """``[(local_date, {duration_s: best watts})]`` per ride -> FTP change points.
 
     On each ride date the trailing window's best power per duration is taken and
-    ``estimate_ftp`` applied. The FTP rises at once with a better estimate but falls
-    by at most ``decline_per_week``. The first value uses ``warmup_days`` of rides and
-    is dated back to the first ride (like ``auto_thresholds``)."""
+    ``estimate_ftp`` applied. The FTP rises only on a day whose rides set a new best in
+    the window at some duration (an old effort ageing out never raises it), and falls by
+    at most ``decline_per_week``. The first value uses ``warmup_days`` of rides and, when
+    it comes from them, is dated back to the first ride (like ``auto_thresholds``)."""
     entries = sorted(((day, curve) for day, curve in rides if curve), key=lambda e: e[0])
     if not entries:
         return []
@@ -464,10 +473,12 @@ def auto_ftp(
 
     changes: list[tuple[str, float]] = []
     current: tuple[str, float] | None = None  # (date, unrounded FTP)
+    improved = False  # did today's rides set a new best in the window?
     for i, (day, curve) in enumerate(entries):
         window.append((day, curve))
         for d, w in curve.items():
             if d in ordered:
+                improved = improved or not ordered[d] or w > ordered[d][-1]
                 insort(ordered[d], w)
         start = (parse_date(day) - timedelta(days=window_days - 1)).isoformat()
         while window[0][0] < start:
@@ -478,13 +489,15 @@ def auto_ftp(
         if following is not None and (following == day or following <= warm_until):
             continue  # more rides on the same day, or still warming up
         estimate = estimate_ftp(envelope())
+        new_best, improved = improved, False
         if estimate is None:
             continue
         if current is None:
-            value, dated = estimate, first
+            value, dated = estimate, first if day <= warm_until else day
         else:
             weeks = (parse_date(day) - parse_date(current[0])).days / 7
-            value, dated = max(estimate, current[1] * (1 - decline_per_week * weeks)), day
+            ceiling = estimate if new_best else min(estimate, current[1])
+            value, dated = max(ceiling, current[1] * (1 - decline_per_week * weeks)), day
         current = (day, value)
         if not changes or changes[-1][1] != round(value):
             changes.append((dated, float(round(value))))

@@ -226,6 +226,16 @@ def test_timeline_manual_values_hold_until_beaten() -> None:
     assert Timeline().at("2026-01-01") is None
 
 
+def test_timeline_a_declining_auto_value_does_not_override_a_lower_manual_one() -> None:
+    """After a layoff the rider sets 230 W while the auto FTP is still easing down from 263 W."""
+    timeline = Timeline.from_rows(
+        [("2025-06-01", "auto", 263), ("2026-01-05", "auto", 262), ("2026-01-12", "auto", 261),
+         ("2026-01-10", "manual", 230), ("2026-02-20", "auto", 255), ("2026-03-01", "auto", 258)]  # fmt: skip
+    )
+    assert timeline.at("2026-01-12") == 230 and timeline.at("2026-02-20") == 230
+    assert timeline.at("2026-03-01") == 258  # a real rise (a new best) takes over again
+
+
 def test_auto_thresholds_use_a_trailing_window() -> None:
     points = [
         ("2025-01-01", 300.0),
@@ -256,7 +266,16 @@ def test_critical_power_fits_the_best_efforts() -> None:
     assert cp == pytest.approx(240) and w_prime == pytest.approx(18000)
     assert critical_power({180: 300, 240: 290, 300: 280}) is None  # no long effort: an extrapolation
     assert critical_power({900: 260, 1200: 250, 1800: 240}) is None  # no short effort
+    assert critical_power({180: 330, 300: 300, 600: 280, 720: 270}) is None  # nothing of 20 minutes
     assert critical_power({180: 250, 600: 250, 1200: 250}) is None  # steady power: no W'
+
+
+def test_critical_power_needs_a_plausible_w_prime() -> None:
+    assert critical_power(envelope(240, 5100)) is not None and critical_power(envelope(240, 39000)) is not None
+    assert critical_power(envelope(240, 4000)) is None  # flat: steady riding, no all-out short efforts
+    assert critical_power(envelope(240, 41000)) is None
+    flat = {180: 261.0, 300: 260.8, 600: 260.5, 1200: 260.2, 1800: 259.9}
+    assert estimate_ftp(flat) == pytest.approx(0.95 * 260.2)  # not CP ~ the best 30 minutes
 
 
 def test_estimate_ftp() -> None:
@@ -283,8 +302,23 @@ def test_auto_ftp_falls_gradually_when_efforts_age_out() -> None:
     ]
     assert dict(auto_ftp([("2026-01-01", strong), ("2026-03-01", envelope(300, 20000))]))["2026-03-01"] == 300  # rises at once
     assert auto_ftp([]) == []
+    # The first estimate only after the warm-up (no usable efforts before): dated to its own day.
+    assert auto_ftp([("2026-01-01", {180: 100}), ("2026-03-01", strong)]) == [("2026-03-01", 260.0)]
     # Several rides on one day: the day's best counts.
+    assert auto_ftp([("2026-01-01", strong), ("2026-01-01", strong)]) == [("2026-01-01", 260.0)]
     assert auto_ftp([("2026-01-01", weak), ("2026-01-01", strong)]) == [("2026-01-01", 260.0)]
+
+
+def test_auto_ftp_never_rises_from_an_effort_ageing_out() -> None:
+    """A short all-out effort lowers the CP fit (W' grows); when it ages out, the fit rises again,
+    but without a new best the FTP must not."""
+    base = envelope(250, 20000)
+    sprinty = {**base, 180: base[180] + 60}  # a big 3-minute effort
+    rides = [("2025-01-01", base), ("2025-01-10", sprinty)] + [(f"2025-{m:02d}-01", envelope(230, 20000))
+                                                                for m in range(2, 13)]  # fmt: skip
+    rides += [("2026-01-05", envelope(230, 20000)), ("2026-01-15", envelope(230, 20000))]
+    values = [v for _, v in auto_ftp(rides)]
+    assert all(later <= earlier for earlier, later in zip(values, values[1:]))
 
 
 def test_auto_thresholds_by_rank_ignore_outliers() -> None:
@@ -333,6 +367,21 @@ def test_analyze_end_to_end(store: Store) -> None:
     assert store.conn.execute("SELECT COUNT(*) FROM power_curve WHERE source_id = '1'").fetchone()[0] == 23  # 1 s-1 h
 
     assert analyze(store) == {"analysed": 0, "rescored": 0, "ftp_changes": 1, "threshold_hr_changes": 1}
+
+
+def test_analyze_sets_ftp_from_critical_power(store: Store) -> None:
+    """A 30-minute ride with a hard 3-minute start: the CP fit, not the hour floor, sets FTP."""
+    power = [380.0] * 180 + [250.0] * 1620
+    store.upsert_activities([{"source": "strava", "source_id": "cp", "start_time": "2026-09-01T16:00:00Z",
+                              "local_date": "2026-09-01", "activity_type": "Ride", "raw": {}}])  # fmt: skip
+    store.upsert_activity_streams([{"source": "strava", "source_id": "cp", "streams": {
+        "time": list(range(len(power))), "power": power, "heart_rate": [150] * len(power)}}])  # fmt: skip
+    analyze(store)
+    curve = {r[0]: r[1] for r in store.conn.execute("SELECT duration_s, watts FROM power_curve WHERE source_id = 'cp'")}
+    fit = critical_power(curve)
+    assert fit is not None and 5000 < fit[1] < 40000
+    assert thresholds_on(store.conn, "2026-09-01").ftp_w == round(fit[0])
+    assert round(fit[0]) not in (round(curve[1200] * 0.95), round(curve[1800]))
 
 
 def test_manual_ftp_rescores_without_reanalysing(store: Store) -> None:

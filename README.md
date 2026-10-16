@@ -115,11 +115,15 @@ How the streams are read:
 **Thresholds.** Detected automatically from rides in the trailing 365 days:
 
 - FTP: estimated from the whole power curve, not a single effort.
-  - Critical power is fitted to your best 3- to 30-minute efforts (work = CP × time + W′). It needs at least one effort
-    of 7 minutes or less and one of 12 minutes or more; otherwise FTP is 95 % of the best 20 minutes.
+  - Critical power is fitted to your best 3- to 30-minute efforts (work = CP × time + W′). The fit needs bests from 7
+    minutes or less up to at least 20 minutes, and a W′ between 5 and 40 kJ. A flat curve, from steady riding without
+    short all-out efforts, gives no sensible fit. Without one, FTP is 95 % of the best 20 minutes.
   - It is never below your best hour, since an hour at X W proves an FTP of at least X.
-  - It rises as soon as a better effort shows up, but falls by at most 1 % a week. When a big effort ages out of the
-    365-day window, FTP eases down instead of dropping overnight (and every ride's TSS jumping with it).
+  - It rises only on a day you set a new best at some duration, never because an old effort aged out. It falls by at
+    most 1 % a week, so when a big effort ages out of the 365-day window FTP eases down instead of dropping overnight.
+    The flip side: after a long break it lags. Set your FTP yourself if you know it has dropped.
+  - Your own value holds until the automatic one *rises* above it with a new best; an automatic value easing down
+    from higher up never overrides it.
 - Threshold HR: the best 20-minute heart rate.
 - Max HR: the third-highest best-30-second heart rate of any activity, so one or two noisy sessions don't set it.
 - The first values use your first four weeks of rides.
