@@ -30,6 +30,8 @@ EXPECTED_TOOLS = {
     "training_load",
     "power_curve",
     "get_activity_analysis",
+    "nutrition_daily",
+    "workout_fueling",
     "sync_now",
 }
 

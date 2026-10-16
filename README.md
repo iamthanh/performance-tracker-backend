@@ -149,6 +149,21 @@ and TSB, the previous day's CTL − ATL, as on TrainingPeaks' Performance Manage
 imported streams have a TSS; each day also reports `unscored` workouts, so you can tell when the load is understated
 (for example, new rides that have not been imported yet).
 
+### Nutrition (logged by you)
+
+Meals and fueling during workouts are logged in the web UI (or through the API) and stored in `nutrition_entries`;
+saved foods (`foods`) make it one tap. There is no importer yet.
+
+- **Each entry keeps its own nutrient totals**, copied when it is logged, so editing or deleting a saved food never
+  changes your history. Logging from a saved food fills in its nutrients × servings; anything you type in wins.
+- **Workout fueling** is an entry with meal `during_workout` linked to the workout, optionally with the time into it.
+  For each workout: carbs (g/h), fluid (ml/h), sodium (mg/h) and caffeine taken during it, per hour of moving time.
+- **Energy out.** A workout's kcal is its recorded calories, else its work in kJ (for cycling, kJ of work ≈ kcal
+  burned). A day's total is your watch's total calories (Garmin), once synced; until then only workout kcal is known.
+- **Carbohydrate burned** is a rough estimate from the workout's intensity factor: about a third of the energy at a
+  recovery pace, two thirds at IF 0.75, nearly all near threshold. It is for comparing with what you ate, not a
+  measurement.
+
 ### Strava API (needs a Strava subscription)
 
 1. Create an API application at <https://www.strava.com/settings/api>. Set **Authorization Callback Domain** to
@@ -290,6 +305,8 @@ Then ask, for example:
 | `training_load` | Daily TSS, fitness (CTL), fatigue (ATL) and form (TSB); default last 90 days |
 | `power_curve` | Best average power per duration (1 s to 5 h) in a date range, with the activity that set it |
 | `get_activity_analysis` | One activity's NP, IF, TSS, VI, EF, decoupling, zones, thresholds used and power curve |
+| `nutrition_daily` | Per day: calories and nutrients eaten, workout kcal, the watch's total and active kcal, and the balance |
+| `workout_fueling` | A workout's fueling: entries, totals and per-hour carbs, fluid, sodium and caffeine, against kcal burned |
 | `sync_now` | Runs a sync and returns its log. It blocks, and `full=true` can hit rate limits |
 
 Units: metres, seconds, bpm, watts, kcal, kg (summaries use km and hours). Timestamps are UTC, and dates are your local
@@ -355,6 +372,12 @@ Reads use read-only connections. The only writes are threshold overrides, which 
 | `GET /api/thresholds?on=YYYY-MM-DD` | Every dated threshold value, and those in effect on `on` |
 | `POST /api/thresholds` `{metric, effective_date, value, note?}` | Set a manual value; returns the re-scoring result |
 | `DELETE /api/thresholds/{metric}/{effective_date}` | Remove a manual value |
+| `GET /api/nutrition/foods?include_archived` | Saved foods, with nutrients per serving |
+| `POST /api/nutrition/foods`, `PUT /api/nutrition/foods/{id}`, `DELETE …/{id}` | Save, replace or delete a food (logged entries keep their own copy) |
+| `GET /api/nutrition/entries?start_date&end_date&activity_source&activity_source_id` | What was eaten and drunk, by dates and/or for one workout |
+| `POST /api/nutrition/entries`, `PUT /api/nutrition/entries/{id}`, `DELETE …/{id}` | Log, replace or delete an entry |
+| `GET /api/nutrition/daily?start_date&end_date` | Per day: intake totals, workout kcal, the watch's total and active kcal, balance |
+| `GET /api/activities/{source}/{id}/fueling` | A workout's fueling: totals and per-hour rates against energy and (estimated) carbs burned |
 
 Errors return `{"detail": …}`:
 
@@ -418,6 +441,10 @@ src/fitness_hub/
 ├── util.py              # timestamp/number parsing helpers
 ├── sync.py              # build_providers, run_sync, sync lock
 ├── queries.py           # read side: activities, summaries, metrics, sleep, body, run_select, de-dup
+├── analysis.py          # training analysis: NP, TSS, zones, power curve, auto thresholds, load
+├── nutrition.py         # foods, nutrition entries, daily energy in/out, workout fueling
+├── api.py               # FastAPI read/write API for the web UI
+├── activity_files.py    # FIT / GPX / TCX / Strava JSON parsing
 └── providers/
     ├── __init__.py      # SyncWindow, SyncResult, run_stream
     ├── strava.py
@@ -443,6 +470,8 @@ local clock. Every row keeps the provider payload in `raw` and an `updated_at` s
 | `daily_series` | `(source, date, series)` | `channels, sample_count, encoding, data`: intraday samples, `{"time": [epoch s], "heart_rate": [bpm]}` for series `heart_rate` |
 | `power_curve` | `(source, source_id, duration_s)` | `watts`: the best average power over `duration_s` in that activity |
 | `athlete_settings` | `(metric, effective_date, origin)` | `value, note`. Metrics `ftp_w, threshold_hr, max_hr, resting_hr`; origin `manual` or `auto` (see Training analysis for how they combine) |
+| `foods` | `id` | `name, brand, serving` and nutrients **per serving**: `kcal, carbs_g, sugars_g, protein_g, fat_g, fiber_g, sodium_mg, potassium_mg, caffeine_mg, fluid_ml`; `note, archived` |
+| `nutrition_entries` | `id` (and `(source, source_id)` for imports) | `local_date, consumed_at, meal` (`breakfast, lunch, dinner, snack, pre_workout, during_workout, post_workout`), `activity_source, activity_source_id, offset_s` (the workout it fuelled, seconds into it), `food_id, name, servings`, the same nutrients as **totals for the entry**, `note` |
 
 **Schema versions.** The version is kept in `PRAGMA user_version`. Opening the database applies any missing migrations
 (`db.MIGRATIONS`), each in one transaction. A database created before versioning counts as version 1, and a database

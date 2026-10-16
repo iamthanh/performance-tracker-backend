@@ -18,7 +18,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from . import queries
+from . import nutrition, queries
 from .config import Settings
 from .db import BODY_METRICS, DAILY_METRICS, SOURCES, open_readonly
 from .sync import PROVIDER_NAMES, run_sync
@@ -204,6 +204,27 @@ def create_server(
         unscored days means the load is understated (e.g. no export imported since)."""
         rows = await read(lambda c: queries.training_load(c, start_date, end_date))
         return _dump({"count": len(rows), "days": rows})
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=False)
+    async def nutrition_daily(
+        start_date: Annotated[str, Field(description="YYYY-MM-DD")],
+        end_date: Annotated[str, Field(description="YYYY-MM-DD")],
+    ) -> str:
+        """Per day: calories and nutrients eaten (logged meals and workout fueling; None = nothing logged),
+        workout kcal (recorded calories, else kJ of work for rides), the watch's total and active kcal, and
+        the balance (intake minus total, when both are known)."""
+        rows = await read(lambda c: nutrition.daily_nutrition(c, start_date, end_date))
+        return _dump({"count": len(rows), "days": rows})
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=False)
+    async def workout_fueling(
+        source: Annotated[str, Field(description="Activity source, e.g. strava")],
+        source_id: Annotated[str, Field(description="Activity id within the source")],
+    ) -> str:
+        """What a workout was fuelled with: the logged entries, totals and per-hour rates (carbs g/h, fluid
+        ml/h, sodium mg/h, caffeine) taken during it, the kcal it burned and a rough estimate of the
+        carbohydrate burned from its intensity factor."""
+        return _dump(await read(lambda c: nutrition.workout_fueling(c, source, source_id)))
 
     @mcp.tool(annotations=READ_ONLY, structured_output=False)
     async def power_curve(

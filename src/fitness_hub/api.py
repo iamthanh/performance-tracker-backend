@@ -40,7 +40,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from . import __version__, queries
+from . import __version__, nutrition, queries
 from .analysis import analyze, thresholds_on
 from .config import Settings
 from .db import ATHLETE_SETTINGS, Store, open_readonly, schema_version
@@ -60,6 +60,48 @@ class ThresholdIn(BaseModel):
     effective_date: str = Field(description="YYYY-MM-DD: the value applies from this date on")
     value: float = Field(gt=0, description="W for ftp_w, bpm otherwise")
     note: str | None = None
+
+
+Meal = Literal["breakfast", "lunch", "dinner", "snack", "pre_workout", "during_workout", "post_workout"]
+if set(get_args(Meal)) != set(nutrition.MEALS):  # pragma: no cover - a programming error
+    raise RuntimeError("Meal is out of sync with nutrition.MEALS")
+Amount = Annotated[float | None, Field(ge=0)]
+
+
+class Nutrients(BaseModel):
+    """Amounts; None = unknown. Per serving for a food, totals for an entry."""
+
+    kcal: Amount = None
+    carbs_g: Amount = None
+    sugars_g: Amount = None
+    protein_g: Amount = None
+    fat_g: Amount = None
+    fiber_g: Amount = None
+    sodium_mg: Amount = None
+    potassium_mg: Amount = None
+    caffeine_mg: Amount = None
+    fluid_ml: Amount = None
+
+
+class FoodIn(Nutrients):
+    name: str = Field(min_length=1, max_length=200)
+    brand: str | None = Field(default=None, max_length=200)
+    serving: str | None = Field(default=None, max_length=200, description='e.g. "1 gel (40 g)", "750 ml bottle"')
+    note: str | None = Field(default=None, max_length=1000)
+    archived: bool = False
+
+
+class EntryIn(Nutrients):
+    local_date: str = Field(description="YYYY-MM-DD, the athlete's local date")
+    meal: Meal
+    name: str | None = Field(default=None, max_length=200, description="Defaults to the food's name")
+    food_id: int | None = Field(default=None, description="Nutrients not given are the food's per serving x servings")
+    servings: float = Field(default=1.0, gt=0)
+    consumed_at: str | None = Field(default=None, description="ISO date-time with a time zone")
+    activity_source: str | None = None
+    activity_source_id: str | None = None
+    offset_s: float | None = Field(default=None, ge=0, description="Seconds into the workout")
+    note: str | None = Field(default=None, max_length=1000)
 
 
 def _read(request: Request) -> Iterator[sqlite3.Connection]:
@@ -220,7 +262,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=sorted(allowed_origins),
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["Content-Type"],
     )
 
@@ -359,6 +401,85 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if not store.delete_athlete_setting(metric, effective_date):
                 raise HTTPException(status_code=404, detail=f"no manual {metric} value from {effective_date}")
             return {"analysis": analyze(store)}
+
+    # -- nutrition ------------------------------------------------------------------------
+
+    @app.get("/api/nutrition/foods")
+    def foods(conn: Conn, include_archived: bool = False) -> list[dict[str, Any]]:
+        """Saved foods (nutrients per serving), by name."""
+        return nutrition.list_foods(conn, include_archived)
+
+    @app.post("/api/nutrition/foods", status_code=201)
+    def create_food(body: FoodIn) -> dict[str, Any]:
+        with Store(settings.db_path) as store:
+            return nutrition.save_food(store.conn, body.model_dump()) or {}
+
+    @app.put("/api/nutrition/foods/{food_id}")
+    def update_food(food_id: int, body: FoodIn) -> dict[str, Any]:
+        """Replace a saved food. Entries already logged from it keep their own nutrients."""
+        with Store(settings.db_path) as store:
+            food = nutrition.save_food(store.conn, body.model_dump(), food_id)
+        if food is None:
+            raise HTTPException(status_code=404, detail=f"no saved food {food_id}")
+        return food
+
+    @app.delete("/api/nutrition/foods/{food_id}", status_code=204)
+    def delete_food(food_id: int) -> Response:
+        with Store(settings.db_path) as store:
+            if not nutrition.delete_food(store.conn, food_id):
+                raise HTTPException(status_code=404, detail=f"no saved food {food_id}")
+        return Response(status_code=204)
+
+    @app.get("/api/nutrition/entries")
+    def entries(
+        conn: Conn,
+        start_date: DateQuery = None,
+        end_date: DateQuery = None,
+        activity_source: str | None = None,
+        activity_source_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """What was eaten and drunk, in order; filter by dates and/or one workout."""
+        if not (start_date or end_date or activity_source):
+            raise InputError("give start_date/end_date or a workout (activity_source, activity_source_id)")
+        if (activity_source is None) != (activity_source_id is None):
+            raise InputError("activity_source and activity_source_id go together")
+        workout = (activity_source, activity_source_id) if activity_source and activity_source_id else None
+        return nutrition.list_entries(conn, start_date, end_date, workout)
+
+    @app.post("/api/nutrition/entries", status_code=201)
+    def create_entry(body: EntryIn) -> dict[str, Any]:
+        with Store(settings.db_path) as store:
+            return nutrition.save_entry(store.conn, body.model_dump(exclude_unset=True)) or {}
+
+    @app.put("/api/nutrition/entries/{entry_id}")
+    def update_entry(entry_id: int, body: EntryIn) -> dict[str, Any]:
+        """Replace an entry (send its nutrients to keep them; missing ones are refilled from its food)."""
+        with Store(settings.db_path) as store:
+            entry = nutrition.save_entry(store.conn, body.model_dump(exclude_unset=True), entry_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"no nutrition entry {entry_id}")
+        return entry
+
+    @app.delete("/api/nutrition/entries/{entry_id}", status_code=204)
+    def delete_entry(entry_id: int) -> Response:
+        with Store(settings.db_path) as store:
+            if not nutrition.delete_entry(store.conn, entry_id):
+                raise HTTPException(status_code=404, detail=f"no nutrition entry {entry_id}")
+        return Response(status_code=204)
+
+    @app.get("/api/nutrition/daily")
+    def nutrition_daily(conn: Conn, start_date: DateQuery = None, end_date: DateQuery = None) -> list[dict[str, Any]]:
+        """Per day: intake totals, workout kcal, the watch's total and active kcal, and the balance."""
+        return nutrition.daily_nutrition(conn, start_date or "", end_date or "")
+
+    @app.get("/api/activities/{source}/{source_id}/fueling")
+    def fueling(conn: Conn, source: str, source_id: str) -> dict[str, Any]:
+        """What a workout was fuelled with: totals and per-hour rates, against the energy and
+        (roughly estimated) carbohydrate it burned."""
+        result = nutrition.workout_fueling(conn, source, source_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail=f"no activity {source}/{source_id}")
+        return result
 
     return app
 
