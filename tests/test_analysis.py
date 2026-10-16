@@ -16,7 +16,10 @@ from fitness_hub.analysis import (
     Thresholds,
     Timeline,
     analyze,
+    auto_ftp,
     auto_thresholds,
+    critical_power,
+    estimate_ftp,
     base_metrics,
     best_average,
     decoupling,
@@ -223,6 +226,16 @@ def test_timeline_manual_values_hold_until_beaten() -> None:
     assert Timeline().at("2026-01-01") is None
 
 
+def test_timeline_a_declining_auto_value_does_not_override_a_lower_manual_one() -> None:
+    """After a layoff the rider sets 230 W while the auto FTP is still easing down from 263 W."""
+    timeline = Timeline.from_rows(
+        [("2025-06-01", "auto", 263), ("2026-01-05", "auto", 262), ("2026-01-12", "auto", 261),
+         ("2026-01-10", "manual", 230), ("2026-02-20", "auto", 255), ("2026-03-01", "auto", 258)]  # fmt: skip
+    )
+    assert timeline.at("2026-01-12") == 230 and timeline.at("2026-02-20") == 230
+    assert timeline.at("2026-03-01") == 258  # a real rise (a new best) takes over again
+
+
 def test_auto_thresholds_use_a_trailing_window() -> None:
     points = [
         ("2025-01-01", 300.0),
@@ -242,6 +255,70 @@ def test_auto_thresholds_warm_up_before_the_first_value() -> None:
     points = [("2026-01-01", 150.0), ("2026-01-10", 250.0), ("2026-02-01", 240.0)]
     assert auto_thresholds(points) == [("2026-01-01", 250.0)]
     assert auto_thresholds([("2026-01-01", 150.0)]) == [("2026-01-01", 150.0)]  # all there is
+
+
+def envelope(cp: float, w_prime: float, durations=(180, 300, 600, 1200, 1800)) -> dict[int, float]:
+    return {t: cp + w_prime / t for t in durations}
+
+
+def test_critical_power_fits_the_best_efforts() -> None:
+    cp, w_prime = critical_power(envelope(240, 18000))
+    assert cp == pytest.approx(240) and w_prime == pytest.approx(18000)
+    assert critical_power({180: 300, 240: 290, 300: 280}) is None  # no long effort: an extrapolation
+    assert critical_power({900: 260, 1200: 250, 1800: 240}) is None  # no short effort
+    assert critical_power({180: 330, 300: 300, 600: 280, 720: 270}) is None  # nothing of 20 minutes
+    assert critical_power({180: 250, 600: 250, 1200: 250}) is None  # steady power: no W'
+
+
+def test_critical_power_needs_a_plausible_w_prime() -> None:
+    assert critical_power(envelope(240, 5100)) is not None and critical_power(envelope(240, 39000)) is not None
+    assert critical_power(envelope(240, 4000)) is None  # flat: steady riding, no all-out short efforts
+    assert critical_power(envelope(240, 41000)) is None
+    flat = {180: 261.0, 300: 260.8, 600: 260.5, 1200: 260.2, 1800: 259.9}
+    assert estimate_ftp(flat) == pytest.approx(0.95 * 260.2)  # not CP ~ the best 30 minutes
+
+
+def test_estimate_ftp() -> None:
+    assert estimate_ftp(envelope(240, 18000)) == pytest.approx(240)
+    assert estimate_ftp({**envelope(240, 18000), 3600: 250}) == 250  # an hour at 250 W proves more
+    assert estimate_ftp({1200: 260}) == pytest.approx(247)  # no fit: 95 % of the best 20 minutes
+    assert estimate_ftp({300: 400}) is None
+
+
+def test_auto_ftp_falls_gradually_when_efforts_age_out() -> None:
+    strong = envelope(260, 20000)
+    weak = envelope(220, 20000)
+    rides = [("2025-01-01", strong)] + [(f"2025-{m:02d}-01", weak) for m in range(2, 13)]
+    rides += [("2026-01-15", weak), ("2026-02-15", weak), ("2026-03-15", weak), ("2026-04-15", weak)]
+    changes = dict(auto_ftp(rides))
+    assert changes["2025-01-01"] == 260
+    assert "2025-12-01" not in changes  # the strong ride is still in the trailing year
+    # 2026-01-15: the strong ride has aged out (estimate 220), but FTP falls at most 1 % a week.
+    weeks = (date(2026, 1, 15) - date(2025, 12, 1)).days / 7
+    assert changes["2026-01-15"] == round(260 * (1 - 0.01 * weeks))
+    assert changes["2026-03-15"] == 223 and changes["2026-04-15"] == 220  # it reaches the estimate in the end
+    assert auto_ftp([("2026-01-01", strong), ("2026-01-20", envelope(300, 20000))]) == [
+        ("2026-01-01", 300.0)  # within the warm-up: the best of the first four weeks, dated to the first ride
+    ]
+    assert dict(auto_ftp([("2026-01-01", strong), ("2026-03-01", envelope(300, 20000))]))["2026-03-01"] == 300  # rises at once
+    assert auto_ftp([]) == []
+    # The first estimate only after the warm-up (no usable efforts before): dated to its own day.
+    assert auto_ftp([("2026-01-01", {180: 100}), ("2026-03-01", strong)]) == [("2026-03-01", 260.0)]
+    # Several rides on one day: the day's best counts.
+    assert auto_ftp([("2026-01-01", strong), ("2026-01-01", strong)]) == [("2026-01-01", 260.0)]
+    assert auto_ftp([("2026-01-01", weak), ("2026-01-01", strong)]) == [("2026-01-01", 260.0)]
+
+
+def test_auto_ftp_never_rises_from_an_effort_ageing_out() -> None:
+    """A short all-out effort lowers the CP fit (W' grows); when it ages out, the fit rises again,
+    but without a new best the FTP must not."""
+    base = envelope(250, 20000)
+    sprinty = {**base, 180: base[180] + 60}  # a big 3-minute effort
+    rides = [("2025-01-01", base), ("2025-01-10", sprinty)] + [(f"2025-{m:02d}-01", envelope(230, 20000))
+                                                                for m in range(2, 13)]  # fmt: skip
+    rides += [("2026-01-05", envelope(230, 20000)), ("2026-01-15", envelope(230, 20000))]
+    values = [v for _, v in auto_ftp(rides)]
+    assert all(later <= earlier for earlier, later in zip(values, values[1:]))
 
 
 def test_auto_thresholds_by_rank_ignore_outliers() -> None:
@@ -276,13 +353,13 @@ def test_analyze_end_to_end(store: Store) -> None:
     result = analyze(store)
     assert result["analysed"] == 3 and result["rescored"] == 3
 
-    # FTP = 95 % of the best 20 minutes (250 W); threshold HR = the rides' best 20-minute HR (the run's 170
-    # does not count); max HR = the third-highest activity max (150, 150, 170).
-    assert thresholds_on(store.conn, "2026-09-02") == Thresholds(ftp_w=238, threshold_hr=150, max_hr=150)
+    # FTP = 250 W: an hour at 250 W proves it (steady power gives no critical-power fit); threshold HR = the
+    # rides' best 20-minute HR (the run's 170 does not count); max HR = the third-highest activity max.
+    assert thresholds_on(store.conn, "2026-09-02") == Thresholds(ftp_w=250, threshold_hr=150, max_hr=150)
     first = metrics(store, "1")
     assert first["analysis_version"] == ANALYSIS_VERSION
-    assert first["ftp_w"] == 238 and first["tss_method"] == "power"
-    assert first["tss"] == pytest.approx(3600 * 250 * (250 / 238) / (238 * 3600) * 100)
+    assert first["ftp_w"] == 250 and first["tss_method"] == "power"
+    assert first["tss"] == pytest.approx(100)  # an hour at FTP
     run = metrics(store, "3")
     assert run["tss_method"] == "hr" and run["avg_power_w"] is None and run["threshold_hr"] == 150
     max_hr = 150 / 0.92  # max HR is not above threshold HR: the fallback applies
@@ -292,16 +369,31 @@ def test_analyze_end_to_end(store: Store) -> None:
     assert analyze(store) == {"analysed": 0, "rescored": 0, "ftp_changes": 1, "threshold_hr_changes": 1}
 
 
+def test_analyze_sets_ftp_from_critical_power(store: Store) -> None:
+    """A 30-minute ride with a hard 3-minute start: the CP fit, not the hour floor, sets FTP."""
+    power = [380.0] * 180 + [250.0] * 1620
+    store.upsert_activities([{"source": "strava", "source_id": "cp", "start_time": "2026-09-01T16:00:00Z",
+                              "local_date": "2026-09-01", "activity_type": "Ride", "raw": {}}])  # fmt: skip
+    store.upsert_activity_streams([{"source": "strava", "source_id": "cp", "streams": {
+        "time": list(range(len(power))), "power": power, "heart_rate": [150] * len(power)}}])  # fmt: skip
+    analyze(store)
+    curve = {r[0]: r[1] for r in store.conn.execute("SELECT duration_s, watts FROM power_curve WHERE source_id = 'cp'")}
+    fit = critical_power(curve)
+    assert fit is not None and 5000 < fit[1] < 40000
+    assert thresholds_on(store.conn, "2026-09-01").ftp_w == round(fit[0])
+    assert round(fit[0]) not in (round(curve[1200] * 0.95), round(curve[1800]))
+
+
 def test_manual_ftp_rescores_without_reanalysing(store: Store) -> None:
     ride(store, "1", "2026-09-01", 250)
     ride(store, "2", "2026-09-10", 250)
     analyze(store)
-    store.set_athlete_setting("ftp_w", "2026-09-05", 250)
+    store.set_athlete_setting("ftp_w", "2026-09-05", 260)
     result = analyze(store)
     assert result["analysed"] == 0
     assert result["rescored"] == 1  # only the ride after the manual value
-    assert metrics(store, "1")["ftp_w"] == 238 and metrics(store, "2")["ftp_w"] == 250
-    assert metrics(store, "2")["tss"] == pytest.approx(100)
+    assert metrics(store, "1")["ftp_w"] == 250 and metrics(store, "2")["ftp_w"] == 260
+    assert metrics(store, "2")["tss"] == pytest.approx((250 / 260) ** 2 * 100)
 
 
 def test_type_or_date_changes_are_rescored(store: Store) -> None:
@@ -334,8 +426,8 @@ def test_changed_streams_are_reanalysed(store: Store) -> None:
 def test_training_load(store: Store) -> None:
     for i in range(1, 4):
         ride(store, str(i), f"2026-09-0{i}", 238, seconds=3600)
-    analyze(store)  # FTP 226 W: each ride scores (238/226)^2 * 100
-    tss = (238 / 226) ** 2 * 100
+    analyze(store)  # an hour at 238 W: FTP 238 W, each ride scores 100
+    tss = 100.0
     days = queries.training_load(store.conn, "2026-08-31", "2026-09-05")
     assert days[0]["date"] == "2026-08-31"  # the range starts where asked, before the first ride
     ctl = atl = 0.0
