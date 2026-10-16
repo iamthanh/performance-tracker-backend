@@ -9,7 +9,7 @@
 
 Energy out: a workout's kcal is its recorded calories, else its mechanical work in kJ
 (for cycling, kJ of work ~ kcal burned: ~24 % gross efficiency cancels 4.184 kJ/kcal).
-A day's total is the watch's total calories (Garmin, or Google Health), when synced.
+A day's total is the watch's total calories (Garmin, else Google Health), when synced.
 
 Carbohydrate burned during a workout is a rough estimate from its intensity factor
 (the crossover concept: the harder the effort, the larger the share of energy from
@@ -21,11 +21,11 @@ from __future__ import annotations
 import math
 import sqlite3
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from . import queries
-from .util import InputError, now_utc_iso, parse_date
+from .util import InputError, now_utc_iso, parse_date, parse_ts
 
 NUTRIENTS = (
     "kcal",
@@ -189,7 +189,8 @@ def list_entries(
     end_date: str | None = None,
     activity: tuple[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Entries in a date range and/or for one workout, in the order they were eaten."""
+    """Entries in a date range and/or for one workout (linked to it or to a copy of it from
+    another service), in the order they were eaten."""
     clauses, params = [], []
     if start_date:
         clauses.append("local_date >= ?")
@@ -198,8 +199,10 @@ def list_entries(
         clauses.append("local_date <= ?")
         params.append(parse_date(end_date, "end_date").isoformat())
     if activity:
-        clauses.append("activity_source = ? AND activity_source_id = ?")
-        params.extend(activity)
+        copies = same_workout(conn, *activity) or [{"source": activity[0], "source_id": activity[1]}]
+        clauses.append("(" + " OR ".join(["(activity_source = ? AND activity_source_id = ?)"] * len(copies)) + ")")
+        for c in copies:
+            params.extend((c["source"], c["source_id"]))
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = (
         f"SELECT * FROM nutrition_entries {where} "
@@ -208,34 +211,54 @@ def list_entries(
     return [_entry(r) for r in conn.execute(sql, params)]
 
 
-def _entry_values(conn: sqlite3.Connection, data: Mapping[str, Any]) -> dict[str, Any]:
+def _entry_values(
+    conn: sqlite3.Connection, data: Mapping[str, Any], existing: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Validated columns for a new entry, or for replacing ``existing``.
+
+    Nutrients given in ``data`` (a key that is present, even as None to clear it) are the
+    entry's own totals. Others: on create, the food's per serving x servings; on update,
+    the stored totals, scaled when only the servings of a food entry changed, or refilled
+    from a different food when the food changed. A food edited after logging never changes
+    an entry unless the entry is re-pointed at it.
+    """
     meal = data.get("meal")
     if meal not in MEALS:
         raise InputError(f"meal must be one of {', '.join(MEALS)}; got {meal!r}")
-    servings = _amount(data.get("servings", 1.0), "servings", positive=True) or 1.0
+    servings = _amount(data.get("servings", existing["servings"] if existing else 1.0), "servings", positive=True)
+    servings = servings or 1.0
     food = None
     food_id = data.get("food_id")
     if food_id is not None:
         if isinstance(food_id, bool) or not isinstance(food_id, int):
             raise InputError("food_id must be a whole number")
         food = get_food(conn, food_id)
-        if food is None:
+        if food is None and not (existing and existing["food_id"] == food_id):
             raise InputError(f"no saved food {food_id}")
-    nutrients = _nutrients(data)
-    if food:
-        # Nutrients sent are the entry's totals; the rest come from the food, per serving x servings.
-        for n in NUTRIENTS:
-            if nutrients[n] is None and food[n] is not None:
-                nutrients[n] = food[n] * servings
+    given = {n: _amount(data[n], n) for n in NUTRIENTS if n in data}
+    if existing is None or (food is not None and existing["food_id"] != food_id):
+        base = {n: (food[n] * servings if food and food[n] is not None else None) for n in NUTRIENTS}
+    else:
+        ratio = servings / existing["servings"] if existing["food_id"] is not None and existing["servings"] else 1.0
+        base = {n: (existing[n] * ratio if existing[n] is not None else None) for n in NUTRIENTS}
+    nutrients = {**base, **given}
+
     activity_source = _text(data.get("activity_source"), "activity_source")
     activity_source_id = _text(data.get("activity_source_id"), "activity_source_id")
     if (activity_source is None) != (activity_source_id is None):
         raise InputError("activity_source and activity_source_id go together")
-    if activity_source and queries.get_activity(conn, activity_source, activity_source_id or "") is None:
+    unchanged_link = existing is not None and (existing["activity_source"], existing["activity_source_id"]) == (
+        activity_source,
+        activity_source_id,
+    )
+    if activity_source and not unchanged_link and not same_workout(conn, activity_source, activity_source_id or ""):
         raise InputError(f"no workout {activity_source}/{activity_source_id}")
     offset_s = _amount(data.get("offset_s"), "offset_s")
     if offset_s is not None and not activity_source:
         raise InputError("offset_s (time into the workout) needs a workout")
+    name = _text(data.get("name"), "name", required=food is None and not existing) or (
+        food["name"] if food else existing["name"] if existing else None
+    )
     return {
         "source": _text(data.get("source"), "source") or "manual",
         "source_id": _text(data.get("source_id"), "source_id"),
@@ -246,39 +269,79 @@ def _entry_values(conn: sqlite3.Connection, data: Mapping[str, Any]) -> dict[str
         "activity_source_id": activity_source_id,
         "offset_s": offset_s,
         "food_id": food_id,
-        "name": _text(data.get("name"), "name", required=food is None) or (food["name"] if food else None),
+        "name": name,
         "servings": servings,
         **nutrients,
         "note": _text(data.get("note"), "note", limit=1000),
     }
 
 
+# An edit never changes where an entry came from: importers own (source, source_id).
+_UPDATE_FIELDS = tuple(f for f in _ENTRY_FIELDS if f not in ("source", "source_id"))
+
+
 def save_entry(conn: sqlite3.Connection, data: Mapping[str, Any], entry_id: int | None = None) -> dict[str, Any] | None:
-    """Log an entry, or replace entry ``entry_id`` (None if it does not exist)."""
-    values = _entry_values(conn, data)
+    """Log an entry, or replace entry ``entry_id`` (None if it does not exist). See ``_entry_values``."""
     now = now_utc_iso()
-    with conn:
-        if entry_id is None:
+    if entry_id is None:
+        values = _entry_values(conn, data)
+        with conn:
             cursor = conn.execute(
                 f"INSERT INTO nutrition_entries ({', '.join(_ENTRY_FIELDS)}, created_at, updated_at) "
                 f"VALUES ({', '.join('?' * len(_ENTRY_FIELDS))}, ?, ?)",
                 (*(values[f] for f in _ENTRY_FIELDS), now, now),
             )
-            entry_id = int(cursor.lastrowid or 0)
-        else:
-            cursor = conn.execute(
-                f"UPDATE nutrition_entries SET {', '.join(f'{f} = ?' for f in _ENTRY_FIELDS)}, updated_at = ? "
-                "WHERE id = ?",
-                (*(values[f] for f in _ENTRY_FIELDS), now, entry_id),
-            )
-            if cursor.rowcount == 0:
-                return None
+        return get_entry(conn, int(cursor.lastrowid or 0))
+    existing = get_entry(conn, entry_id)
+    if existing is None:
+        return None
+    values = _entry_values(conn, data, existing)
+    with conn:
+        conn.execute(
+            f"UPDATE nutrition_entries SET {', '.join(f'{f} = ?' for f in _UPDATE_FIELDS)}, updated_at = ? WHERE id = ?",
+            (*(values[f] for f in _UPDATE_FIELDS), now, entry_id),
+        )
     return get_entry(conn, entry_id)
 
 
 def delete_entry(conn: sqlite3.Connection, entry_id: int) -> bool:
     with conn:
         return conn.execute("DELETE FROM nutrition_entries WHERE id = ?", (entry_id,)).rowcount > 0
+
+
+# -- the same workout across sources -------------------------------------------------------
+
+
+def same_workout(conn: sqlite3.Connection, source: str, source_id: str) -> list[dict[str, Any]]:
+    """The workout and its copies from other services: activities of other sources starting
+    within ``queries.DEDUPE_WINDOW_S`` of it (how the activity lists merge duplicates). Entries
+    and calories may sit on any copy, and which copy a list shows can change after an import."""
+    row = conn.execute(
+        "SELECT source, source_id, start_time, calories FROM activities WHERE source = ? AND source_id = ?",
+        (source, source_id),
+    ).fetchone()
+    if row is None:
+        return []
+    start = parse_ts(row["start_time"])
+    copies = [dict(row)]
+    if start is None:
+        return copies
+    window = timedelta(seconds=queries.DEDUPE_WINDOW_S)
+    for other in conn.execute(
+        "SELECT source, source_id, start_time, calories FROM activities WHERE local_date BETWEEN ? AND ? AND source != ?",
+        ((start - timedelta(days=1)).date().isoformat(), (start + timedelta(days=1)).date().isoformat(), source),
+    ):
+        ts = parse_ts(other["start_time"])
+        if ts is not None and abs(ts - start) <= window:
+            copies.append(dict(other))
+    return copies
+
+
+def _best_calories(copies: list[dict[str, Any]]) -> float | None:
+    """Recorded calories from the preferred source that has them."""
+    known = [c for c in copies if c.get("calories")]
+    return float(min(known, key=lambda c: queries.SOURCE_PRIORITY.index(c["source"])
+                     if c["source"] in queries.SOURCE_PRIORITY else 99)["calories"]) if known else None  # fmt: skip
 
 
 # -- summaries -------------------------------------------------------------------------------
@@ -321,6 +384,9 @@ def daily_nutrition(conn: sqlite3.Connection, start_date: str, end_date: str) ->
     for entry in list_entries(conn, start.isoformat(), end.isoformat()):
         days[entry["local_date"]]["entries"].append(entry)
     for row in queries.activities_with_metrics(conn, start.isoformat(), end.isoformat()):
+        if not row.get("calories") and row.get("also_recorded_by"):
+            # The copy shown may lack calories that another service's copy recorded.
+            row = {**row, "calories": _best_calories(same_workout(conn, row["source"], row["source_id"]))}
         kcal = workout_kcal(row)
         if kcal is not None and row["local_date"] in days:
             bucket = days[row["local_date"]]
@@ -355,6 +421,8 @@ def daily_nutrition(conn: sqlite3.Connection, start_date: str, end_date: str) ->
                 "total_kcal": d["total_kcal"],
                 "active_kcal": d["active_kcal"],
                 "balance_kcal": balance,
+                # Today's totals are still growing (the watch's total covers the day so far).
+                "partial": day_iso >= date.today().isoformat(),
             }
         )
     return out
@@ -378,6 +446,7 @@ def workout_fueling(conn: sqlite3.Connection, source: str, source_id: str) -> di
         (source, source_id),
     ).fetchone()
     row = {**activity, **(dict(metrics) if metrics else {}), "sport": queries.sport_family(activity["activity_type"])}
+    row["calories"] = _best_calories(same_workout(conn, source, source_id))
     entries = list_entries(conn, activity=(source, source_id))
     during = [e for e in entries if e["meal"] == DURING]
     totals = _sum(during)

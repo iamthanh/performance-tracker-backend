@@ -10,14 +10,15 @@ Protections against other web pages in the browser:
   page cannot reach the API through DNS rebinding. Allowed: loopback names; in
   LAN mode also private/link-local IP addresses, this machine's host name
   (bare and ``.local``) and ``API_ALLOWED_HOSTS``.
-- Writes (POST/DELETE) carrying an ``Origin`` header must come from an origin
+- Writes (POST/PUT/DELETE) carrying an ``Origin`` header must come from an origin
   whose host is allowed as above, or one in ``API_CORS_ORIGINS`` (403); CORS
   lets only ``API_CORS_ORIGINS`` read responses cross-origin; and JSON bodies
   need ``Content-Type: application/json``, which a cross-site form or simple
   request cannot send.
 
 Every read opens its own read-only connection (``mode=ro`` + ``query_only``);
-the only writes are threshold overrides, which re-score the affected activities.
+writes are threshold overrides, which re-score the affected activities, and nutrition
+(saved foods and logged entries).
 
 Dates are ``YYYY-MM-DD`` on the athlete's local clock; units are those of the
 database (metres, seconds, watts, bpm) unless a field name says otherwise.
@@ -36,9 +37,10 @@ from typing import Annotated, Any, Literal, get_args
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__, nutrition, queries
 from .analysis import analyze, thresholds_on
@@ -70,6 +72,9 @@ Amount = Annotated[float | None, Field(ge=0)]
 
 class Nutrients(BaseModel):
     """Amounts; None = unknown. Per serving for a food, totals for an entry."""
+
+    # Strict: true is not 1 (a food id or an amount), and text is not a number.
+    model_config = ConfigDict(strict=True)
 
     kcal: Amount = None
     carbs_g: Amount = None
@@ -224,7 +229,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="fitness-hub",
         version=__version__,
-        description="Read API over the local fitness-hub database, for the performance-tracker UI.",
+        description="API over the local fitness-hub database, for the performance-tracker UI.",
     )
     app.state.settings = settings
     allowed_origins = {o.rstrip("/") for o in settings.api_cors_origins}
@@ -265,6 +270,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["Content-Type"],
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # Without the offending input: NaN or a huge body would not serialise, or would echo back.
+        detail = [{"loc": list(e.get("loc", ())), "msg": e.get("msg", ""), "type": e.get("type", "")} for e in exc.errors()]
+        return JSONResponse(status_code=422, content={"detail": detail})
 
     @app.exception_handler(InputError)
     async def bad_request(request: Request, exc: InputError) -> JSONResponse:

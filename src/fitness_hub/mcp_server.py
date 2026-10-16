@@ -58,6 +58,10 @@ updated_at), athlete_settings(metric, effective_date, origin, value, note, updat
 max_hr or resting_hr), activity_streams(source, \
 source_id, channels, sample_count, encoding, data, meta, updated_at) and daily_series(source, date, series, channels, \
 sample_count, encoding, data, updated_at; all-day heart rate); their `data` is a compressed blob, not queryable. \
+foods(id, name, brand, serving, nutrients per serving: kcal, carbs_g, sugars_g, protein_g, fat_g, fiber_g, \
+sodium_mg, potassium_mg, caffeine_mg, fluid_ml; note, archived) and nutrition_entries(id, source, source_id, \
+local_date, consumed_at, meal, activity_source, activity_source_id, offset_s, food_id, name, servings, the same \
+nutrients as totals for the entry, note) hold what the user logged eating and drinking. \
 activity_metrics, power_curve and athlete_settings are filled by the training analysis and may be empty. \
 `raw` holds the provider JSON (use json_extract). \
 query_sql does NOT de-duplicate activities.

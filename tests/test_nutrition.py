@@ -205,3 +205,107 @@ def test_api_nutrition_writes_from_other_origins_are_refused(client: TestClient)
     assert client.put("/api/nutrition/foods/1", json=GEL, headers=evil).status_code == 403
     assert client.delete("/api/nutrition/entries/1", headers=evil).status_code == 403
     assert client.get("/api/nutrition/foods").json() == []
+
+
+# -- review follow-ups ---------------------------------------------------------------------------
+
+
+def test_editing_an_entry_never_rederives_it_from_the_food(store: Store) -> None:
+    gel = nutrition.save_food(store.conn, GEL)
+    assert gel
+    entry = nutrition.save_entry(store.conn, {"local_date": "2026-10-12", "meal": "snack", "food_id": gel["id"]})
+    assert entry and entry["kcal"] == 100
+    nutrition.save_food(store.conn, {**GEL, "kcal": 300}, gel["id"])
+    base = {"local_date": "2026-10-12", "meal": "snack", "food_id": gel["id"]}
+    noted = nutrition.save_entry(store.conn, {**base, "note": "warm day"}, entry["id"])
+    assert noted and noted["kcal"] == 100 and noted["note"] == "warm day"  # the food's new 300 is not used
+    doubled = nutrition.save_entry(store.conn, {**base, "servings": 2}, entry["id"])
+    assert doubled and doubled["kcal"] == 200 and doubled["carbs_g"] == 50  # scaled from the stored totals
+    cleared = nutrition.save_entry(store.conn, {**base, "servings": 2, "sodium_mg": None}, entry["id"])
+    assert cleared and cleared["sodium_mg"] is None and cleared["kcal"] == 200  # an explicit null clears
+    mix = nutrition.save_food(store.conn, MIX)
+    assert mix
+    moved = nutrition.save_entry(store.conn, {**base, "food_id": mix["id"], "servings": 1}, entry["id"])
+    assert moved and moved["kcal"] == 240 and moved["fluid_ml"] == 750  # another food: refilled from it
+    assert nutrition.save_entry(store.conn, base, 999) is None
+
+
+def test_editing_keeps_where_an_entry_came_from(store: Store) -> None:
+    imported = nutrition.save_entry(store.conn, {"local_date": "2026-10-12", "meal": "lunch", "name": "Salad",
+                                                 "kcal": 400, "source": "cronometer", "source_id": "abc"})  # fmt: skip
+    assert imported
+    edited = nutrition.save_entry(store.conn, {"local_date": "2026-10-12", "meal": "dinner"}, imported["id"])
+    assert edited and (edited["source"], edited["source_id"]) == ("cronometer", "abc")
+    assert edited["name"] == "Salad" and edited["kcal"] == 400 and edited["meal"] == "dinner"
+
+
+def test_fueling_and_calories_follow_the_workout_across_services(store: Store) -> None:
+    """The same ride from Strava (analysed, shown) and Garmin (calories): entries linked to either copy
+    count, and the Garmin copy's calories are used."""
+    ride(store, "s1")
+    store.upsert_activities([{"source": "garmin", "source_id": "g1", "start_time": "2026-10-12T16:00:40Z",
+                              "local_date": "2026-10-12", "activity_type": "cycling", "calories": 1500.0,
+                              "raw": {}}])  # fmt: skip
+    analyze(store)
+    nutrition.save_entry(store.conn, {"local_date": "2026-10-12", "meal": "during_workout", "name": "Bar",
+                                      "carbs_g": 40, "activity_source": "garmin", "activity_source_id": "g1"})  # fmt: skip
+    fueling = nutrition.workout_fueling(store.conn, "strava", "s1")
+    assert fueling and fueling["during"]["carbs_g"] == 40 and fueling["burned_kcal"] == 1500
+    day = nutrition.daily_nutrition(store.conn, "2026-10-12", "2026-10-12")[0]
+    assert day["workout_kcal"] == 1500  # the Garmin copy's calories, not the Strava copy's 1440 kJ
+    assert day["partial"] is False
+
+
+def test_api_rejects_nan_and_booleans_cleanly(client: TestClient) -> None:
+    nan = client.post("/api/nutrition/foods", content='{"name": "x", "kcal": NaN}',
+                      headers={"Content-Type": "application/json"})  # fmt: skip
+    assert nan.status_code == 422 and nan.json()["detail"][0]["loc"][-1] == "kcal"
+    assert client.post("/api/nutrition/foods", json={"name": "x", "kcal": True}).status_code == 422
+    entry = {"local_date": "2026-10-12", "meal": "snack", "name": "x"}
+    assert client.post("/api/nutrition/entries", json={**entry, "food_id": True}).status_code == 422
+    assert client.post("/api/nutrition/entries", json={**entry, "kcal": 12}).status_code == 201  # ints are numbers
+
+
+def test_archived_foods_are_hidden_unless_asked(store: Store) -> None:
+    kept = nutrition.save_food(store.conn, GEL)
+    gone = nutrition.save_food(store.conn, {**MIX, "archived": True})
+    assert kept and gone
+    assert [f["id"] for f in nutrition.list_foods(store.conn)] == [kept["id"]]
+    assert {f["id"] for f in nutrition.list_foods(store.conn, include_archived=True)} == {kept["id"], gone["id"]}
+
+
+def test_a_v3_database_with_data_migrates_to_v4(tmp_path) -> None:
+    import sqlite3
+
+    from fitness_hub.db import MIGRATIONS, SCHEMA
+
+    path = tmp_path / "fitness.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA)
+    for version in (2, 3):
+        for statement in MIGRATIONS[version]:
+            conn.execute(statement)
+    conn.execute("PRAGMA user_version = 3")
+    conn.execute("INSERT INTO activities (source, source_id, start_time, local_date, activity_type, raw, updated_at) "
+                 "VALUES ('strava', '1', '2026-10-12T16:00:00Z', '2026-10-12', 'Ride', '{}', '2026-10-12T18:00:00Z')")  # fmt: skip
+    conn.commit()
+    conn.close()
+    with Store(path) as migrated:
+        assert schema_version(migrated.conn) == 4 and migrated.row_counts()["activities"] == 1
+        assert nutrition.save_entry(migrated.conn, {"local_date": "2026-10-12", "meal": "during_workout",
+                                                    "name": "Gel", "activity_source": "strava",
+                                                    "activity_source_id": "1"})  # fmt: skip
+
+
+def test_mcp_nutrition_tools(settings: Settings) -> None:
+    from tests.test_mcp_server import call
+
+    with Store(settings.db_path) as s:
+        ride(s)
+        analyze(s)
+        nutrition.save_entry(s.conn, {"local_date": "2026-10-12", "meal": "during_workout", "name": "Gel",
+                                      "carbs_g": 25, "activity_source": "strava", "activity_source_id": "1"})  # fmt: skip
+    error, days = call(settings, "nutrition_daily", {"start_date": "2026-10-12", "end_date": "2026-10-12"})
+    assert not error and days["days"][0]["intake"]["carbs_g"] == 25  # type: ignore[index]
+    error, fueling = call(settings, "workout_fueling", {"source": "strava", "source_id": "1"})
+    assert not error and fueling["during"]["carbs_g"] == 25  # type: ignore[index]

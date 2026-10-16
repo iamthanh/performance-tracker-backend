@@ -158,11 +158,16 @@ saved foods (`foods`) make it one tap. There is no importer yet.
   changes your history. Logging from a saved food fills in its nutrients × servings; anything you type in wins.
 - **Workout fueling** is an entry with meal `during_workout` linked to the workout, optionally with the time into it.
   For each workout: carbs (g/h), fluid (ml/h), sodium (mg/h) and caffeine taken during it, per hour of moving time.
-- **Energy out.** A workout's kcal is its recorded calories, else its work in kJ (for cycling, kJ of work ≈ kcal
-  burned). A day's total is your watch's total calories (Garmin), once synced; until then only workout kcal is known.
+- **Energy out.** A workout's kcal is its recorded calories (from whichever service recorded them), else its work in
+  kJ (for cycling, kJ of work ≈ kcal burned). A day's total is your watch's total calories (Garmin, else Google
+  Health), once synced; until then only workout kcal is known. Today's totals are flagged `partial`.
 - **Carbohydrate burned** is a rough estimate from the workout's intensity factor: about a third of the energy at a
-  recovery pace, two thirds at IF 0.75, nearly all near threshold. It is for comparing with what you ate, not a
+  recovery pace, two thirds at IF 0.75, nearly all near threshold (the crossover concept, for a rider who has eaten;
+  fasted riders burn more fat). It errs high, toward eating more, and is for comparing with what you ate, not a
   measurement.
+- **Editing an entry** keeps its nutrients unless you send new ones; changing the servings of a saved-food entry
+  scales them, and pointing it at another food refills them from that food. An entry linked to a workout counts for
+  that workout whichever service's copy of it you linked.
 
 ### Strava API (needs a Strava subscription)
 
@@ -355,7 +360,8 @@ thresholds, so use it only on a network you trust. In LAN mode:
 - If a firewall is on, allow port 8801 from your network only (for example
   `sudo ufw allow from 192.168.1.0/24 to any port 8801 proto tcp`).
 
-Reads use read-only connections. The only writes are threshold overrides, which re-score the affected activities.
+Reads use read-only connections. Writes are threshold overrides, which re-score the affected activities, and nutrition
+(saved foods and logged entries).
 
 | Endpoint | Returns |
 |---|---|
