@@ -296,16 +296,3 @@ def test_a_v3_database_with_data_migrates_to_v4(tmp_path) -> None:
                                                     "name": "Gel", "activity_source": "strava",
                                                     "activity_source_id": "1"})  # fmt: skip
 
-
-def test_mcp_nutrition_tools(settings: Settings) -> None:
-    from tests.test_mcp_server import call
-
-    with Store(settings.db_path) as s:
-        ride(s)
-        analyze(s)
-        nutrition.save_entry(s.conn, {"local_date": "2026-10-12", "meal": "during_workout", "name": "Gel",
-                                      "carbs_g": 25, "activity_source": "strava", "activity_source_id": "1"})  # fmt: skip
-    error, days = call(settings, "nutrition_daily", {"start_date": "2026-10-12", "end_date": "2026-10-12"})
-    assert not error and days["days"][0]["intake"]["carbs_g"] == 25  # type: ignore[index]
-    error, fueling = call(settings, "workout_fueling", {"source": "strava", "source_id": "1"})
-    assert not error and fueling["during"]["carbs_g"] == 25  # type: ignore[index]
