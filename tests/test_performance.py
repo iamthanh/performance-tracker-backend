@@ -39,7 +39,7 @@ def add_ride(store: Store, source_id: str, day: str, c: dict[int, float], fatigu
 
 
 def day(offset: int) -> str:
-    return (date(2026, 1, 1) + timedelta(days=offset)).isoformat()
+    return (date(2020, 1, 1) + timedelta(days=offset)).isoformat()  # in the past: the index ends today
 
 
 @pytest.fixture
@@ -119,6 +119,41 @@ def test_the_first_window_is_not_reported(store: Store) -> None:
     add_ride(store, "1", day(0), curve())
     days = P.performance(store.conn, end_date=day(100))["days"]
     assert days[0]["date"] == day(89) and days[-1]["date"] == day(100)
+
+
+def test_no_rises_without_a_new_best_even_with_fast_easing(store: Store) -> None:
+    for i in range(0, 120, 3):
+        add_ride(store, str(i), day(i), curve())  # the same efforts over and over
+    events = P.raw_timeline(store.conn, 0.05, end=day(120))["events"]
+    assert [e for e in events if e["date"] > day(0)] == []
+
+
+def test_a_days_score_does_not_depend_on_the_range(store: Store) -> None:
+    for i in range(0, 700, 6):
+        add_ride(store, str(i), day(i), curve(1 + (i % 60) / 300))
+    short = P.performance(store.conn, start_date=day(200), end_date=day(200))["days"][0]
+    full = next(d for d in P.performance(store.conn)["days"] if d["date"] == day(200))
+    assert short == full
+
+
+def test_an_easy_ride_after_a_layoff_is_not_a_test(store: Store) -> None:
+    add_ride(store, "best", day(0), curve())
+    add_ride(store, "easy", day(150), curve(0.7))  # 70 % of the (slowly easing) value
+    last = P.raw_timeline(store.conn, 0.005, end=day(150))["days"][-1]
+    assert last["values"]["vo2max"] > 0.9 * 300 and last["tested"]["vo2max"] is None
+
+
+def test_range_checks_and_warm_up_events(store: Store) -> None:
+    add_ride(store, "1", day(0), curve())
+    add_ride(store, "2", day(40), curve(1.1))  # a rise while the first window fills
+    result = P.performance(store.conn)
+    assert result["starts"] == day(89) and result["first_ride"] == day(0)
+    assert result["events"] == []  # before the index starts
+    assert result["days"][-1]["date"] == date.today().isoformat()
+    future = P.performance(store.conn, end_date="2999-01-01")["days"]
+    assert future[-1]["date"] == date.today().isoformat()  # never past today
+    with pytest.raises(InputError):
+        P.performance(store.conn, start_date=day(100), end_date=day(99))
 
 
 def test_runs_do_not_count(store: Store) -> None:

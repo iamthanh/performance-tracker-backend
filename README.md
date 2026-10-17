@@ -187,9 +187,11 @@ CTL is how much you have trained; the performance index is what you can produce,
 sprint (best 5 s), anaerobic (1 min), VO2max (5 min), threshold (the FTP estimate of the window's curve),
 endurance (60 min) and durability (best 5 and 20 min after 1000 kJ of work, as a share of fresh).
 
-- A component rises only with a new best in the window and otherwise falls by at most 0.5 % a week (set in the
-  UI's Settings). `fitness-hub performance --backtest` compares decay rates by how well each predicts your best
-  efforts of the following 28 days; 0.5 % had the lowest error and least bias on the author's history.
+- A component rises only with a new best in the window and otherwise falls by at most 1 % a week (as the auto FTP;
+  set in the UI's Settings). `fitness-hub performance --backtest` compares decay rates by how well each predicts
+  the efforts of the following 28 days: on the author's history the error fell from 14 % without easing to 7 % at
+  1 % a week, with little gain beyond. The test favours fast easing (the next weeks rarely hold all-out efforts),
+  so treat it as a guide.
 - Each component is an index, 100 = its average over the first year of data (after the first full window); each
   day also says when it was last tested (a ride within 97 % of the window's best).
 - The score is their weighted geometric mean (default: threshold 30, durability 20, VO2max 15, endurance 15,

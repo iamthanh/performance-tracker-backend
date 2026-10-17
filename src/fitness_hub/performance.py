@@ -42,7 +42,7 @@ from typing import Any
 import numpy as np
 
 from .analysis import FTP_CURVE_DURATIONS, estimate_ftp
-from .queries import sport_family
+from .queries import dedupe_activities, sport_family
 from .util import InputError, now_utc_iso
 
 COMPONENTS = ("sprint", "anaerobic", "vo2max", "threshold", "endurance", "durability")
@@ -83,7 +83,10 @@ PRESETS = {
     },
 }
 WINDOW_DAYS = 90
-DEFAULT_DECAY_PER_WEEK = 0.005  # from `fitness-hub performance --backtest`: lowest error, least bias
+# As the auto FTP. `fitness-hub performance --backtest` on the author's history: error fell from 14 % (no easing) to
+# 7.2 % at 1 % a week, with little gain beyond (6.7 % at 3 %); faster easing is also favoured by the test itself, as
+# the following weeks rarely hold all-out efforts.
+DEFAULT_DECAY_PER_WEEK = 0.01
 BASELINE_DAYS = 365
 TESTED_SHARE = 0.97
 RISE_SHARE = 0.005  # a rise of at least this much is listed as what changed the score
@@ -142,6 +145,7 @@ class _Rides:
     refs: list[dict[str, Any]]  # {source, source_id, name} per ride
     curve: np.ndarray  # rides x _CURVE_DURATIONS, NaN where missing
     fatigued: np.ndarray  # rides x DURABILITY_DURATIONS_S, after DURABILITY_AFTER_KJ
+    ftp: np.ndarray  # each ride's own FTP estimate (NaN without one)
 
 
 def _rides(conn: sqlite3.Connection) -> _Rides:
@@ -183,7 +187,10 @@ def _rides(conn: sqlite3.Connection) -> _Rides:
         for j, d in enumerate(DURABILITY_DURATIONS_S):
             if d in ride["fatigued"]:
                 fatigued[i, j] = ride["fatigued"][d]
-    return _Rides([r["date"] for r in ordered], [r["ref"] for r in ordered], curve, fatigued)
+    ftp = np.array(
+        [estimate_ftp({d: w for d, w in r["curve"].items() if d in FTP_CURVE_DURATIONS}) or np.nan for r in ordered]
+    )
+    return _Rides([r["date"] for r in ordered], [r["ref"] for r in ordered], curve, fatigued, ftp)
 
 
 def _col(duration_s: int) -> int:
@@ -212,20 +219,23 @@ def _window_measures(rides: _Rides, lo: int, hi: int) -> dict[str, float | None]
     return out
 
 
-def _last_tested(rides: _Rides, lo: int, hi: int, component: str) -> str | None:
-    """The date of the latest ride in the window within ``TESTED_SHARE`` of the window's best at the
-    component's key measure."""
-    if hi <= lo:
+def _last_tested(rides: _Rides, lo: int, hi: int, component: str, value: float | None) -> str | None:
+    """The date of the latest ride in the window within ``TESTED_SHARE`` of the component's value
+    that day (so an easy ride after a layoff does not count as a test of an older, higher best):
+    its own FTP estimate for the threshold, its share of the window's fresh power for durability."""
+    if hi <= lo or not value:
         return None
-    if component == "durability":
-        column = rides.fatigued[lo:hi, 0]
+    if component == "threshold":
+        column = rides.ftp[lo:hi]
+    elif component == "durability":
+        fresh = _max(rides.curve[lo:hi, _col(DURABILITY_DURATIONS_S[0])])
+        if not fresh:
+            return None
+        column = rides.fatigued[lo:hi, 0] / fresh
     else:
         column = rides.curve[lo:hi, _col(KEY_DURATION_S[component])]
-    best = _max(column)
-    if not best:
-        return None
     with np.errstate(invalid="ignore"):
-        near = np.flatnonzero(column >= TESTED_SHARE * best)
+        near = np.flatnonzero(column >= TESTED_SHARE * value)
     return rides.dates[lo + int(near[-1])] if near.size else None
 
 
@@ -244,13 +254,15 @@ def _best_ride(rides: _Rides, lo: int, hi: int, component: str) -> dict[str, Any
 def _efficiency(conn: sqlite3.Connection) -> list[tuple[str, float]]:
     rows = conn.execute(
         """
-        SELECT a.local_date, a.activity_type, m.efficiency_factor
+        SELECT a.source, a.source_id, a.start_time, a.local_date, a.activity_type, m.efficiency_factor
         FROM activity_metrics m JOIN activities a USING (source, source_id)
         WHERE m.efficiency_factor IS NOT NULL AND m.timer_s >= ? AND m.variability_index <= ?
         """,
         (EF_MIN_S, EF_MAX_VI),
     ).fetchall()
-    return sorted((r[0], r[2]) for r in rows if sport_family(r[1]) == "cycling")
+    rides = [dict(r) for r in rows if sport_family(r["activity_type"]) == "cycling"]
+    # The same ride stored from two services counts once.
+    return sorted((r["local_date"], r["efficiency_factor"]) for r in dedupe_activities(rides))
 
 
 # -- the timeline -----------------------------------------------------------------------------------
@@ -276,18 +288,19 @@ def raw_timeline(conn: sqlite3.Connection, decay_per_week: float, end: str | Non
         lo, hi = bisect_left(rides.dates, start), bisect_right(rides.dates, day)
         today = bisect_left(rides.dates, day)
         measures = _window_measures(rides, lo, hi)
-        row: dict[str, Any] = {"date": day, "values": {}, "tested": {}}
+        row: dict[str, Any] = {"date": day, "values": {}, "tested": {}, "measured": measures}
         for c in COMPONENTS:
             previous = values[c]
             decayed = previous * daily if previous is not None else None
             measured = measures[c]
             value = max(v for v in (measured, decayed) if v is not None) if measured or decayed else None
-            if previous and value and measured and measured > decayed * (1 + RISE_SHARE) and today < hi:
+            # A rise is a new best above yesterday's value (not just above where it would have eased to).
+            if previous and value and measured and measured > previous * (1 + RISE_SHARE) and today < hi:
                 ride = _best_ride(rides, today, hi, c)
                 events.append({"date": day, "component": c, "from": previous, "to": value, "ride": ride})
             values[c] = value
             row["values"][c] = value
-            row["tested"][c] = _last_tested(rides, lo, hi, c)
+            row["tested"][c] = _last_tested(rides, lo, hi, c, value)
         out_days.append(row)
     return {"days": out_days, "events": events}
 
@@ -296,7 +309,7 @@ def _baselines(days: list[dict[str, Any]]) -> dict[str, float | None]:
     out: dict[str, float | None] = {}
     for c in COMPONENTS:
         # From a full window on: the first WINDOW_DAYS only see part of it and read low.
-        seen = [d["values"][c] for d in days[WINDOW_DAYS:] if d["values"][c] is not None][:BASELINE_DAYS]
+        seen = [d["values"][c] for d in days[WINDOW_DAYS - 1 :] if d["values"][c] is not None][:BASELINE_DAYS]
         out[c] = float(np.mean(seen)) if seen else None
     return out
 
@@ -316,17 +329,25 @@ def score(indexes: Mapping[str, float | None], weights: Mapping[str, float]) -> 
 def performance(
     conn: sqlite3.Connection, start_date: str | None = None, end_date: str | None = None
 ) -> dict[str, Any]:
-    """The performance index from ``start_date`` to ``end_date`` (default: everything to today)."""
+    """The performance index from ``start_date`` to ``end_date`` (default: everything to today; the
+    end is at most today). The timeline always runs to today, so a day's score does not depend on
+    the range asked for."""
+    today = date.today().isoformat()
+    end = min(end_date or today, today)
+    if start_date and start_date > end:
+        raise InputError(f"start_date {start_date} is after end_date {end}")
     settings = get_settings(conn)
     weights = settings["weights"]
-    raw = raw_timeline(conn, settings["decay_per_week"], end_date)
+    raw = raw_timeline(conn, settings["decay_per_week"])
     baselines = _baselines(raw["days"])
+    reported = raw["days"][WINDOW_DAYS - 1 :]
+    first_reported = reported[0]["date"] if reported else None
     efficiency = _efficiency(conn)
     ef_dates = [d for d, _ in efficiency]
     days = []
     # The first window is not full yet: every component reads low, so those days are left out.
-    for d in raw["days"][WINDOW_DAYS - 1 :]:
-        if start_date and d["date"] < start_date:
+    for d in reported:
+        if (start_date and d["date"] < start_date) or d["date"] > end:
             continue
         indexes = {
             c: (100 * d["values"][c] / baselines[c]) if d["values"][c] is not None and baselines[c] else None
@@ -355,7 +376,7 @@ def performance(
         {**e, "from": round(e["from"], 3), "to": round(e["to"], 3),
          "index_change": round(100 * (e["to"] - e["from"]) / baselines[e["component"]], 1)}
         for e in raw["events"]
-        if (not start_date or e["date"] >= start_date) and baselines[e["component"]]
+        if first_reported and max(start_date or "", first_reported) <= e["date"] <= end and baselines[e["component"]]
     ]  # fmt: skip
     return {
         "weights": weights,
@@ -368,6 +389,12 @@ def performance(
              "baseline": None if baselines[c] is None else round(baselines[c], 3)}
             for c in COMPONENTS
         ],  # fmt: skip
+        "first_ride": raw["days"][0]["date"] if raw["days"] else None,
+        # The first day with a full window: the index starts here.
+        "starts": first_reported or (
+            (date.fromisoformat(raw["days"][0]["date"]) + timedelta(days=WINDOW_DAYS - 1)).isoformat()
+            if raw["days"] else None
+        ),
         "days": days,
         "events": events,
     }
@@ -376,37 +403,31 @@ def performance(
 # -- calibration ------------------------------------------------------------------------------------
 
 
-def _ride_ftp(rides: _Rides, i: int) -> float:
-    curve = {d: float(rides.curve[i, _col(d)]) for d in FTP_CURVE_DURATIONS if np.isfinite(rides.curve[i, _col(d)])}
-    return estimate_ftp(curve) or 0.0
-
-
 def backtest(
     conn: sqlite3.Connection, decays: tuple[float, ...] = (0.0, 0.005, 0.01, 0.02, 0.03), horizon_days: int = 28
 ) -> list[dict[str, Any]]:
-    """How well each decay rate predicts what the rider does next: for every day and component
-    (but durability), the value against the best key effort of the following ``horizon_days``.
-    Only days that hold a hard effort count (at least 90 % of the highest value of any decay), the
-    same days for every decay. ``mae_pct``: mean absolute error; ``bias_pct``: mean signed error
+    """How well each decay rate predicts what the rider does next: for every reported day and
+    component (but durability), the value against the same measure over the rides of the following
+    ``horizon_days`` (for the threshold, the FTP estimate of their combined curve, as the value is).
+    Only days whose next rides hold a hard effort count: at least 90 % of the window's measured best
+    that day, which does not depend on the decay, so every decay is judged on the same days and
+    detraining days count too. ``mae_pct``: mean absolute error; ``bias_pct``: mean signed error
     (negative: the value runs above what the rider then does); ``under_pct``: share of efforts over
     3 % above the value (capacity underestimated)."""
     rides = _rides(conn)
     timelines = [raw_timeline(conn, decay)["days"] for decay in decays]
     errors: list[list[float]] = [[] for _ in decays]
-    for t, day in enumerate(timelines[0]):
+    for t in range(WINDOW_DAYS - 1, len(timelines[0])):
+        day = timelines[0][t]
         lo = bisect_right(rides.dates, day["date"])
         hi = bisect_right(rides.dates, (date.fromisoformat(day["date"]) + timedelta(days=horizon_days)).isoformat())
         if hi <= lo:
             continue
-        for c, duration in KEY_DURATION_S.items():
+        ahead = _window_measures(rides, lo, hi)
+        for c in KEY_DURATION_S:
+            measured, actual = day["measured"][c], ahead[c]
             predictions = [timeline[t]["values"][c] for timeline in timelines]
-            if any(p is None for p in predictions):
-                continue
-            if c == "threshold":
-                actual = max(_ride_ftp(rides, i) for i in range(lo, hi))
-            else:
-                actual = _max(rides.curve[lo:hi, _col(duration)]) or 0.0
-            if actual < 0.9 * max(predictions):
+            if not measured or not actual or any(p is None for p in predictions) or actual < 0.9 * measured:
                 continue  # nothing hard enough to say what the rider could do
             for k, predicted in enumerate(predictions):
                 errors[k].append((actual - predicted) / predicted)

@@ -23,6 +23,7 @@ from . import nutrition, performance, queries
 from .config import Settings
 from .db import BODY_METRICS, DAILY_METRICS, SOURCES, open_readonly
 from .sync import PROVIDER_NAMES, run_sync
+from .util import parse_date
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -244,7 +245,8 @@ def create_server(
         100 = their baseline, from six components (sprint 5 s, anaerobic 1 min, VO2max 5 min, threshold,
         endurance 60 min, durability = power kept after 1000 kJ), each an index with the date it was last
         tested near-maximally; plus aerobic efficiency (EF of steady rides) and the rides that raised it."""
-        start = start_date or (date.today() - timedelta(days=89)).isoformat()
+        end = parse_date(end_date, "end_date") if end_date else date.today()
+        start = start_date or (end - timedelta(days=89)).isoformat()
         return _dump(await read(lambda c: performance.performance(c, start, end_date)))
 
     @mcp.tool(annotations=READ_ONLY, structured_output=False)
