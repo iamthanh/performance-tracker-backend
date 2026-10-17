@@ -177,17 +177,18 @@ def test_power_is_per_kg_of_each_rides_weight(store: Store) -> None:
     light_kg = rise["ride"]["kg"]  # the trend weight of that day: on its way from 80 to 70 kg
     assert 70 < light_kg < 80 and rise["ride"]["watts"] == pytest.approx(294)
     assert days[day(10)]["values"]["vo2max"] == pytest.approx(294 / light_kg, abs=0.001)
-    weight = 80 / light_kg  # against the heavy ride the previous value rested on
-    assert rise["split"]["weight_pct"] == pytest.approx(100 * (weight - 1), abs=0.05)
-    change = rise["to"] / rise["from"]  # power x weight = the W/kg change (power includes 10 days of easing)
-    assert (1 + rise["split"]["power_pct"] / 100) * weight == pytest.approx(change, abs=0.002)
+    # Against the heavy ride the previous value rested on: the weight change (lighter: < 0) ...
+    assert rise["split"]["weight_pct"] == pytest.approx(100 * (light_kg / 80 - 1), abs=0.05)
+    # ... and the power change, which with it gives the W/kg change (power includes 10 days of easing).
+    power, weight = 1 + rise["split"]["power_pct"] / 100, 1 + rise["split"]["weight_pct"] / 100
+    assert power / weight == pytest.approx(rise["to"] / rise["from"], abs=0.002)
     # Durability is a ratio of watts: weight cancels.
     assert days[day(10)]["values"]["durability"] is None or days[day(10)]["values"]["durability"] <= 1
 
 
-def test_rides_without_a_weight_do_not_count_and_estimated_weights_are_flagged(store: Store) -> None:
+def test_rides_without_a_weigh_in_near_them_count_as_estimated(store: Store) -> None:
     add_ride(store, "unweighed", day(0), curve(), kg=None)
-    assert all(d["values"]["vo2max"] is None for d in P.raw_timeline(store.conn, 0.01, end=day(5))["days"])
+    assert all(d["values"]["vo2max"] is None for d in P.raw_timeline(store.conn, 0.01, end=day(5))["days"])  # none
     weigh(store, day(10), 75.0)
     add_ride(store, "guess", day(60), curve(1.1), kg=None)  # inside a 100-day gap: an estimated weight
     weigh(store, day(110), 75.0)
@@ -195,6 +196,23 @@ def test_rides_without_a_weight_do_not_count_and_estimated_weights_are_flagged(s
     flagged = {d["date"]: d["components"]["vo2max"]["estimated_weight"] for d in result["days"]}
     assert flagged[day(100)] is True  # the window's best rests on the estimated-weight ride
     assert flagged[day(150)] is True  # still the value in effect, eased
+    # A ride long after the last weigh-in still counts, at the last trend weight, flagged as a guess.
+    add_ride(store, "late", day(200), curve(1.3), kg=None)
+    late = next(d for d in P.performance(store.conn, end_date=day(200))["days"] if d["date"] == day(200))
+    assert late["components"]["vo2max"]["value"] == pytest.approx(300 * 1.3 / 75, abs=0.001)
+    assert late["components"]["vo2max"]["estimated_weight"] is True
+
+
+def test_a_pre_ride_weight_on_one_copy_applies_to_every_copy(store: Store) -> None:
+    from fitness_hub import nutrition
+
+    add_ride(store, "strava-copy", day(0), curve(), kg=70.0)
+    store.upsert_activities([{"source": "upload", "source_id": "u1", "start_time": day(0) + "T08:00:30Z",
+                              "local_date": day(0), "activity_type": "Ride", "name": "Ride", "raw": {}}])  # fmt: skip
+    store.replace_power_curve("upload", "u1", curve())
+    nutrition.set_workout_weight(store.conn, "upload", "u1", 76.0, None)
+    first = P.raw_timeline(store.conn, 0.01, end=day(0))["days"][0]
+    assert first["values"]["vo2max"] == pytest.approx(300 / 76)  # not the lighter trend weight of the other copy
 
 
 def test_runs_do_not_count(store: Store) -> None:

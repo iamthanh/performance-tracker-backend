@@ -12,7 +12,7 @@ rates higher. Rides without a weight do not count for them.
 - anaerobic: best 1 min;
 - vo2max: best 5 min;
 - threshold: the FTP estimate of the window's W/kg curve (``analysis.estimate_ftp``: critical
-  power of the best 3-30 min efforts, at least the best hour; fitted as a ``REF_KG`` rider);
+  power of the best 3-30 min efforts, at least the best hour; fitted at the window's median weight);
 - endurance: best 60 min;
 - durability: the best 5 and 20 min started after ``DURABILITY_AFTER_KJ`` of work in a ride, as
   a share of the best 5 and 20 min fresh (averaged over the two): a ratio of watts, which weight
@@ -50,6 +50,7 @@ import numpy as np
 
 from .analysis import FTP_CURVE_DURATIONS, estimate_ftp
 from .bodyweight import daily_weigh_ins, trend
+from .nutrition import same_workout
 from .queries import dedupe_activities, sport_family
 from .util import InputError, now_utc_iso
 
@@ -91,10 +92,9 @@ PRESETS = {
     },
 }
 WINDOW_DAYS = 90
-REF_KG = 70.0  # the FTP fit runs on a rider of this weight (its W' sanity range is in joules)
 GUESSED_WEIGHTS = ("estimated",)  # weight kinds flagged on a component that rests on them
-# As the auto FTP. `fitness-hub performance --backtest` on the author's history: error fell from 14 % (no easing) to
-# 7.2 % at 1 % a week, with little gain beyond (6.7 % at 3 %); faster easing is also favoured by the test itself, as
+# As the auto FTP. `fitness-hub performance --backtest` on the author's history (W/kg): error fell from 14 % (no easing)
+# to 7.4 % at 1 % a week, with little gain beyond (6.7 % at 3 %); faster easing is also favoured by the test itself, as
 # the following weeks rarely hold all-out efforts.
 DEFAULT_DECAY_PER_WEEK = 0.01
 BASELINE_DAYS = 365
@@ -203,25 +203,34 @@ def _rides(conn: sqlite3.Connection) -> _Rides:
     ftp = np.array(
         [estimate_ftp({d: w for d, w in r["curve"].items() if d in FTP_CURVE_DURATIONS}) or np.nan for r in ordered]
     )
-    # Each ride's weight: the one saved before it, else the trend weight of its day (bodyweight).
-    by_day = {d["date"]: d for d in trend(daily_weigh_ins(conn))}
-    pre_ride = {
-        (r[0], r[1]): r[2]
-        for r in conn.execute("SELECT source, source_id, pre_kg FROM workout_weights WHERE pre_kg > 0")
-    }
+    # Each ride's weight: the one saved before it (on any copy of the workout), else the trend weight of
+    # its day (bodyweight), else the nearest trend weight, flagged "estimated" (a ride after weeks
+    # without weighing still counts, as a guess).
+    days = trend(daily_weigh_ins(conn))
+    by_day = {d["date"]: d for d in days}
+    trend_dates = [d["date"] for d in days]
+    pre_ride: dict[tuple[str, str], float] = {}
+    for source, source_id, pre_kg in conn.execute(
+        "SELECT source, source_id, pre_kg FROM workout_weights WHERE pre_kg > 0"
+    ).fetchall():
+        for copy in same_workout(conn, source, source_id) or [{"source": source, "source_id": source_id}]:
+            pre_ride[(copy["source"], copy["source_id"])] = pre_kg
     kg = np.full(len(ordered), np.nan)
     kinds: list[str | None] = []
     for i, ride in enumerate(ordered):
         saved = pre_ride.get((ride["ref"]["source"], ride["ref"]["source_id"]))
         day = by_day.get(ride["date"])
         if saved:
-            kg[i] = saved
-            kinds.append("pre_ride")
+            kg[i], kind = saved, "pre_ride"
         elif day:
-            kg[i] = day["kg"]
-            kinds.append(day["kind"])
+            kg[i], kind = day["kg"], day["kind"]
+        elif days:
+            j = bisect_right(trend_dates, ride["date"])
+            nearest = days[j - 1] if j else days[0]
+            kg[i], kind = nearest["kg"], "estimated"
         else:
-            kinds.append(None)
+            kind = None
+        kinds.append(kind)
     return _Rides(
         [r["date"] for r in ordered], [r["ref"] for r in ordered], curve, fatigued, kg, kinds,
         curve / kg[:, None], ftp / kg,
@@ -239,20 +248,27 @@ def _max(values: np.ndarray) -> float | None:
 
 def _window_measures(rides: _Rides, lo: int, hi: int) -> dict[str, float | None]:
     """Each component's raw measure over rides ``lo:hi`` (the window)."""
-    if hi <= lo:
+    return _measures_of(rides, slice(lo, hi)) if hi > lo else dict.fromkeys(COMPONENTS)
+
+
+def _measures_of(rides: _Rides, rows: slice | list[int]) -> dict[str, float | None]:
+    """Each component's raw measure over the given rides."""
+    block = rides.wkg[rows]
+    if not len(block):
         return dict.fromkeys(COMPONENTS)
-    block = rides.wkg[lo:hi]
     envelope = {d: _max(block[:, _col(d)]) for d in _CURVE_DURATIONS}
     out: dict[str, float | None] = {c: envelope[d] for c, d in KEY_DURATION_S.items() if c != "threshold"}
     # The FTP model is linear, so W/kg works as well as watts; its sanity range for W' is in joules, so
-    # the fit runs on the curve of a REF_KG rider and the result is scaled back.
-    threshold = estimate_ftp({d: w * REF_KG for d, w in envelope.items() if w and d in FTP_CURVE_DURATIONS})
-    out["threshold"] = threshold / REF_KG if threshold else None
+    # the fit runs on the curve of a rider of the window's median weight and the result is scaled back.
+    weights = rides.kg[rows][np.isfinite(rides.kg[rows])]
+    ref = float(np.median(weights)) if weights.size else 70.0
+    threshold = estimate_ftp({d: w * ref for d, w in envelope.items() if w and d in FTP_CURVE_DURATIONS})
+    out["threshold"] = threshold / ref if threshold else None
     # Durability is a ratio of the same ride's watts: weight cancels, so every ride counts.
-    watts = {d: _max(rides.curve[lo:hi, _col(d)]) for d in DURABILITY_DURATIONS_S}
+    watts = {d: _max(rides.curve[rows, _col(d)]) for d in DURABILITY_DURATIONS_S}
     shares = []
     for j, d in enumerate(DURABILITY_DURATIONS_S):
-        tired, fresh = _max(rides.fatigued[lo:hi, j]), watts[d]
+        tired, fresh = _max(rides.fatigued[rows, j]), watts[d]
         if tired and fresh:
             shares.append(min(tired / fresh, 1.0))
     out["durability"] = float(np.mean(shares)) if shares else None
@@ -280,9 +296,12 @@ def _last_tested(rides: _Rides, lo: int, hi: int, component: str, value: float |
 
 
 def _best_index(rides: _Rides, lo: int, hi: int, component: str) -> int | None:
-    """The ride among ``lo:hi`` with the highest key measure of the component (W/kg; durability: watts)."""
+    """The ride among ``lo:hi`` with the highest key measure of the component (W/kg; the threshold:
+    its own FTP per kg; durability: watts)."""
     if component == "durability":
         column = rides.fatigued[lo:hi, 0]
+    elif component == "threshold":
+        column = rides.ftp_wkg[lo:hi]  # the ride whose own efforts give the highest FTP per kg
     else:
         column = rides.wkg[lo:hi, _col(KEY_DURATION_S[component])]
     if hi <= lo or not np.isfinite(column).any():
@@ -290,25 +309,42 @@ def _best_index(rides: _Rides, lo: int, hi: int, component: str) -> int | None:
     return lo + int(np.nanargmax(column))
 
 
-def _ride(rides: _Rides, i: int, component: str) -> dict[str, Any]:
-    """A ride's reference with its weight and, for a power component, its key effort in watts."""
+def _threshold_raiser(rides: _Rides, lo: int, hi: int, today: int) -> int | None:
+    """Of the day's rides (``today:hi``), the one the window's threshold depends on most: whose removal
+    lowers it the most (a short hard effort can lift the fit as much as a long one)."""
+    full = _window_measures(rides, lo, hi)["threshold"] or 0.0
+    best, drop = None, -1.0
+    for i in range(today, hi):
+        keep = [j for j in range(lo, hi) if j != i]
+        without = _measures_of(rides, keep)["threshold"] or 0.0
+        if full - without > drop:
+            best, drop = i, full - without
+    return best
+
+
+def _ride(rides: _Rides, i: int, component: str, value: float | None = None) -> dict[str, Any]:
+    """A ride's reference with its weight and, for a power component, its key effort in watts (the
+    threshold: the new threshold ``value`` in watts at the ride's weight)."""
     out: dict[str, Any] = {**rides.refs[i], "date": rides.dates[i], "weight_kind": rides.weight_kind[i],
                            "kg": None if np.isnan(rides.kg[i]) else round(float(rides.kg[i]), 2)}  # fmt: skip
     if component != "durability":
-        watts = rides.curve[i, _col(KEY_DURATION_S[component])]
+        if component == "threshold":
+            watts = (value or np.nan) * rides.kg[i]  # the FTP it raised, at the ride's weight
+        else:
+            watts = rides.curve[i, _col(KEY_DURATION_S[component])]
         out["watts"] = None if np.isnan(watts) else round(float(watts), 1)
     return out
 
 
 def _split(change: float, kg: float | None, before_kg: float | None) -> dict[str, float] | None:
-    """How much of a W/kg rise (``change``: new / previous value) came from weight and how much from
-    power, against the weight of the ride the previous value rested on: ``{power_pct, weight_pct}``
-    (weight_pct > 0: lighter); (1 + power) x (1 + weight) = change. The power part includes what the
-    previous value had eased by."""
+    """How much of a W/kg rise (``change``: new / previous value) came from power and how much from
+    weight, against the ride the previous value rested on: ``{power_pct, weight_pct}``, the changes in
+    watts and in kg (weight_pct < 0: lighter), so (1 + power) / (1 + weight) = change. The power part
+    includes what the previous value had eased by."""
     if not kg or not before_kg:
         return None
-    weight = before_kg / kg
-    return {"power_pct": round(100 * (change / weight - 1), 1), "weight_pct": round(100 * (weight - 1), 1)}
+    weight = kg / before_kg
+    return {"power_pct": round(100 * (change * weight - 1), 1), "weight_pct": round(100 * (weight - 1), 1)}
 
 
 def _efficiency(conn: sqlite3.Connection) -> list[tuple[str, float]]:
@@ -358,8 +394,10 @@ def raw_timeline(conn: sqlite3.Connection, decay_per_week: float, end: str | Non
             value = max(v for v in (measured, decayed) if v is not None) if measured or decayed else None
             # A rise is a new best above yesterday's value (not just above where it would have eased to).
             if previous and value and measured and measured > previous * (1 + RISE_SHARE) and today < hi:
-                best_today = _best_index(rides, today, hi, c)
-                ride = _ride(rides, best_today, c) if best_today is not None else None
+                best_today = (
+                    _threshold_raiser(rides, lo, hi, today) if c == "threshold" else _best_index(rides, today, hi, c)
+                )
+                ride = _ride(rides, best_today, c, value) if best_today is not None else None
                 before = basis[c]
                 split = None
                 if ride and c != "durability" and before is not None and not np.isnan(rides.kg[before]):
@@ -367,7 +405,10 @@ def raw_timeline(conn: sqlite3.Connection, decay_per_week: float, end: str | Non
                 events.append({"date": day, "component": c, "from": previous, "to": value, "ride": ride,
                                "split": split})  # fmt: skip
             if measured is not None and (decayed is None or measured >= decayed):
-                basis[c] = _best_index(rides, lo, hi, c)
+                if c == "threshold" and today < hi and previous and measured > previous * (1 + RISE_SHARE):
+                    basis[c] = best_today
+                elif c != "threshold" or basis[c] is None or basis[c] < lo:
+                    basis[c] = _best_index(rides, lo, hi, c)
             values[c] = value
             kind = rides.weight_kind[basis[c]] if basis[c] is not None and c != "durability" else None
             row["basis"][c] = kind
