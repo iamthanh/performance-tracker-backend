@@ -36,7 +36,7 @@ Units: distance in metres (summaries: km), durations in seconds (summaries: hour
 heart rate in bpm, power in watts, energy in kcal, weight in kg. Timestamps are UTC ISO-8601; \
 `local_date`/`date` are YYYY-MM-DD on the athlete's local clock. Sleep is filed under the date it ended.
 
-Sources: {", ".join(SOURCES)} (garmin_export = Garmin CSV import).
+Sources: {", ".join(SOURCES)} (garmin_export = Garmin CSV import; weight_csv = imported weigh-ins).
 De-duplication: the same workout recorded by several services (starting within 180 s of the kept one) is returned once by \
 list_activities (unless `source` is given) and always by activity_summary, preferring \
 garmin > google_health > strava > garmin_export; `also_recorded_by` lists the other sources. \

@@ -180,6 +180,15 @@ each (60 MB once unzipped), through `POST /api/activities/import`. Imports run o
 - **Duplicates from other services:** a workout already stored from another service (e.g. a later Strava export) is
   merged in the lists, as for any duplicate, and the import says so.
 
+### Body weight from a CSV
+
+`fitness-hub import-weight-csv weights.csv [--unit kg|lb]` imports dated weigh-ins (a spreadsheet log or a scale
+app's export) as `weight_kg` under source `weight_csv`. It reads the column headed "Date" and the one headed "Weight"
+(else the first with the word, skipping goal, target and body-composition columns). Dates may be ISO (with or
+without a time), long ("Tuesday, June 26, 2018") or US (06/26/2018); day/month dates are refused. The unit comes from
+the header or `--unit`: never guessed, and the two must agree. Blank days are skipped, a weigh-in stored by several
+sources counts once, and importing again updates those days. Ride insights use these for W/kg and kJ/kg.
+
 ### Performance index (how good you are, over time)
 
 CTL is how much you have trained; the performance index is what you can produce, from best efforts only
@@ -203,7 +212,8 @@ endurance (60 min) and durability (best 5 and 20 min after 1000 kJ of work, as a
 
 `GET /api/activities/{source}/{id}/insights` adds what coaches look at beyond NP/IF/TSS (`insights.py`):
 
-- **Per kg:** the body weight saved before the workout, else the latest weigh-in up to its day.
+- **Per kg:** the body weight saved before the workout, else the average of the week's weigh-ins up to its day
+  (daily weights swing by a kilo); none when the latest weigh-in is over 30 days old.
 - **Best efforts:** for 30 s, 1, 5, 10, 15, 20, 30 and 60 minutes, then every hour, the stretch with the highest
   average power, when it was, and the min, max and average heart rate over it.
 - **Durability:** the best 1, 5, 8, 10, 15 and 20 minutes after the ride had already done 100, 200, 300 ... kJ of work
