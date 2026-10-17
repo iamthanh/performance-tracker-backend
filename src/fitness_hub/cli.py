@@ -9,6 +9,7 @@ import threading
 from collections.abc import Sequence
 from contextlib import closing
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -82,6 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
     weight = sub.add_parser("import-weight-csv", help="import body weight from a CSV of dated weigh-ins")
     weight.add_argument("path", type=Path)
     weight.add_argument("--unit", choices=("kg", "lb", "g"), help="the weights' unit, when the header does not say")
+    weight.add_argument(
+        "--timezone",
+        help="IANA zone for timestamped weigh-ins' dates, e.g. America/Los_Angeles (default: this machine's)",
+    )
 
     analyze = sub.add_parser("analyze", help="compute TSS, NP, zones, power curves and auto FTP from stored streams")
     analyze.add_argument("--full", action="store_true", help="re-analyse every activity, not only new ones")
@@ -219,14 +224,23 @@ def cmd_import_weight(settings: Settings, args: argparse.Namespace) -> int:
             text = data.decode("utf-8-sig")
         except UnicodeDecodeError:
             text = data.decode("cp1252", errors="replace")
+    tz = None
+    if args.timezone:
+        try:
+            tz = ZoneInfo(args.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            print(f"error: unknown timezone {args.timezone!r} (an IANA name like America/Los_Angeles)", file=sys.stderr)
+            return 1
     try:
         with Store(settings.db_path) as store:
-            result = import_weight_csv(store, text, args.unit)
+            result = import_weight_csv(store, text, args.unit, tz)
     except InputError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    print(f"Imported {result['imported']} weigh-ins ({result['unit']}) from {result['first']} to {result['last']} "
-          f"as source {SOURCE}; {result['skipped']} days without a weight skipped.")  # fmt: skip
+    print(
+        f"Imported {result['weigh_ins']} weigh-ins ({result['unit']}) as {result['imported']} days from "
+        f"{result['first']} to {result['last']}, source {SOURCE}; {result['skipped']} rows without a weight skipped."
+    )
     return 0
 
 
