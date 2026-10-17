@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 """
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # MIGRATIONS[v] upgrades a database from version v - 1 to v. Each one runs in a
 # single transaction together with the ``user_version`` bump.
@@ -305,6 +305,20 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,             -- JSON
             updated_at TEXT NOT NULL
+        )
+        """,
+    ),
+    # Cardio index: each workout's steady riding and heart-rate recoveries (steady.py).
+    7: (
+        """
+        CREATE TABLE ride_cardio (
+            source TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            has_gps INTEGER NOT NULL,        -- 0: no position recorded (indoors)
+            blocks TEXT NOT NULL,            -- JSON [[start_s, watts, bpm, temp_c, kj_before]]
+            recoveries TEXT NOT NULL,        -- JSON [[peak_bpm, drop_bpm, effort_w, recovery_w]]
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source, source_id)
         )
         """,
     ),
@@ -722,6 +736,21 @@ class Store:
                 params,
             )
         return len(params)
+
+    def replace_ride_cardio(self, source: str, source_id: str, cardio: Mapping[str, Any] | None) -> None:
+        """Store one workout's steady blocks and HR recoveries (``steady.ride_cardio``), or remove
+        them (``None``: no power or no heart rate)."""
+        with self.conn:
+            if cardio is None:
+                self.conn.execute("DELETE FROM ride_cardio WHERE source = ? AND source_id = ?", (source, source_id))
+                return
+            self.conn.execute(
+                "INSERT INTO ride_cardio (source, source_id, has_gps, blocks, recoveries, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (source, source_id) DO UPDATE SET has_gps = excluded.has_gps, "
+                "blocks = excluded.blocks, recoveries = excluded.recoveries, updated_at = excluded.updated_at",
+                (source, source_id, int(bool(cardio["has_gps"])), json.dumps(cardio["blocks"]),
+                 json.dumps(cardio["recoveries"]), now_utc_iso()),
+            )  # fmt: skip
 
     def set_athlete_setting(
         self, metric: str, effective_date: str, value: float, origin: str = "manual", note: str | None = None

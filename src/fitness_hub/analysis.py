@@ -14,7 +14,8 @@ Per activity (``activity_metrics``, ``power_curve``):
   rolling average, 4th-power mean), work, variability index, HR stats, best
   20-minute HR, efficiency factor, Pw:HR decoupling, the mean-maximal power
   curve and power/HR histograms. Power curve and best 20-minute values never
-  join efforts across a pause.
+  join efforts across a pause. With power and heart rate, the steady blocks and
+  heart-rate recoveries the cardio index reads (``steady``, ``ride_cardio``).
 - Threshold-dependent values, from the stored histograms so a new threshold
   never needs the streams again: intensity factor, TSS and time in Coggan power
   zones and Friel HR zones.
@@ -55,11 +56,12 @@ import numpy as np
 
 from .db import Store, decode_streams
 from .queries import sport_family
+from .steady import ride_cardio
 from .util import now_utc_iso, parse_date
 
 log = logging.getLogger(__name__)
 
-ANALYSIS_VERSION = 2  # 2: durability bests
+ANALYSIS_VERSION = 3  # 2: durability bests; 3: steady blocks and HR recoveries (cardio)
 BATCH = 200
 MAX_GAP_S = 5
 MOVING_SPEED_MPS = 1.0
@@ -304,7 +306,7 @@ def decoupling(power: np.ndarray, hr: np.ndarray) -> float | None:
 def base_metrics(streams: Mapping[str, list[Any]]) -> tuple[dict[str, Any], dict[int, float]]:
     """Threshold-independent metrics and the power curve of one activity."""
     series = timer_series(streams, ("power", "heart_rate"))
-    paused = timer_series(streams, ("power", "heart_rate"), keep_pauses=True)
+    _, is_pause, paused = timer_clock(streams, ("power", "heart_rate", "temperature"))
     for s in (series, paused):
         hr_values = s["heart_rate"]
         with np.errstate(invalid="ignore"):
@@ -340,6 +342,10 @@ def base_metrics(streams: Mapping[str, list[Any]]) -> tuple[dict[str, Any], dict
             np_w = metrics["normalized_power_w"]
             metrics["efficiency_factor"] = np_w / avg_hr if np_w else None
             metrics["decoupling_pct"] = decoupling(np.nan_to_num(raw_power, nan=0.0), hr)
+            has_gps = any(v is not None for v in streams.get("lat") or [])
+            metrics["cardio"] = ride_cardio(
+                paused["power"], paused["heart_rate"], paused["temperature"], is_pause, has_gps
+            )
     return metrics, curve
 
 
@@ -640,6 +646,7 @@ def analyze(store: Store, *, full: bool = False, progress: Callable[[int, int], 
         ).fetchone()
         metrics, curve = base_metrics(decode_streams(encoding, data))
         store.replace_durability_bests(source, source_id, metrics.pop("durability_bests", {}))
+        store.replace_ride_cardio(source, source_id, metrics.pop("cardio", None))
         # The threshold-dependent columns stay empty until the re-scoring pass below.
         batch.append(
             {

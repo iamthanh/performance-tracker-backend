@@ -68,7 +68,7 @@ BASE = "http://127.0.0.1:8801"
 
 def test_health_and_status(client: TestClient) -> None:
     health = client.get("/api/health").json()
-    assert health["status"] == "ok" and health["schema_version"] == 6
+    assert health["status"] == "ok" and health["schema_version"] == 7
     assert health["latest_activity_date"] == "2026-09-10" and health["last_analysis_at"]
     assert client.get("/api/status").json()["row_counts"]["activities"] == 5
 

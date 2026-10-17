@@ -229,6 +229,36 @@ its power and weight parts.
   a big strength. It needs the threshold.
 - Aerobic efficiency (median EF of steady rides of an hour or more over 42 days) is reported alongside, not in it.
 
+### Cardio index (how fit your heart and lungs are, over time)
+
+The fitter the aerobic system, the fewer beats the same power takes. The cardio index tracks heart rate against
+power (`cardio.py`, `GET /api/cardio`, `fitness-hub cardio`), with everything that moves heart rate besides fitness
+taken out first. The analysis stores each ride's **steady blocks** (`steady.py`, table `ride_cardio`): 5 minutes of
+even power after 3 minutes at that power (heart rate settles with a time constant of about a minute), with their
+heart rate, temperature and the work done before them, and each **HR recovery** after a hard effort.
+
+- **Same power**: blocks from 20 minutes in (earlier ones read 3-6 bpm low: still warming up), within 35 % of the
+  reference power (by default the median power of your steady riding, rounded to 5 W; set it in Settings), are
+  moved to it along your own heart rate / power slope and back to 500 kJ of work done (heart rate drifts up with
+  work), both fitted within rides.
+- **Same conditions**: each ride's value is corrected to outdoors, 25 °C or cooler and form (TSB) 0. Indoor rides read
+  differently (another power meter, a fan), heat raises heart rate, and **fatigue lowers it**, which would
+  otherwise pass for fitness. The three effects are fitted from how far each ride is from the rides within 14 days of
+  it, together, until they settle (so a season of fitness is not taken for heat or form). On the author's history:
+  indoors -5.3 bpm, +0.6 bpm per °C above 25 °C, 0.17 bpm per point of TSB (5 bpm in a hard block);
+  `fitness-hub cardio --backtest` shows each correction lowering the error of predicting a ride from the 42 days
+  before it, from 4.9 bpm to 4.1 with all three. Indoor means no GPS, a virtual or indoor sport, Strava's trainer
+  flag, or trainer gear (a KICKR ride stored as a plain "Ride").
+- **Components**, each day: *aerobic* (median over 42 days, at least 5 rides), as heart rate at the reference power
+  and as power at the reference heart rate; *resting heart rate* (median of the daily values over 7 days, from
+  Garmin or Google Health); *HR recovery* (the drop in the minute after a hard effort when you ease right off,
+  corrected to a standard peak and recovery power; median over 90 days); *cardiac drift* (heart rate rise per
+  1000 kJ on long steady rides: shown, not scored, as it mostly follows the heat).
+- The score is the weighted geometric mean of the scored components' indexes (100 = their first year; default
+  aerobic 60, resting heart rate 25, HR recovery 15), over those with a value; it needs the aerobic one. It falls as
+  well as rises. Each day also estimates **VO2max** from the aerobic value (ACSM oxygen cost of the reference power
+  at that day's weight, over the share of heart rate reserve it takes), saying which resting heart rate it used.
+
 ### Ride insights (computed on demand)
 
 `GET /api/activities/{source}/{id}/insights` adds what coaches look at beyond NP/IF/TSS (`insights.py`):
@@ -421,6 +451,7 @@ Then ask, for example:
 | `get_activity_analysis` | One activity's NP, IF, TSS, VI, EF, decoupling, zones, thresholds used and power curve |
 | `nutrition_daily` | Per day: calories and nutrients eaten, workout kcal, the watch's total and active kcal, and the balance |
 | `performance_index` | How good the rider is over time (not CTL): score and six components with when each was last tested |
+| `cardio_index` | How fit the heart is over time: heart rate against power on steady riding (corrected for heat, indoors and fatigue), resting heart rate, HR recovery, cardiac drift and an estimated VO2max |
 | `workout_fueling` | A workout's fueling: entries, totals and per-hour carbs, fluid, sodium and caffeine, against kcal burned |
 | `sync_now` | Runs a sync and returns its log. It blocks, and `full=true` can hit rate limits |
 
@@ -484,6 +515,9 @@ Reads use read-only connections. Writes are threshold overrides, which re-score 
 | `GET /api/weight?start_date&end_date` | The daily trend weight, each day labelled weigh_in, interpolated, estimated or carried (raw weigh-ins: `/api/body`) |
 | `GET /api/performance?start_date&end_date` | The performance index per day (score, components with last-tested dates, efficiency), what raised it and the weights; all history by default |
 | `GET/PUT /api/performance/settings` | The index's component weights (`{weights: {sprint, …}, decay_per_week}`) and presets |
+| `GET /api/cardio?start_date&end_date` | The cardio index per day (score, heart rate at the reference power and power at the reference heart rate, components, estimated VO2max), the fitted model and each ride's corrected value; all history by default |
+| `GET/PUT /api/cardio/settings` | `{weights: {aerobic, resting_hr, hr_recovery}, reference_power_w, reference_hr_bpm}` (null: automatic) |
+| `GET /api/activities/{source}/{id}/cardio` | One ride's steady blocks (which counted), heart rate at the reference power raw and corrected, the 42-day normal and its HR recoveries |
 | `GET /api/activities/{source}/{id}/insights` | Body weight for per-kg values, best efforts (power with the heart rate over them), durability (best efforts after accumulated work), W' balance with matches, efforts above FTP |
 | `GET /api/summary?start_date&end_date&group_by=week` | Totals per day/week (Monday start)/month, overall and per sport: count, distance, hours, elevation, TSS, kJ, kcal burned |
 | `GET /api/training-load?start_date&end_date` | Daily TSS, CTL, ATL, TSB and `unscored` workouts (default 90 days) |
@@ -597,7 +631,8 @@ local clock. Every row keeps the provider payload in `raw` and an `updated_at` s
 | `nutrition_entries` | `id` (and `(source, source_id)` for imports) | `local_date, consumed_at, meal` (`breakfast, lunch, dinner, snack, pre_workout, during_workout, post_workout`), `activity_source, activity_source_id, offset_s` (the workout it fuelled, seconds into it), `food_id, name, servings` (bottles, for a drink), the same nutrients as **totals for the entry**, `note`, `kind` (`food` or `drink`), `recipe` (one bottle, JSON) |
 | `workout_weights` | `(source, source_id)` | `pre_kg, post_kg, note`: body weight before and after the workout |
 | `durability_bests` | `(source, source_id, after_kj, duration_s)` | `watts`: the best average power over `duration_s` started after `after_kj` (1000 … 3000) of work in that ride |
-| `app_settings` | `key` | `value` (JSON): settings such as the performance index weights |
+| `ride_cardio` | `(source, source_id)` | `has_gps`; `blocks` (JSON `[[start_s, watts, bpm, temp_c, kj_before]]`: steady riding) and `recoveries` (JSON `[[peak_bpm, drop_bpm, effort_w, recovery_w]]`) for the cardio index |
+| `app_settings` | `key` | `value` (JSON): settings such as the performance and cardio index weights |
 
 **Schema versions.** The version is kept in `PRAGMA user_version`. Opening the database applies any missing migrations
 (`db.MIGRATIONS`), each in one transaction. A database created before versioning counts as version 1, and a database
