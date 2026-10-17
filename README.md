@@ -182,12 +182,15 @@ each (60 MB once unzipped), through `POST /api/activities/import`. Imports run o
 
 ### Body weight from a CSV
 
-`fitness-hub import-weight-csv weights.csv [--unit kg|lb]` imports dated weigh-ins (a spreadsheet log or a scale
-app's export) as `weight_kg` under source `weight_csv`. It reads the column headed "Date" and the one headed "Weight"
-(else the first with the word, skipping goal, target and body-composition columns). Dates may be ISO (with or
-without a time), long ("Tuesday, June 26, 2018") or US (06/26/2018); day/month dates are refused. The unit comes from
-the header or `--unit`: never guessed, and the two must agree. Blank days are skipped, a weigh-in stored by several
-sources counts once, and importing again updates those days. Ride insights use these for W/kg and kJ/kg.
+`fitness-hub import-weight-csv weights.csv [--unit kg|lb|g] [--timezone America/Los_Angeles]` imports dated
+weigh-ins (a spreadsheet log or a scale app's export) as `weight_kg` under source `weight_csv`, one value per day. It
+reads the column headed "Date" (or just "Timestamp") and the one headed "Weight" (else the first with the word,
+skipping goal, target and body-composition columns). Dates may be ISO, long ("Tuesday, June 26, 2018") or US
+(06/26/2018); day/month dates are refused. A timestamp with a zone, as a scale exports, counts for its date in your
+time zone (this machine's, with daylight saving time, unless `--timezone` says otherwise), and a day with several
+weigh-ins stores their mean. The unit (kg, lb or grams) comes from the header or `--unit`: never guessed, and the
+two must agree. Blank days are skipped, a weigh-in stored by several sources counts once, and importing again
+updates those days. Ride insights use these for W/kg and kJ/kg.
 
 ### Performance index (how good you are, over time)
 
