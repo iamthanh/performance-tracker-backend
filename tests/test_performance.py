@@ -115,6 +115,12 @@ def test_performance_indexes_against_the_baseline(store: Store) -> None:
     assert {c["key"] for c in result["components"]} == set(P.COMPONENTS)
 
 
+def test_the_first_window_is_not_reported(store: Store) -> None:
+    add_ride(store, "1", day(0), curve())
+    days = P.performance(store.conn, end_date=day(100))["days"]
+    assert days[0]["date"] == day(89) and days[-1]["date"] == day(100)
+
+
 def test_runs_do_not_count(store: Store) -> None:
     add_ride(store, "run", day(0), curve(), activity_type="Run")
     assert P.performance(store.conn)["days"] == []

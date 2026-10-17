@@ -21,10 +21,10 @@ says when the component was last *tested*: the latest ride in the window within 
 of the window's best at its key duration.
 
 Each component is an index, 100 = its baseline: the average of its daily values over the first
-``BASELINE_DAYS`` it has values once the first window is full. The score is the weighted geometric
-mean of the indexes (a big weakness is not hidden by a big strength), over the components that
-have a value; it needs the threshold. Aerobic efficiency (EF of steady rides) is reported
-alongside, not in the score: heat and pacing move it.
+``BASELINE_DAYS`` it has values once the first window is full (the days before are not reported).
+The score is the weighted geometric mean of the indexes (a big weakness is not hidden by a big
+strength), over the components that have a value; it needs the threshold. Aerobic efficiency (EF
+of steady rides) is reported alongside, not in the score: heat and pacing move it.
 """
 
 from __future__ import annotations
@@ -324,7 +324,8 @@ def performance(
     efficiency = _efficiency(conn)
     ef_dates = [d for d, _ in efficiency]
     days = []
-    for d in raw["days"]:
+    # The first window is not full yet: every component reads low, so those days are left out.
+    for d in raw["days"][WINDOW_DAYS - 1 :]:
         if start_date and d["date"] < start_date:
             continue
         indexes = {
