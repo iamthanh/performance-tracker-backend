@@ -31,33 +31,26 @@ def intervals(reps: int = 3, on: int = 60, off: int = 120, hard: float = 350, ea
     return ([easy] * 600 + ([hard] * on + [easy] * off) * reps) + [easy] * 600
 
 
-def test_durability_by_kj_per_kg() -> None:
-    power = np.full(3600, 300.0)  # 1080 kJ: 14.4 kJ/kg at 75 kg, six 2.5 kJ/kg steps cover it
-    result = durability(power, 75)
-    assert result is not None and result["unit"] == "kJ/kg" and result["total"] == 14.4
-    assert result["steps"] == [0, 2.5, 5, 7.5, 10, 12.5]
+def test_durability_in_100_kj_steps() -> None:
+    power = np.full(3600, 300.0)  # 1080 kJ
+    result = durability(power)
+    assert result is not None and result["unit"] == "kJ" and result["total"] == 1080
+    assert result["steps"] == list(range(0, 1001, 100))  # 1000 kJ leaves 80 kJ, more than half a step
     rows = {r["duration_s"]: r["watts"] for r in result["rows"]}
-    # 10 kJ/kg (750 kJ) is done after 2500 s: 1100 s are left, too few for 20 minutes.
-    assert rows[60] == [300] * 6 and rows[1200] == [300, 300, 300, 300, None, None]
-    # No step in the last half step of the ride: 13.6 kJ/kg leaves 12.5 out (0.4 kJ/kg after it).
-    assert durability(np.full(3400, 300.0), 75)["steps"] == [0, 2.5, 5, 7.5, 10]
-    # A long ride keeps the research's 10 kJ/kg steps (60 kJ/kg here, at most six steps) ...
-    assert durability(np.full(4 * 3600, 300.0), 72)["steps"] == [0, 10, 20, 30, 40, 50]
-    # ... and a mid-length one keeps its late steps (35 kJ/kg: 10 kJ/kg steps, not 5 cut off at 25).
-    assert durability(np.full(3600, 700.0), 72)["steps"] == [0, 10, 20, 30]
+    # 700 kJ is done after 2334 s: 1266 s are left, enough for 20 minutes; 800 kJ leaves too few.
+    assert rows[60] == [300] * 11 and rows[1200] == [300] * 8 + [None] * 3
+    assert durability(np.full(3400, 300.0))["steps"][-1] == 900  # 1020 kJ: 1000 leaves under half a step
+    assert durability(np.full(3000, 1000 / 3))["steps"][-1] == 900  # exactly 1000 kJ from float watts
+    assert durability(np.full(30, 200.0)) is None
 
 
-def test_durability_shows_the_fade_and_counts_kj_without_a_weight() -> None:
+def test_durability_shows_the_fade_and_coarsens_very_long_rides() -> None:
     power = np.concatenate([np.full(1800, 400.0), np.full(9000, 250.0)])  # hard start, then steady
-    result = durability(power, None)
-    assert result is not None and result["unit"] == "kJ" and result["steps"] == [0, 500, 1000, 1500, 2000, 2500]
-    five = next(r["watts"] for r in result["rows"] if r["duration_s"] == 300)
-    assert five == [400, 400, 250, 250, 250, 250]  # the 720 kJ hard start is over before 1000 kJ
-    # A two-hour ride of ~1400 kJ gets 250 kJ steps, not just "start" and "after 1000 kJ".
-    assert durability(np.full(7200, 195.0), None)["steps"] == [0, 250, 500, 750, 1000, 1250]
-    # Exactly 1000 kJ from float watts: 250 kJ steps, the last one dropped (nothing left after it).
-    assert durability(np.full(3000, 1000 / 3), None)["steps"] == [0, 250, 500, 750]
-    assert durability(np.full(30, 200.0), 70) is None
+    five = next(r["watts"] for r in durability(power)["rows"] if r["duration_s"] == 300)
+    assert five[:7] == [400] * 7 and five[8:20] == [250] * 12  # the 720 kJ start is over by 800 kJ
+    long = durability(np.full(12 * 3600, 300.0))  # 12960 kJ: over 100 steps of 100 kJ
+    assert long["steps"][1] == 200 and len(long["steps"]) <= 101
+    assert durability(np.full(3600, 10_000_000 / 3600))["steps"][1] == 100  # exactly 10000 kJ: still 100 kJ steps
 
 
 def test_w_balance_spends_above_cp_and_recovers_below() -> None:
@@ -158,7 +151,7 @@ def client(settings: Settings) -> TestClient:
 def test_insights_for_a_ride(client: TestClient) -> None:
     body = client.get("/api/activities/strava/2/insights").json()
     assert body["weight"] == {"kg": 72.5, "origin": "body", "date": "2026-09-20"}
-    assert body["durability"]["unit"] == "kJ/kg" and body["durability"]["steps"][0] == 0
+    assert body["durability"]["unit"] == "kJ" and body["durability"]["steps"][0] == 0
     efforts = body["efforts"]
     assert efforts["count"] == 5 and efforts["items"][0]["duration_s"] == 60
     first = efforts["items"][0]
