@@ -49,16 +49,43 @@ class UnsupportedFile(ValueError):
 SUPPORTED_SUFFIXES = (".fit", ".gpx", ".tcx", ".json")
 
 
+class FileTooLarge(ValueError):
+    """A (decompressed) file over the size limit."""
+
+
 def parse_file(path: Path | str) -> ParsedActivity:
     """Parse ``.fit``, ``.gpx``, ``.tcx`` or Strava ``.json``, optionally gzipped."""
     path = Path(path)
-    name = path.name.lower()
+    if not supported(path.name):
+        raise UnsupportedFile(f"unsupported activity file type: {path.name}")
+    return parse_bytes(path.name, path.read_bytes())
+
+
+def supported(filename: str) -> bool:
+    name = filename.lower()
+    return (name[:-3] if name.endswith(".gz") else name).endswith(SUPPORTED_SUFFIXES)
+
+
+def _gunzip(data: bytes, max_bytes: int | None) -> bytes:
+    if max_bytes is None:
+        return gzip.decompress(data)
+    with gzip.GzipFile(fileobj=io.BytesIO(data)) as gz:
+        out = gz.read(max_bytes + 1)  # never inflate a "zip bomb" past the limit
+    if len(out) > max_bytes:
+        raise FileTooLarge(f"the file is larger than {max_bytes // 1_000_000} MB once decompressed")
+    return out
+
+
+def parse_bytes(filename: str, data: bytes, max_bytes: int | None = None) -> ParsedActivity:
+    """Parse a file's contents by its name's type (see ``parse_file``). ``max_bytes`` caps the
+    decompressed size of a gzipped file."""
+    name = filename.lower()
     gz = name.endswith(".gz")
     stem = name[:-3] if gz else name
     if not stem.endswith(SUPPORTED_SUFFIXES):
-        raise UnsupportedFile(f"unsupported activity file type: {path.name}")
-    with path.open("rb") as raw:
-        data = gzip.decompress(raw.read()) if gz else raw.read()
+        raise UnsupportedFile(f"unsupported activity file type: {filename}")
+    if gz:
+        data = _gunzip(data, max_bytes)
     if stem.endswith(".fit"):
         return parse_fit(io.BytesIO(data))
     if stem.endswith(".gpx"):
@@ -250,10 +277,17 @@ def parse_gpx(data: bytes) -> ParsedActivity:
         if sample.get("ts") is not None:
             samples.append(sample)
     samples.sort(key=lambda s: s["ts"])
+    meta: dict[str, Any] = {"format": "gpx"}
+    track = next((e for e in root.iter() if _local(e.tag) == "trk"), None)
+    if track is not None:
+        for tag in ("name", "type"):
+            text = _child_text(track, tag)
+            if text and text.strip():
+                meta[tag] = text.strip()
     if not samples:
-        return ParsedActivity(start_time=None, streams={}, meta={"format": "gpx"})
+        return ParsedActivity(start_time=None, streams={}, meta=meta)
     start = samples[0]["ts"]
-    return ParsedActivity(start_time=start, streams=_build(samples, start), meta={"format": "gpx"})
+    return ParsedActivity(start_time=start, streams=_build(samples, start), meta=meta)
 
 
 # -- TCX ------------------------------------------------------------------------------
@@ -294,10 +328,14 @@ def parse_tcx(data: bytes) -> ParsedActivity:
                 sample["speed"] = _num(child.text)
         samples.append(sample)
     samples.sort(key=lambda s: s["ts"])
+    meta: dict[str, Any] = {"format": "tcx"}
+    activity = next((e for e in root.iter() if _local(e.tag) == "Activity"), None)
+    if activity is not None and activity.get("Sport"):
+        meta["type"] = activity.get("Sport")
     if not samples:
-        return ParsedActivity(start_time=None, streams={}, meta={"format": "tcx"})
+        return ParsedActivity(start_time=None, streams={}, meta=meta)
     start = samples[0]["ts"]
-    return ParsedActivity(start_time=start, streams=_build(samples, start), meta={"format": "tcx"})
+    return ParsedActivity(start_time=start, streams=_build(samples, start), meta=meta)
 
 
 # -- Strava app JSON ------------------------------------------------------------------

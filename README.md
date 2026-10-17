@@ -149,6 +149,28 @@ and TSB, the previous day's CTL − ATL, as on TrainingPeaks' Performance Manage
 imported streams have a TSS; each day also reports `unscored` workouts, so you can tell when the load is understated
 (for example, new rides that have not been imported yet).
 
+### Importing a single file (web UI)
+
+The Activities page's **Import workout** button uploads `.fit`, `.gpx` or `.tcx` files (also gzipped), up to 50 MB
+each, through `POST /api/activities/import`.
+
+- **Storage:** each file becomes an `upload` activity keyed by the file's SHA-256, so importing the same file again
+  updates that workout. Its samples go into `activity_streams` and the training analysis runs straight away (NP,
+  TSS, zones, power curve, FTP).
+- **Totals** come from the FIT session where there is one. Otherwise they are worked out from the samples:
+  - duration;
+  - distance (the distance channel, or the GPS track ignoring jitter under 3 m);
+  - elevation gain (ignoring wiggles under 2 m);
+  - heart rate and power.
+  
+  On real files these come within about 1 % of Strava's figures. Average power is always taken from the samples,
+  as Strava does.
+- **Local date:** the file's own clock (most FIT files), else the time zone the browser sends.
+- **Name and sport:** taken from the file, or set in the dialog. Without a name, it is "Morning Ride",
+  "Evening Run", etc.
+- **Duplicates:** a workout already stored from another service (e.g. a later Strava export) is merged in the lists,
+  as for any duplicate, and the import says so.
+
 ### Nutrition (logged by you)
 
 Meals and fueling during workouts are logged in the web UI (or through the API) and stored in `nutrition_entries`;
@@ -368,6 +390,7 @@ Reads use read-only connections. Writes are threshold overrides, which re-score 
 | `GET /api/health` | Status, version, schema version, latest activity date, last analysis time |
 | `GET /api/status` | Row counts and per-source sync state |
 | `GET /api/activities?start_date&end_date&activity_type&limit` | Workouts newest first, one per workout (an analysed copy wins over an unanalysed duplicate), with TSS, IF, NP, work, VI, EF, decoupling, `kcal` burned (recorded calories from any copy of the workout, else a ride's kJ of work), `has_streams` |
+| `POST /api/activities/import?filename&name&activity_type&timezone` | Import one `.fit`, `.gpx` or `.tcx` file (optionally `.gz`); the body is the file, as `application/octet-stream`. Stored as source `upload` and analysed; returns the workout and any copy already stored from another service |
 | `GET /api/activities/{source}/{id}` | One workout: `activity`, `analysis` (zones, power curve, thresholds used), `laps`, `device`, available `streams` channels |
 | `GET /api/activities/{source}/{id}/streams?max_points=2000` | Per-sample channels averaged down to `max_points` (`time` in seconds from the start) |
 | `GET /api/summary?start_date&end_date&group_by=week` | Totals per day/week (Monday start)/month, overall and per sport: count, distance, hours, elevation, TSS, kJ, kcal burned |
