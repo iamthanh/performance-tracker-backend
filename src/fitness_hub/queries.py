@@ -21,7 +21,7 @@ from .db import load_daily_series, load_streams, row_counts, sync_states
 from .util import InputError, parse_date, parse_ts
 
 DEDUPE_WINDOW_S = 180
-SOURCE_PRIORITY = ("garmin", "google_health", "strava", "garmin_export")
+SOURCE_PRIORITY = ("garmin", "google_health", "strava", "garmin_export", "upload")
 GROUP_BY = ("week", "month", "day", "type")
 MAX_ACTIVITY_LIMIT = 500
 MAX_SQL_LIMIT = 1000

@@ -26,6 +26,7 @@ database (metres, seconds, watts, bpm) unless a field name says otherwise.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
 import sqlite3
@@ -37,12 +38,13 @@ from typing import Annotated, Any, Literal, get_args
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import __version__, nutrition, queries
+from . import __version__, nutrition, queries, uploads
 from .analysis import analyze, thresholds_on
 from .config import Settings
 from .db import ATHLETE_SETTINGS, Store, open_readonly, schema_version
@@ -233,6 +235,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     allowed_origins = {o.rstrip("/") for o in settings.api_cors_origins}
+    import_slot = asyncio.Semaphore(1)
     lan = is_lan_bind(settings.api_host)
     # Computed once: host names are looked up on every request.
     lan_names = machine_host_names() | {host_name(h).rstrip(".") for h in settings.api_allowed_hosts}
@@ -314,6 +317,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> list[dict[str, Any]]:
         """Workouts newest first, one per workout, with TSS, IF, NP and work."""
         return queries.activities_with_metrics(conn, start_date, end_date, activity_type, limit)
+
+    @app.post("/api/activities/import", status_code=201)
+    async def import_activity(
+        request: Request,
+        filename: Annotated[str, Query(min_length=1, max_length=255, description="The file's name: .fit, .gpx or .tcx, optionally .gz")],
+        name: Annotated[str | None, Query(max_length=200)] = None,
+        activity_type: Annotated[str | None, Query(max_length=60, description="e.g. Ride, Run; default from the file")] = None,
+        timezone: Annotated[str | None, Query(max_length=64, description="IANA zone for the local date, e.g. Europe/Paris")] = None,
+    ) -> dict[str, Any]:
+        """Import one recorded activity file. The body is the file's bytes, sent as
+        ``application/octet-stream`` (a cross-site form cannot send that type). The workout is
+        stored as source ``upload``, analysed, and returned with any copies already stored from
+        other services; uploading the same file again updates it."""
+        if request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/octet-stream":
+            raise HTTPException(status_code=415, detail="send the file as application/octet-stream")
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > uploads.MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"files up to {uploads.MAX_UPLOAD_BYTES // 1_000_000} MB")
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > uploads.MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail=f"files up to {uploads.MAX_UPLOAD_BYTES // 1_000_000} MB")
+
+        data = bytes(body)
+        del body  # one copy of the file in memory, not two
+
+        def run() -> dict[str, Any]:
+            with Store(settings.db_path) as store:
+                return uploads.import_activity_file(
+                    store, filename, data, timezone=timezone, name=name, activity_type=activity_type
+                )
+
+        # One import at a time: each parses a file and runs the analysis, which two at once would
+        # repeat for each other (and memory would add up).
+        async with import_slot:
+            return await run_in_threadpool(run)
 
     @app.get("/api/activities/{source}/{source_id}")
     def activity(conn: Conn, source: str, source_id: str) -> dict[str, Any]:

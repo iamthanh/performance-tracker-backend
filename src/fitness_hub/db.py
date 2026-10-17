@@ -295,7 +295,7 @@ DAILY_METRICS = (
     "vo2_max",
 )
 BODY_METRICS = ("weight_kg", "body_fat_pct")
-SOURCES = ("strava", "garmin", "google_health", "garmin_export")
+SOURCES = ("strava", "garmin", "google_health", "garmin_export", "upload")
 
 _ACTIVITY_COLUMNS = (
     "source",

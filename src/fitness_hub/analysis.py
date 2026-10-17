@@ -64,6 +64,10 @@ BATCH = 200
 MAX_GAP_S = 5
 MOVING_SPEED_MPS = 1.0
 MAX_MOVING_GAP_S = 600
+# A pause is kept (as missing seconds, so efforts never join across it) for at most this long:
+# longer than the longest power-curve window, so it changes nothing, but a file whose clock
+# jumps by years cannot blow the 1 Hz series up to millions of seconds.
+MAX_PAUSE_S = 6 * 3600
 MIN_HR_BPM = 30  # below: a strap that lost contact
 MAX_HR_BPM = 220  # above: sensor noise (cadence lock, static spikes)
 MIN_POWER_SHARE = 0.25
@@ -166,7 +170,7 @@ def timer_series(
     held[:-1][moving] = gaps[moving]
     paused = np.zeros(sec.size, dtype=np.int64)
     if keep_pauses:
-        paused[:-1][~moving] = gaps[~moving] - 1
+        paused[:-1][~moving] = np.minimum(gaps[~moving] - 1, MAX_PAUSE_S)
     # Each sample covers its own second plus held seconds (a copy of it) and paused seconds (NaN).
     span = held + paused
     index = np.repeat(np.arange(sec.size), span)

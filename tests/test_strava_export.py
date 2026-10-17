@@ -158,7 +158,7 @@ def test_parse_tcx() -> None:
     assert s["speed"] == [8.5, None]
     assert s["distance"] == [0, 8.5]
     assert s["lat"] == [37.1, None]
-    assert parsed.meta == {"format": "tcx"}
+    assert parsed.meta == {"format": "tcx", "type": "Biking"}
 
 
 # -- activities.csv -------------------------------------------------------------------

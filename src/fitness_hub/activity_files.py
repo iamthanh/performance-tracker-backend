@@ -18,6 +18,7 @@ import io
 import json
 import math
 import xml.etree.ElementTree as ET
+import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,16 +50,54 @@ class UnsupportedFile(ValueError):
 SUPPORTED_SUFFIXES = (".fit", ".gpx", ".tcx", ".json")
 
 
+class FileTooLarge(ValueError):
+    """A (decompressed) file over the size limit."""
+
+
 def parse_file(path: Path | str) -> ParsedActivity:
     """Parse ``.fit``, ``.gpx``, ``.tcx`` or Strava ``.json``, optionally gzipped."""
     path = Path(path)
-    name = path.name.lower()
+    if not supported(path.name):
+        raise UnsupportedFile(f"unsupported activity file type: {path.name}")
+    return parse_bytes(path.name, path.read_bytes())
+
+
+def supported(filename: str) -> bool:
+    name = filename.lower()
+    return (name[:-3] if name.endswith(".gz") else name).endswith(SUPPORTED_SUFFIXES)
+
+
+def gunzip(data: bytes, max_bytes: int | None) -> bytes:
+    """Decompress gzip data, refusing to inflate past ``max_bytes`` (a "zip bomb") and never
+    allocating more than the output so far."""
+    if max_bytes is None:
+        return gzip.decompress(data)
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)  # gzip framing
+    out = bytearray()
+    chunk = data
+    while chunk:
+        out += inflater.decompress(chunk, 1 << 20)
+        if len(out) > max_bytes:
+            raise FileTooLarge(f"the file is larger than {max_bytes // 1_000_000} MB once decompressed")
+        chunk = inflater.unconsumed_tail
+    out += inflater.flush()
+    if len(out) > max_bytes:
+        raise FileTooLarge(f"the file is larger than {max_bytes // 1_000_000} MB once decompressed")
+    if not inflater.eof:
+        raise ValueError("the gzip data is truncated")
+    return bytes(out)
+
+
+def parse_bytes(filename: str, data: bytes, max_bytes: int | None = None) -> ParsedActivity:
+    """Parse a file's contents by its name's type (see ``parse_file``). ``max_bytes`` caps the
+    decompressed size of a gzipped file."""
+    name = filename.lower()
     gz = name.endswith(".gz")
     stem = name[:-3] if gz else name
     if not stem.endswith(SUPPORTED_SUFFIXES):
-        raise UnsupportedFile(f"unsupported activity file type: {path.name}")
-    with path.open("rb") as raw:
-        data = gzip.decompress(raw.read()) if gz else raw.read()
+        raise UnsupportedFile(f"unsupported activity file type: {filename}")
+    if gz:
+        data = gunzip(data, max_bytes)
     if stem.endswith(".fit"):
         return parse_fit(io.BytesIO(data))
     if stem.endswith(".gpx"):
@@ -133,6 +172,20 @@ _FIT_MESSAGES = {"record", "session", "lap", "activity", "file_id", "device_info
 _THRESHOLD_FIELDS = ("functional_threshold_power", "threshold_heart_rate", "max_heart_rate")
 
 
+def _combined_session(sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    """A multisport file (e.g. a triathlon): the legs' totals added up, sport "multisport"."""
+    combined: dict[str, Any] = {"sport": "multisport", "start_time": sessions[0].get("start_time"),
+                                "legs": [s.get("sport") for s in sessions]}  # fmt: skip
+    for key in ("total_elapsed_time", "total_timer_time", "total_distance", "total_ascent", "total_calories"):
+        values = [s[key] for s in sessions if isinstance(s.get(key), (int, float))]
+        if values:
+            combined[key] = sum(values)
+    hr = [s["max_heart_rate"] for s in sessions if isinstance(s.get("max_heart_rate"), (int, float))]
+    if hr:
+        combined["max_heart_rate"] = max(hr)
+    return combined
+
+
 def _pick(values: dict[str, Any], names: tuple[str, ...]) -> dict[str, Any]:
     return {n: values[n] for n in names if values.get(n) is not None}
 
@@ -204,6 +257,8 @@ def parse_fit(fileobj: IO[bytes]) -> ParsedActivity:
                 meta.setdefault("thresholds", {}).update(_pick(values, _THRESHOLD_FIELDS))
     if meta.get("sessions"):
         meta["session"] = meta["sessions"][0]  # most files have exactly one
+        if len(meta["sessions"]) > 1:
+            meta["session"] = _combined_session(meta["sessions"])
     samples.sort(key=lambda s: s["ts"])
     if not samples:
         return ParsedActivity(start_time=None, streams={}, meta=meta, local_offset_s=local_offset)
@@ -250,10 +305,17 @@ def parse_gpx(data: bytes) -> ParsedActivity:
         if sample.get("ts") is not None:
             samples.append(sample)
     samples.sort(key=lambda s: s["ts"])
+    meta: dict[str, Any] = {"format": "gpx"}
+    track = next((e for e in root.iter() if _local(e.tag) == "trk"), None)
+    if track is not None:
+        for tag in ("name", "type"):
+            text = _child_text(track, tag)
+            if text and text.strip():
+                meta[tag] = text.strip()[:200]
     if not samples:
-        return ParsedActivity(start_time=None, streams={}, meta={"format": "gpx"})
+        return ParsedActivity(start_time=None, streams={}, meta=meta)
     start = samples[0]["ts"]
-    return ParsedActivity(start_time=start, streams=_build(samples, start), meta={"format": "gpx"})
+    return ParsedActivity(start_time=start, streams=_build(samples, start), meta=meta)
 
 
 # -- TCX ------------------------------------------------------------------------------
@@ -294,10 +356,14 @@ def parse_tcx(data: bytes) -> ParsedActivity:
                 sample["speed"] = _num(child.text)
         samples.append(sample)
     samples.sort(key=lambda s: s["ts"])
+    meta: dict[str, Any] = {"format": "tcx"}
+    activity = next((e for e in root.iter() if _local(e.tag) == "Activity"), None)
+    if activity is not None and activity.get("Sport"):
+        meta["type"] = activity.get("Sport")
     if not samples:
-        return ParsedActivity(start_time=None, streams={}, meta={"format": "tcx"})
+        return ParsedActivity(start_time=None, streams={}, meta=meta)
     start = samples[0]["ts"]
-    return ParsedActivity(start_time=start, streams=_build(samples, start), meta={"format": "tcx"})
+    return ParsedActivity(start_time=start, streams=_build(samples, start), meta=meta)
 
 
 # -- Strava app JSON ------------------------------------------------------------------
