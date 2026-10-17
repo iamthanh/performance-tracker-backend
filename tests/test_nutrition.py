@@ -296,3 +296,27 @@ def test_a_v3_database_with_data_migrates_to_v4(tmp_path) -> None:
                                                     "name": "Gel", "activity_source": "strava",
                                                     "activity_source_id": "1"})  # fmt: skip
 
+
+
+def test_workouts_report_kcal_burned(store: Store) -> None:
+    """kcal in the activity list and summaries: recorded calories (from any copy), else a ride's kJ of work."""
+    from fitness_hub import queries
+
+    ride(store, "s1")  # 2 h at 200 W, no calories: 1440 kJ
+    ride(store, "s2", day="2026-10-13")
+    store.upsert_activities(
+        [
+            {"source": "garmin", "source_id": "g2", "start_time": "2026-10-13T16:01:00Z", "local_date": "2026-10-13",
+             "activity_type": "cycling", "calories": 1500.0, "raw": {}},  # the same ride, recorded with calories
+            {"source": "strava", "source_id": "run", "start_time": "2026-10-14T07:00:00Z", "local_date": "2026-10-14",
+             "activity_type": "Run", "calories": 600.0, "raw": {}},
+            {"source": "strava", "source_id": "walk", "start_time": "2026-10-14T18:00:00Z", "local_date": "2026-10-14",
+             "activity_type": "Walk", "raw": {}},  # nothing known
+        ]
+    )  # fmt: skip
+    analyze(store)
+    kcal = {r["source_id"]: r["kcal"] for r in queries.activities_with_metrics(store.conn, "2026-10-12", "2026-10-14")}
+    assert kcal == {"s1": pytest.approx(1440), "s2": 1500, "run": 600, "walk": None}
+    weeks = queries.period_totals(store.conn, "2026-10-12", "2026-10-14", "week")["periods"]
+    assert weeks[0]["total"]["kcal"] == pytest.approx(1440 + 1500 + 600)
+    assert weeks[0]["by_sport"]["running"]["kcal"] == 600

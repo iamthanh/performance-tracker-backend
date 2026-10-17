@@ -542,13 +542,44 @@ def activities_with_metrics(
         item.update(sport=sport_family(row["activity_type"]), also_recorded_by=row["also_recorded_by"],
                     has_streams=bool(row["has_streams"]), analysed=bool(row["analysed"]))  # fmt: skip
         item.update({c: row[f"m_{c}"] for c in _LIST_METRIC_COLUMNS})
+        item["kcal"] = workout_kcal(item, _copies_calories(row, rows))
         out.append(item)
     return out
 
 
+def _copies_calories(kept: Mapping[str, Any], rows: list[dict[str, Any]]) -> float | None:
+    """Recorded calories of the kept row, else of a duplicate from another service (the
+    preferred source first): Strava summaries have none, a Garmin copy may."""
+    if kept.get("calories"):
+        return float(kept["calories"])
+    if not kept.get("also_recorded_by"):
+        return None
+    start = parse_ts(kept.get("start_time"))
+    if start is None:
+        return None
+    window = timedelta(seconds=DEDUPE_WINDOW_S)
+    copies = [
+        r for r in rows
+        if r["source"] in kept["also_recorded_by"] and r.get("calories")
+        and (ts := parse_ts(r.get("start_time"))) is not None and abs(ts - start) <= window
+    ]  # fmt: skip
+    return float(min(copies, key=lambda r: _priority(r["source"]))["calories"]) if copies else None
+
+
+def workout_kcal(row: Mapping[str, Any], calories: float | None = None) -> float | None:
+    """Energy a workout burned, kcal: its recorded calories (``calories`` overrides the row's),
+    else for a ride its work in kJ (kJ of work ~ kcal burned at ~24 % gross efficiency)."""
+    recorded = calories if calories is not None else row.get("calories")
+    if recorded:
+        return round(float(recorded), 1)
+    if row.get("work_kj") and sport_family(row.get("activity_type")) == "cycling":
+        return round(float(row["work_kj"]), 1)
+    return None
+
+
 def _new_totals() -> dict[str, Any]:
     return {"count": 0, "distance_km": 0.0, "moving_hours": 0.0, "elevation_gain_m": 0.0, "tss": 0.0, "work_kj": 0.0,
-            "unscored": 0}  # fmt: skip
+            "kcal": 0.0, "unscored": 0}  # fmt: skip
 
 
 def _add(totals: dict[str, Any], row: Mapping[str, Any]) -> None:
@@ -559,6 +590,7 @@ def _add(totals: dict[str, Any], row: Mapping[str, Any]) -> None:
     totals["elevation_gain_m"] += row.get("elevation_gain_m") or 0.0
     totals["tss"] += row.get("tss") or 0.0
     totals["work_kj"] += row.get("work_kj") or 0.0
+    totals["kcal"] += row.get("kcal") or 0.0
 
 
 def _rounded(totals: dict[str, Any]) -> dict[str, Any]:
@@ -569,7 +601,7 @@ def period_totals(
     conn: sqlite3.Connection, start_date: str, end_date: str, group_by: str = "week"
 ) -> dict[str, Any]:
     """Totals per day, week (Monday start) or month, overall and per sport: count,
-    distance, moving hours, elevation, TSS, work and workouts without a TSS
+    distance, moving hours, elevation, TSS, work, kcal burned and workouts without a TSS
     (``unscored``). De-duplicated; empty periods included. A period is labelled by
     its first day, which can be before ``start_date`` (the first week or month is
     then only counted from ``start_date``)."""
