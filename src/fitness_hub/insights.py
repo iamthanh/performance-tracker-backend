@@ -53,6 +53,8 @@ log = logging.getLogger(__name__)
 DURABILITY_DURATIONS_S = (60, 300, 480, 600, 900, 1200)
 DURABILITY_STEP_KJ = 100
 DURABILITY_MAX_STEPS = 100  # a longer ride takes a multiple of DURABILITY_STEP_KJ instead
+TIME_MARK_EVERY_S = (300, 600, 900, 1800, 3600, 7200)
+TIME_MARKS = 10
 DURABILITY_MIN_LEFT = 0.5  # of a step: a step is shown only with at least this much riding after it
 DEFAULT_W_PRIME_J = 20000.0
 MATCH_J = 2000.0
@@ -93,11 +95,14 @@ def ride_weight(conn: sqlite3.Connection, source: str, source_id: str, local_dat
 # -- durability -----------------------------------------------------------------------------
 
 
-def durability(power: np.ndarray) -> dict[str, Any] | None:
+def durability(power: np.ndarray, clock: np.ndarray | None = None) -> dict[str, Any] | None:
     """Best power per duration after each step of accumulated work (see the module docstring).
 
     ``power`` is the 1 Hz timer series with pauses as 0 W. A cell is None when too little of the
-    ride is left after the step for that duration."""
+    ride is left after the step for that duration. With ``clock`` (each timer second's elapsed
+    time, ``timer_clock``) it also places the work on the ride's time: ``step_times_s``, when each
+    step was reached, and ``time_marks``, the work done by round elapsed times (for a time axis
+    under the kJ one)."""
     if power.size < min(DURABILITY_DURATIONS_S):
         return None
     work = np.cumsum(power) / 1000  # kJ done by the end of each second
@@ -117,7 +122,25 @@ def durability(power: np.ndarray) -> dict[str, Any] | None:
         best_from = np.maximum.accumulate(averages[::-1])[::-1]  # best_from[i]: best window starting at i or later
         values = [_round(best_from[i], 0) if i < averages.size else None for i in starts]
         rows.append({"duration_s": d, "watts": values})
-    return {"unit": "kJ", "steps": steps, "total": _round(total), "rows": rows}
+    out: dict[str, Any] = {"unit": "kJ", "steps": steps, "total": _round(total), "rows": rows}
+    if clock is not None and clock.size == power.size:
+        out["step_times_s"] = [0.0, *(_round(clock[min(i, clock.size - 1)], 0) for i in starts[1:])]
+        out["time_marks"] = _time_marks(clock, work, steps[-1])
+    return out
+
+
+def _time_marks(clock: np.ndarray, work: np.ndarray, up_to_kj: float) -> list[dict[str, float]]:
+    """``[{time_s, kj}]`` every round interval of elapsed time (at most ``TIME_MARKS`` of them up
+    to ``up_to_kj``): the work done by then."""
+    end = int(np.searchsorted(work, up_to_kj - 1e-9))  # the second the last step is reached
+    span = float(clock[min(end, clock.size - 1)])
+    every = next((m for m in TIME_MARK_EVERY_S if span / m <= TIME_MARKS), TIME_MARK_EVERY_S[-1])
+    marks = []
+    for t in np.arange(every, span + 1e-9, every):
+        i = int(np.searchsorted(clock, t))  # the first timer second at or after it
+        if i < work.size:
+            marks.append({"time_s": float(t), "kj": _round(float(work[i - 1]) if i else 0.0, 1)})
+    return marks
 
 
 # -- W' balance -----------------------------------------------------------------------------
@@ -282,7 +305,7 @@ def activity_insights(conn: sqlite3.Connection, source: str, source_id: str) -> 
     if ride is None:
         return out
     power, clock, ftp = ride["power"], ride["clock"], ride["ftp"]
-    out["durability"] = durability(power)
+    out["durability"] = durability(power, clock)
     if not ftp:
         return out
     cp, w_prime, origin = cp_model(conn, activity["local_date"], ftp)
