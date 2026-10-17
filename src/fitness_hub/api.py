@@ -99,7 +99,7 @@ class FoodIn(Nutrients):
 
 
 class OtherIngredient(BaseModel):
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, extra="forbid")
 
     name: str = Field(min_length=1, max_length=100)
     grams: Amount = None
@@ -111,7 +111,7 @@ class OtherIngredient(BaseModel):
 class DrinkIn(BaseModel):
     """Bottles of sports drink: how many, and what ONE bottle holds."""
 
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, extra="forbid")  # a typo (malto_g) must not be ignored
 
     bottles: float = Field(default=1.0, gt=0, le=50)
     water_ml: Amount = None
@@ -122,7 +122,7 @@ class DrinkIn(BaseModel):
 
 
 class WeightIn(BaseModel):
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, extra="forbid")
 
     pre_kg: Annotated[float | None, Field(ge=20, le=300)] = None
     post_kg: Annotated[float | None, Field(ge=20, le=300)] = None
@@ -559,7 +559,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def set_weight(source: str, source_id: str, body: WeightIn) -> dict[str, Any]:
         """Body weight just before and just after the workout (kg); send neither to clear them."""
         with Store(settings.db_path) as store:
-            saved = nutrition.set_workout_weight(store.conn, source, source_id, body.pre_kg, body.post_kg, body.note)
+            # A note left out is kept.
+            note = {"note": body.note} if "note" in body.model_fields_set else {}
+            saved = nutrition.set_workout_weight(store.conn, source, source_id, body.pre_kg, body.post_kg, **note)
         if saved is None:
             raise HTTPException(status_code=404, detail=f"no activity {source}/{source_id}")
         return saved

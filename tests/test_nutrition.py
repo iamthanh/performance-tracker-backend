@@ -423,3 +423,90 @@ def test_api_drinks_and_weight(client: TestClient) -> None:
     assert fueling["sweat"]["change_kg"] == -1 and fueling["drinks"]["bottles"] == 2
     evil = client.put("/api/activities/strava/1/weight", json={"pre_kg": 70}, headers={"Origin": "https://evil.example"})
     assert evil.status_code == 403
+
+
+def test_editing_a_bottle(store: Store) -> None:
+    ride(store)
+    analyze(store)
+    link = {"local_date": "2026-10-12", "meal": "during_workout", "activity_source": "strava", "activity_source_id": "1"}
+    entry = nutrition.save_entry(store.conn, {**link, "name": "Morning mix", "drink": {**MIX_BOTTLE, "bottles": 2}})
+    assert entry
+    # A new recipe keeps the entry's name and bottle count unless they are sent.
+    edited = nutrition.save_entry(store.conn, {**link, "drink": {"water_ml": 500, "maltodextrin_g": 40}}, entry["id"])
+    assert edited and edited["name"] == "Morning mix" and edited["servings"] == 2 and edited["carbs_g"] == 80
+    # Nutrients cannot be set beside a recipe, with a new one or without.
+    for body in ({**link, "drink": {"water_ml": 500}, "carbs_g": 10}, {**link, "carbs_g": 10}):
+        with pytest.raises(InputError, match="come from its recipe"):
+            nutrition.save_entry(store.conn, body, entry["id"])
+    # "drink": null makes it a food: the recipe goes.
+    food = nutrition.save_entry(store.conn, {**link, "drink": None, "name": "Banana", "carbs_g": 25, "fluid_ml": None,
+                                             "kcal": 100, "sugars_g": None, "sodium_mg": None, "caffeine_mg": None},
+                                entry["id"])  # fmt: skip
+    assert food and food["kind"] == "food" and food["recipe"] is None and food["carbs_g"] == 25 and food["fluid_ml"] is None
+    assert nutrition.workout_fueling(store.conn, "strava", "1")["drinks"] is None  # type: ignore[index]
+
+
+def test_scaled_bottles_are_rounded(store: Store) -> None:
+    ride(store)
+    analyze(store)
+    link = {"local_date": "2026-10-12", "meal": "during_workout", "activity_source": "strava", "activity_source_id": "1"}
+    entry = nutrition.save_entry(store.conn, {**link, "drink": {"salt_g": 1.0, "water_ml": 500, "bottles": 3}})
+    assert entry
+    two = nutrition.save_entry(store.conn, {**link, "servings": 2}, entry["id"])
+    assert two and two["sodium_mg"] == pytest.approx(786.8) and two["sodium_mg"] == round(two["sodium_mg"], 2)
+
+
+def test_the_weight_note_is_kept_and_needs_a_weight(store: Store) -> None:
+    ride(store)
+    analyze(store)
+    nutrition.set_workout_weight(store.conn, "strava", "1", 72, 71, "hot day")
+    again = nutrition.set_workout_weight(store.conn, "strava", "1", 72, 70.5)  # e.g. the UI, which sends no note
+    assert again and again["note"] == "hot day" and again["post_kg"] == 70.5
+    cleared = nutrition.set_workout_weight(store.conn, "strava", "1", 72, 70.5, None)
+    assert cleared and cleared["note"] is None
+    with pytest.raises(InputError, match="needs a weight"):
+        nutrition.set_workout_weight(store.conn, "strava", "1", None, None, "x")
+
+
+def test_sweat_rate_uses_the_longest_elapsed_time(store: Store) -> None:
+    ride(store, "s1")  # 2 h moving, no elapsed time on this copy
+    store.upsert_activities([{"source": "garmin", "source_id": "g1", "start_time": "2026-10-12T16:00:40Z",
+                              "local_date": "2026-10-12", "activity_type": "cycling", "duration_s": 3 * 3600.0,
+                              "raw": {}}])  # fmt: skip
+    analyze(store)
+    nutrition.set_workout_weight(store.conn, "strava", "s1", 72, 70.5)
+    sweat = nutrition.workout_fueling(store.conn, "strava", "s1")["sweat"]  # type: ignore[index]
+    assert sweat["sweat_l_per_h"] == pytest.approx(1.5 / 3)  # over 3 h out, not 2 h moving
+
+
+def test_api_drink_typos_and_note(client: TestClient) -> None:
+    link = {"local_date": "2026-10-12", "meal": "during_workout", "activity_source": "strava", "activity_source_id": "1"}
+    typo = client.post("/api/nutrition/entries", json={**link, "drink": {"water_ml": 500, "malto_g": 60}})
+    assert typo.status_code == 422 and typo.json()["detail"][0]["loc"][-1] == "malto_g"
+    client.put("/api/activities/strava/1/weight", json={"pre_kg": 72.0, "post_kg": 71.0, "note": "hot"})
+    kept = client.put("/api/activities/strava/1/weight", json={"pre_kg": 72.0, "post_kg": 70.0})
+    assert kept.json()["note"] == "hot"
+    assert client.put("/api/activities/strava/1/weight", json={"note": "x"}).status_code == 400
+
+
+def test_v4_entries_become_foods_on_upgrade(tmp_path) -> None:
+    import sqlite3
+
+    from fitness_hub.db import MIGRATIONS, SCHEMA
+
+    path = tmp_path / "fitness.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA)
+    for version in (2, 3, 4):
+        for statement in MIGRATIONS[version]:
+            conn.execute(statement)
+    conn.execute("PRAGMA user_version = 4")
+    conn.execute("INSERT INTO nutrition_entries (local_date, meal, name, kcal, created_at, updated_at) "
+                 "VALUES ('2026-10-12', 'lunch', 'Pasta', 700, 'x', 'x')")  # fmt: skip
+    conn.commit()
+    conn.close()
+    with Store(path) as upgraded:
+        entry = nutrition.list_entries(upgraded.conn, "2026-10-12", "2026-10-12")[0]
+        assert (entry["kind"], entry["recipe"], entry["kcal"]) == ("food", None, 700)
+        with pytest.raises(Exception, match="CHECK"):
+            upgraded.conn.execute("UPDATE nutrition_entries SET kind = 'soup'")

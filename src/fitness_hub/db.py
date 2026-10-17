@@ -271,7 +271,7 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
     ),
     # Workout drinks as bottles with a recipe, and body weight before and after a workout.
     5: (
-        "ALTER TABLE nutrition_entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'food'",  # food | drink
+        "ALTER TABLE nutrition_entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'food' CHECK (kind IN ('food', 'drink'))",
         # JSON recipe of ONE bottle (water_ml, salt_g, maltodextrin_g, sucrose_g, other: [...]);
         # servings is the number of bottles and the nutrient columns hold the totals.
         "ALTER TABLE nutrition_entries ADD COLUMN recipe TEXT",

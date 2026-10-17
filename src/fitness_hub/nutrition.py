@@ -51,7 +51,6 @@ CARB_SHARE_SLOPE = 1.6
 CARB_SHARE_OFFSET = -0.55
 CARB_SHARE_RANGE = (0.3, 0.95)
 MAX_TEXT = 200
-KINDS = ("food", "drink")
 SODIUM_MG_PER_G_SALT = 393.4  # table salt is 39.3 % sodium (22.99 / 58.44)
 MAX_OTHER_INGREDIENTS = 20
 WEIGHT_RANGE_KG = (20.0, 300.0)
@@ -284,17 +283,18 @@ def _entry_values(
     if drink is not None:
         if data.get("food_id") is not None:
             raise InputError("an entry is a saved food or a drink, not both")
+        _no_nutrients_with_a_recipe(data)
         recipe, per_bottle = bottle(drink)
-        bottles = _amount(drink.get("bottles", data.get("servings", 1.0)), "bottles", positive=True) or 1.0
-        given = {n: _amount(data[n], n) for n in NUTRIENTS if n in data}
-        nutrients = {n: (v * bottles if v is not None else None) for n, v in per_bottle.items()}
+        default_bottles = data.get("servings", existing["servings"] if existing else 1.0)
+        bottles = _amount(drink.get("bottles", default_bottles), "bottles", positive=True) or 1.0
+        nutrients = {n: (round(v * bottles, 2) if v is not None else None) for n, v in per_bottle.items()}
         return {
             **_common(conn, data, existing),
             "meal": meal,
             "food_id": None,
-            "name": _text(data.get("name"), "name") or "Bottle",
+            "name": _text(data.get("name"), "name") or (existing["name"] if existing else "Bottle"),
             "servings": bottles,
-            **{**nutrients, **given},
+            **nutrients,
             "kind": "drink",
             "recipe": json.dumps(recipe),
         }
@@ -315,13 +315,17 @@ def _entry_values(
         # A food entry, or a bottle edited without its recipe: the totals follow the servings (bottles).
         per_unit = existing["food_id"] is not None or existing.get("kind") == "drink"
         ratio = servings / existing["servings"] if per_unit and existing["servings"] else 1.0
-        base = {n: (existing[n] * ratio if existing[n] is not None else None) for n in NUTRIENTS}
+        base = {n: (round(existing[n] * ratio, 2) if existing[n] is not None else None) for n in NUTRIENTS}
     nutrients = {**base, **given}
 
     name = _text(data.get("name"), "name", required=food is None and not existing) or (
         food["name"] if food else existing["name"] if existing else None
     )
-    keeps_recipe = existing is not None and existing.get("kind") == "drink" and food is None
+    # A bottle edited without a recipe stays a bottle (its totals follow the bottle count) unless
+    # "drink": null says it is now a food.
+    keeps_recipe = existing is not None and existing.get("kind") == "drink" and food is None and "drink" not in data
+    if keeps_recipe:
+        _no_nutrients_with_a_recipe(data)
     return {
         **_common(conn, data, existing),
         "meal": meal,
@@ -332,6 +336,15 @@ def _entry_values(
         "kind": "drink" if keeps_recipe else "food",
         "recipe": json.dumps(existing["recipe"]) if keeps_recipe and existing and existing.get("recipe") else None,
     }
+
+
+def _no_nutrients_with_a_recipe(data: Mapping[str, Any]) -> None:
+    sent = [n for n in NUTRIENTS if n in data]
+    if sent:
+        raise InputError(
+            f"a bottle's nutrients come from its recipe (got {', '.join(sent)}): send a new drink, "
+            'or "drink": null to make the entry a food'
+        )
 
 
 def _common(conn: sqlite3.Connection, data: Mapping[str, Any], existing: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -402,7 +415,7 @@ def same_workout(conn: sqlite3.Connection, source: str, source_id: str) -> list[
     within ``queries.DEDUPE_WINDOW_S`` of it (how the activity lists merge duplicates). Entries
     and calories may sit on any copy, and which copy a list shows can change after an import."""
     row = conn.execute(
-        "SELECT source, source_id, start_time, calories FROM activities WHERE source = ? AND source_id = ?",
+        "SELECT source, source_id, start_time, calories, duration_s FROM activities WHERE source = ? AND source_id = ?",
         (source, source_id),
     ).fetchone()
     if row is None:
@@ -413,7 +426,8 @@ def same_workout(conn: sqlite3.Connection, source: str, source_id: str) -> list[
         return copies
     window = timedelta(seconds=queries.DEDUPE_WINDOW_S)
     for other in conn.execute(
-        "SELECT source, source_id, start_time, calories FROM activities WHERE local_date BETWEEN ? AND ? AND source != ?",
+        "SELECT source, source_id, start_time, calories, duration_s FROM activities WHERE local_date BETWEEN ? AND ? "
+        "AND source != ?",
         ((start - timedelta(days=1)).date().isoformat(), (start + timedelta(days=1)).date().isoformat(), source),
     ):
         ts = parse_ts(other["start_time"])
@@ -452,14 +466,22 @@ def _weight(value: Any, field: str) -> float | None:
     return kg
 
 
+_KEEP = object()
+
+
 def set_workout_weight(
-    conn: sqlite3.Connection, source: str, source_id: str, pre_kg: Any, post_kg: Any, note: Any = None
+    conn: sqlite3.Connection, source: str, source_id: str, pre_kg: Any, post_kg: Any, note: Any = _KEEP
 ) -> dict[str, Any] | None:
-    """Save (or, with neither weight, clear) a workout's before and after weights; None if no such workout."""
+    """Save (or, with neither weight, clear) a workout's before and after weights; None if no such
+    workout. The note is kept unless one is given."""
     copies = same_workout(conn, source, source_id)
     if not copies:
         return None
     pre, post = _weight(pre_kg, "pre_kg"), _weight(post_kg, "post_kg")
+    if note is _KEEP:
+        note = (get_workout_weight(conn, source, source_id) or {}).get("note")
+    elif note is not None and pre is None and post is None:
+        raise InputError("a note needs a weight before or after the workout")
     with conn:
         # One row per workout, whichever copy it was saved on.
         for c in copies:
@@ -617,7 +639,8 @@ def workout_fueling(conn: sqlite3.Connection, source: str, source_id: str) -> di
     share = carb_share(intensity) if intensity else None
     carbs_burned = round(burned * share / KCAL_PER_G_CARB) if burned and share else None
     weight = get_workout_weight(conn, source, source_id)
-    elapsed = row.get("duration_s") or seconds
+    # The longest elapsed time any service recorded (some copies have none, or only timer time).
+    elapsed = max([c["duration_s"] for c in same_workout(conn, source, source_id) if c.get("duration_s")] or [seconds])
     return {
         "activity": {"source": source, "source_id": source_id, "name": activity.get("name"),
                      "local_date": activity["local_date"], "moving_s": seconds or None},  # fmt: skip
