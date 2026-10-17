@@ -4,7 +4,7 @@
   body-weight measurement on or before its day.
 - **Durability** (fatigue resistance): the best 1-, 5- and 20-minute power *after* the
   ride had already done 10, 20, 30 ... kJ/kg of work (1000, 2000 ... kJ without a body
-  weight), next to the same efforts from the start. Professionals' best efforts fall
+  weight; finer steps for a ride with less work), next to the same efforts from the start. Professionals' best efforts fall
   progressively with accumulated work, most clearly beyond about 20 kJ/kg, and how
   little they fall separates riders that fresh power does not (Mateo-March et al.
   2022 and 2025; Spragg et al. 2024).
@@ -49,8 +49,11 @@ from .queries import downsample, get_activity, sport_family
 log = logging.getLogger(__name__)
 
 DURABILITY_DURATIONS_S = (60, 300, 1200)
-DURABILITY_STEP_KJ_KG = 10
-DURABILITY_STEP_KJ = 1000  # without a body weight
+# Step sizes, finest first: the coarsest that still gives DURABILITY_MIN_STEPS steps after the start is used, so a
+# two-hour ride is not just "start" and "after 1000 kJ" while long rides keep the research's 10 kJ/kg steps.
+DURABILITY_STEPS_KJ_KG = (2.5, 5, 10)
+DURABILITY_STEPS_KJ = (250, 500, 1000)  # without a body weight
+DURABILITY_MIN_STEPS = 4
 DURABILITY_MAX_STEPS = 6
 DEFAULT_W_PRIME_J = 20000.0
 MATCH_J = 2000.0
@@ -100,8 +103,9 @@ def durability(power: np.ndarray, weight_kg: float | None) -> dict[str, Any] | N
         return None
     work = np.cumsum(power)  # J done by the end of each second
     per = weight_kg * 1000 if weight_kg else 1000.0  # J per unit (kJ/kg or kJ)
-    step = DURABILITY_STEP_KJ_KG if weight_kg else DURABILITY_STEP_KJ
+    sizes = DURABILITY_STEPS_KJ_KG if weight_kg else DURABILITY_STEPS_KJ
     total = work[-1] / per
+    step = next((x for x in reversed(sizes) if total >= DURABILITY_MIN_STEPS * x), sizes[0])
     steps = [k * step for k in range(DURABILITY_MAX_STEPS) if k * step <= total]
     sums = np.concatenate(([0.0], work))
     rows = []
