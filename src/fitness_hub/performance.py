@@ -300,15 +300,15 @@ def _ride(rides: _Rides, i: int, component: str) -> dict[str, Any]:
     return out
 
 
-def _split(ride: dict[str, Any], before: dict[str, Any] | None) -> dict[str, float] | None:
-    """How much of a new best came from power and how much from weight, against the previous best ride
-    of the window: ``{power_pct, weight_pct}`` (weight_pct > 0: lighter), whose product is the W/kg change."""
-    if not before or not ride.get("watts") or not before.get("watts") or not ride.get("kg") or not before.get("kg"):
+def _split(change: float, kg: float | None, before_kg: float | None) -> dict[str, float] | None:
+    """How much of a W/kg rise (``change``: new / previous value) came from weight and how much from
+    power, against the weight of the ride the previous value rested on: ``{power_pct, weight_pct}``
+    (weight_pct > 0: lighter); (1 + power) x (1 + weight) = change. The power part includes what the
+    previous value had eased by."""
+    if not kg or not before_kg:
         return None
-    return {
-        "power_pct": round(100 * (ride["watts"] / before["watts"] - 1), 1),
-        "weight_pct": round(100 * (before["kg"] / ride["kg"] - 1), 1),
-    }
+    weight = before_kg / kg
+    return {"power_pct": round(100 * (change / weight - 1), 1), "weight_pct": round(100 * (weight - 1), 1)}
 
 
 def _efficiency(conn: sqlite3.Connection) -> list[tuple[str, float]]:
@@ -343,7 +343,7 @@ def raw_timeline(conn: sqlite3.Connection, decay_per_week: float, end: str | Non
     last = end or date.today().isoformat()
     daily = (1 - decay_per_week) ** (1 / 7)
     values: dict[str, float | None] = dict.fromkeys(COMPONENTS)
-    basis: dict[str, str | None] = dict.fromkeys(COMPONENTS)  # the weight kind of the ride the value rests on
+    basis: dict[str, int | None] = dict.fromkeys(COMPONENTS)  # the ride each value rests on
     out_days, events = [], []
     for day in _days(rides.dates[0], max(last, rides.dates[0])):
         start = (date.fromisoformat(day) - timedelta(days=WINDOW_DAYS - 1)).isoformat()
@@ -357,18 +357,20 @@ def raw_timeline(conn: sqlite3.Connection, decay_per_week: float, end: str | Non
             measured = measures[c]
             value = max(v for v in (measured, decayed) if v is not None) if measured or decayed else None
             # A rise is a new best above yesterday's value (not just above where it would have eased to).
-            if measured is not None and (decayed is None or measured >= decayed):
-                best = _best_index(rides, lo, hi, c)
-                basis[c] = rides.weight_kind[best] if best is not None and c != "durability" else None
             if previous and value and measured and measured > previous * (1 + RISE_SHARE) and today < hi:
                 best_today = _best_index(rides, today, hi, c)
                 ride = _ride(rides, best_today, c) if best_today is not None else None
-                earlier = _best_index(rides, lo, today, c)
-                before = _ride(rides, earlier, c) if earlier is not None else None
+                before = basis[c]
+                split = None
+                if ride and c != "durability" and before is not None and not np.isnan(rides.kg[before]):
+                    split = _split(value / previous, ride["kg"], float(rides.kg[before]))
                 events.append({"date": day, "component": c, "from": previous, "to": value, "ride": ride,
-                               "split": _split(ride, before) if ride and c != "durability" else None})  # fmt: skip
+                               "split": split})  # fmt: skip
+            if measured is not None and (decayed is None or measured >= decayed):
+                basis[c] = _best_index(rides, lo, hi, c)
             values[c] = value
-            row["basis"][c] = basis[c]
+            kind = rides.weight_kind[basis[c]] if basis[c] is not None and c != "durability" else None
+            row["basis"][c] = kind
             row["values"][c] = value
             row["tested"][c] = _last_tested(rides, lo, hi, c, value)
         out_days.append(row)

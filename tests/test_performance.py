@@ -177,7 +177,10 @@ def test_power_is_per_kg_of_each_rides_weight(store: Store) -> None:
     light_kg = rise["ride"]["kg"]  # the trend weight of that day: on its way from 80 to 70 kg
     assert 70 < light_kg < 80 and rise["ride"]["watts"] == pytest.approx(294)
     assert days[day(10)]["values"]["vo2max"] == pytest.approx(294 / light_kg, abs=0.001)
-    assert rise["split"] == {"power_pct": -2.0, "weight_pct": pytest.approx(100 * (80 / light_kg - 1), abs=0.05)}
+    weight = 80 / light_kg  # against the heavy ride the previous value rested on
+    assert rise["split"]["weight_pct"] == pytest.approx(100 * (weight - 1), abs=0.05)
+    change = rise["to"] / rise["from"]  # power x weight = the W/kg change (power includes 10 days of easing)
+    assert (1 + rise["split"]["power_pct"] / 100) * weight == pytest.approx(change, abs=0.002)
     # Durability is a ratio of watts: weight cancels.
     assert days[day(10)]["values"]["durability"] is None or days[day(10)]["values"]["durability"] <= 1
 
