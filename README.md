@@ -245,9 +245,10 @@ heart rate, temperature and the work done before them, and each **HR recovery** 
   differently (another power meter, a fan), heat raises heart rate, and **fatigue lowers it**, which would
   otherwise pass for fitness. The three effects are fitted from how far each ride is from the rides within 14 days of
   it, together, until they settle (so a season of fitness is not taken for heat or form). On the author's history:
-  indoors -5.3 bpm, +0.6 bpm per °C above 25 °C, 0.17 bpm per point of TSB (5 bpm in a hard block);
+  indoors -4.7 bpm, +0.6 bpm per °C above 25 °C, 0.17 bpm per point of TSB (5 bpm in a hard block);
   `fitness-hub cardio --backtest` shows each correction lowering the error of predicting a ride from the 42 days
-  before it, from 4.9 bpm to 4.1 with all three. Indoor means no GPS, a virtual or indoor sport, Strava's trainer
+  before it, from 4.8 bpm to 4.1 with all three. A ride still more than 20 bpm from the rides around it once
+  corrected (a strap reading half) is flagged and left out. Indoor means no GPS, a virtual or indoor sport, Strava's trainer
   flag, or trainer gear (a KICKR ride stored as a plain "Ride").
 - **Components**, each day: *aerobic* (median over 42 days, at least 5 rides), as heart rate at the reference power
   and as power at the reference heart rate; *resting heart rate* (median of the daily values over 7 days, from

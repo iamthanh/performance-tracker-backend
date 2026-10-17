@@ -353,3 +353,14 @@ def test_corrections_with_slow_form_and_a_fixed_effect() -> None:
     found, fitted = C.fit_corrections(days, raw, np.zeros(n, dtype=bool), heat, form)
     assert found["form"] == pytest.approx(0.15, abs=0.03) and found["heat"] == pytest.approx(0.5, abs=0.08)
     assert found["indoor"] == C.DEFAULTS["indoor"] and not fitted["indoor"]  # no indoor rides: its default
+
+
+def test_a_ride_far_from_the_others_is_a_sensor_problem(store: Store) -> None:
+    for i in range(12):
+        add_ride(store, str(i), day(i), 150.0 + (i % 3))
+    add_ride(store, "strap", day(6), 75.0)  # a strap reading half
+    result = C.cardio(store.conn, end_date=day(11))
+    rides = {r["source_id"]: r for r in result["rides"]}
+    assert rides["strap"]["outlier"] and rides["strap"]["bpm"] is None and rides["strap"]["raw_bpm"] == 75.0
+    assert not rides["5"]["outlier"] and result["model"]["outliers"] == 1
+    assert result["days"][-1]["hr_at_ref"] == pytest.approx(151.0, abs=0.1)  # the median of the rest

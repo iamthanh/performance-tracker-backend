@@ -4,7 +4,7 @@ The fitter the aerobic system, the fewer beats it takes to deliver the same powe
 volume, more blood, more mitochondria). Raw heart rate moves with much else, so every value is put
 on the same footing first. The figures in brackets are from the author's 1,582 rides with both
 power and heart rate, where each correction lowered the error of predicting a ride from the ones
-before it (``backtest``: from 4.9 to 4.1 bpm).
+before it (``backtest``: from 4.8 to 4.1 bpm).
 
 - **Steady riding only** (``steady``): 5 min blocks of even power, after 3 min at that power (heart
   rate settles with a time constant of about a minute), from ``WARMUP_S`` into the ride (earlier
@@ -17,7 +17,7 @@ before it (``backtest``: from 4.9 to 4.1 bpm).
   are fitted within rides (each ride its own level), over all of them.
 - **The same conditions**: a ride's value (the median of its blocks) is corrected to outdoors,
   ``HEAT_FROM_C`` or cooler and fresh (form, TSB, of 0): indoor rides read differently (another
-  power meter, a fan) [5 bpm lower]; heat raises heart rate above ``HEAT_FROM_C`` [0.6 bpm per
+  power meter, a fan) [4.7 bpm lower]; heat raises heart rate above ``HEAT_FROM_C`` [0.6 bpm per
   degree, by the device's temperature]; and fatigue *lowers* it [0.18 bpm per point of TSB below 0:
   5 bpm in a hard block], which would otherwise read as fitness. Each effect is fitted to how
   far each ride is from the rides within ``NEIGHBOUR_DAYS`` of it (so a season of fitness does not
@@ -98,6 +98,9 @@ REFERENCE_ROUND_W = 5
 DRIFT_CAP_KJ = 1500.0
 DRIFT_REF_KJ = 500.0
 MIN_RIDE_BLOCKS = 2
+# A ride this far from the rides around it once corrected is a sensor problem (a strap reading half), not
+# fitness: day-to-day scatter is about 6 bpm. Such rides are shown, flagged, and left out of the index and the fit.
+OUTLIER_BPM = 20.0
 MIN_SLOPE_RIDE_BLOCKS = 3
 MIN_FIT_BLOCKS = 200
 HEAT_FROM_C = 25.0
@@ -211,6 +214,7 @@ class _Ride:
     temp_c: float | None = None  # average over the blocks used
     used: list[int] = field(default_factory=list)  # blocks in the aerobic value
     raw_bpm: float | None = None  # median of the used blocks at the reference power and work
+    outlier: bool = False  # corrected, far from the rides around it (OUTLIER_BPM): left out
     bpm: float | None = None  # corrected to outdoors, cool and fresh
     recovery: float | None = None  # median corrected drop
     recovery_count: int = 0
@@ -274,6 +278,7 @@ class Model:
     recovery: tuple[float, float]
     rides: int = 0
     blocks: int = 0
+    outliers: int = 0
 
     def correction(self, ride: _Ride) -> dict[str, float]:
         """What each condition added to the ride's heart rate (bpm; subtracted to correct it)."""
@@ -296,6 +301,7 @@ class Model:
             "fitted": self.fitted,
             "rides": self.rides,
             "blocks": self.blocks,
+            "outliers": self.outliers,
         }  # fmt: skip
 
 
@@ -442,12 +448,27 @@ def build(conn: sqlite3.Connection, settings: Mapping[str, Any] | None = None) -
         _ride_value(ride, model)
         _ride_drift(ride)
     valued = [r for r in rides if r.raw_bpm is not None]
-    days = np.array([date.fromisoformat(r.date).toordinal() for r in valued], dtype=float)
-    corrections, fitted = fit_corrections(
-        days, np.array([r.raw_bpm for r in valued], dtype=float), np.array([r.indoor for r in valued]),
-        np.array([r.heat() for r in valued], dtype=float), np.array([r.tsb for r in valued], dtype=float),
-    )  # fmt: skip
-    model.corrections, model.fitted, model.rides = corrections, {**model.fitted, **fitted}, len(valued)
+
+    def fit(group: list[_Ride]) -> tuple[dict[str, float], dict[str, bool]]:
+        days = np.array([date.fromisoformat(r.date).toordinal() for r in group], dtype=float)
+        return fit_corrections(
+            days, np.array([r.raw_bpm for r in group], dtype=float), np.array([r.indoor for r in group]),
+            np.array([r.heat() for r in group], dtype=float), np.array([r.tsb for r in group], dtype=float),
+        )  # fmt: skip
+
+    # Fit, flag the rides still far from their neighbours once corrected (a hot ride is not an outlier),
+    # and fit again without them.
+    model.corrections, fitted = fit(valued)
+    corrected = np.array(
+        [r.raw_bpm - sum(model.correction(r).values()) for r in valued], dtype=float  # type: ignore[operator]
+    )
+    ordinals = np.array([date.fromisoformat(r.date).toordinal() for r in valued], dtype=float)
+    for ride, value, base in zip(valued, corrected, _neighbour_bases(ordinals, corrected), strict=True):
+        ride.outlier = bool(np.isfinite(base) and abs(value - base) > OUTLIER_BPM)
+    valued = [r for r in valued if not r.outlier]
+    model.corrections, fitted = fit(valued)
+    model.fitted, model.rides = {**model.fitted, **fitted}, len(valued)
+    model.outliers = sum(r.outlier for r in rides)
     for ride in valued:
         ride.bpm = ride.raw_bpm - sum(model.correction(ride).values())  # type: ignore[operator]
     events = _recovery_events(rides, conn)
@@ -507,6 +528,7 @@ def _ride_out(ride: _Ride, model: Model) -> dict[str, Any]:
         **ride.ref, "indoor": ride.indoor, "temp_c": None if ride.temp_c is None else round(ride.temp_c, 1),
         "tsb": round(ride.tsb, 1), "blocks": len(ride.used),
         "raw_bpm": None if ride.raw_bpm is None else round(ride.raw_bpm, 1),
+        "outlier": ride.outlier,
         "bpm": None if ride.bpm is None else round(ride.bpm, 1),
         "power_w": None if ride.bpm is None else round(model.power_at(ride.bpm), 1),
         "corrections": {k: round(v, 1) + 0.0 for k, v in model.correction(ride).items()},  # never -0.0
@@ -604,7 +626,8 @@ def cardio(conn: sqlite3.Connection, start_date: str | None = None, end_date: st
         c["baseline"] = None if baselines[c["key"]] is None else round(baselines[c["key"]], 2)
     in_range = [
         _ride_out(r, model) for r in rides
-        if (r.bpm is not None or r.recovery is not None) and (not start_date or r.date >= start_date) and r.date <= end
+        if (r.raw_bpm is not None or r.recovery is not None)
+        and (not start_date or r.date >= start_date) and r.date <= end
     ]  # fmt: skip
     return {**meta, "model": model.as_dict(), "days": days, "rides": in_range}
 
@@ -677,7 +700,7 @@ def backtest(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     model, rides = build(conn)
     if model is None:
         return []
-    valued = [r for r in rides if r.raw_bpm is not None]
+    valued = [r for r in rides if r.raw_bpm is not None and not r.outlier]
     days = np.array([date.fromisoformat(r.date).toordinal() for r in valued])
     raw = np.array([r.raw_bpm for r in valued], dtype=float)
     columns = np.array([(r.indoor, r.heat(), r.tsb) for r in valued], dtype=float)
