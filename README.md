@@ -196,6 +196,17 @@ saved foods (`foods`) make it one tap. There is no importer yet.
   recovery pace, two thirds at IF 0.75, nearly all near threshold (the crossover concept, for a rider who has eaten;
   fasted riders burn more fat). It errs high, toward eating more, and is for comparing with what you ate, not a
   measurement.
+- **Drinks during a workout are bottles with a recipe.** You give the number of bottles and what one bottle holds:
+  - water (ml);
+  - table salt (g; 1 g ≈ 393 mg of sodium);
+  - maltodextrin and sucrose (g);
+  - any other ingredients, each with its own carbs, sodium and caffeine (e.g. sodium citrate, a caffeine powder).
+  
+  The entry keeps the recipe (`kind = drink`, `recipe` JSON) and stores the totals: fluid, carbs, sugars, sodium,
+  caffeine and 4 kcal per gram of carbs. A workout's fueling adds the bottles' ingredients up and gives the
+  glucose:fructose split: maltodextrin is glucose, sucrose is half glucose and half fructose.
+- **Body weight before and after** a workout (`workout_weights`, `PUT /api/activities/{source}/{id}/weight`) gives
+  the weight change, % of body weight, and the sweat rate: weight lost plus fluid drunk, per hour of elapsed time.
 - **Editing an entry** keeps its nutrients unless you send new ones; changing the servings of a saved-food entry
   scales them, and pointing it at another food refills them from that food. An entry linked to a workout counts for
   that workout whichever service's copy of it you linked.
@@ -415,7 +426,8 @@ Reads use read-only connections. Writes are threshold overrides, which re-score 
 | `GET /api/nutrition/entries?start_date&end_date&activity_source&activity_source_id` | What was eaten and drunk, by dates and/or for one workout |
 | `POST /api/nutrition/entries`, `PUT /api/nutrition/entries/{id}`, `DELETE …/{id}` | Log, replace or delete an entry |
 | `GET /api/nutrition/daily?start_date&end_date` | Per day: intake totals, workout kcal, the watch's total and active kcal, balance |
-| `GET /api/activities/{source}/{id}/fueling` | A workout's fueling: totals and per-hour rates against energy and (estimated) carbs burned |
+| `GET /api/activities/{source}/{id}/fueling` | A workout's fueling: totals and per-hour rates against energy and (estimated) carbs burned; bottles' ingredients and glucose:fructose; weights and sweat rate |
+| `PUT /api/activities/{source}/{id}/weight` `{pre_kg, post_kg, note?}` | Body weight before and after the workout (neither clears them) |
 
 Errors return `{"detail": …}`:
 
@@ -509,7 +521,8 @@ local clock. Every row keeps the provider payload in `raw` and an `updated_at` s
 | `power_curve` | `(source, source_id, duration_s)` | `watts`: the best average power over `duration_s` in that activity |
 | `athlete_settings` | `(metric, effective_date, origin)` | `value, note`. Metrics `ftp_w, threshold_hr, max_hr, resting_hr`; origin `manual` or `auto` (see Training analysis for how they combine) |
 | `foods` | `id` | `name, brand, serving` and nutrients **per serving**: `kcal, carbs_g, sugars_g, protein_g, fat_g, fiber_g, sodium_mg, potassium_mg, caffeine_mg, fluid_ml`; `note, archived` |
-| `nutrition_entries` | `id` (and `(source, source_id)` for imports) | `local_date, consumed_at, meal` (`breakfast, lunch, dinner, snack, pre_workout, during_workout, post_workout`), `activity_source, activity_source_id, offset_s` (the workout it fuelled, seconds into it), `food_id, name, servings`, the same nutrients as **totals for the entry**, `note` |
+| `nutrition_entries` | `id` (and `(source, source_id)` for imports) | `local_date, consumed_at, meal` (`breakfast, lunch, dinner, snack, pre_workout, during_workout, post_workout`), `activity_source, activity_source_id, offset_s` (the workout it fuelled, seconds into it), `food_id, name, servings` (bottles, for a drink), the same nutrients as **totals for the entry**, `note`, `kind` (`food` or `drink`), `recipe` (one bottle, JSON) |
+| `workout_weights` | `(source, source_id)` | `pre_kg, post_kg, note`: body weight before and after the workout |
 
 **Schema versions.** The version is kept in `PRAGMA user_version`. Opening the database applies any missing migrations
 (`db.MIGRATIONS`), each in one transaction. A database created before versioning counts as version 1, and a database

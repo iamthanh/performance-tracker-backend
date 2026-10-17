@@ -37,7 +37,7 @@ def store(settings: Settings):
 
 
 def test_schema_has_the_nutrition_tables(store: Store) -> None:
-    assert schema_version(store.conn) == SCHEMA_VERSION == 4
+    assert schema_version(store.conn) == SCHEMA_VERSION == 5
     tables = {r[0] for r in store.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"foods", "nutrition_entries"} <= tables
 
@@ -274,7 +274,7 @@ def test_archived_foods_are_hidden_unless_asked(store: Store) -> None:
     assert {f["id"] for f in nutrition.list_foods(store.conn, include_archived=True)} == {kept["id"], gone["id"]}
 
 
-def test_a_v3_database_with_data_migrates_to_v4(tmp_path) -> None:
+def test_a_v3_database_with_data_migrates_to_the_latest(tmp_path) -> None:
     import sqlite3
 
     from fitness_hub.db import MIGRATIONS, SCHEMA
@@ -291,7 +291,7 @@ def test_a_v3_database_with_data_migrates_to_v4(tmp_path) -> None:
     conn.commit()
     conn.close()
     with Store(path) as migrated:
-        assert schema_version(migrated.conn) == 4 and migrated.row_counts()["activities"] == 1
+        assert schema_version(migrated.conn) == 5 and migrated.row_counts()["activities"] == 1
         assert nutrition.save_entry(migrated.conn, {"local_date": "2026-10-12", "meal": "during_workout",
                                                     "name": "Gel", "activity_source": "strava",
                                                     "activity_source_id": "1"})  # fmt: skip
@@ -321,3 +321,105 @@ def test_workouts_report_kcal_burned(store: Store) -> None:
     weeks = queries.period_totals(store.conn, "2026-10-12", "2026-10-14", "week")["periods"]
     assert weeks[0]["total"]["kcal"] == pytest.approx(1440 + 1500 + 600)
     assert weeks[0]["by_sport"]["running"]["kcal"] == 600
+
+
+# -- drinks (bottles with a recipe) and body weight ------------------------------------------------
+
+MIX_BOTTLE = {"water_ml": 750, "salt_g": 1.5, "maltodextrin_g": 60, "sucrose_g": 30,
+              "other": [{"name": "Caffeine powder", "grams": 0.1, "caffeine_mg": 100}]}  # fmt: skip
+
+
+def test_a_bottle_recipe_becomes_totals(store: Store) -> None:
+    ride(store)
+    analyze(store)
+    link = {"local_date": "2026-10-12", "meal": "during_workout", "activity_source": "strava", "activity_source_id": "1"}
+    entry = nutrition.save_entry(store.conn, {**link, "drink": {**MIX_BOTTLE, "bottles": 2}})
+    assert entry and entry["kind"] == "drink" and entry["name"] == "Bottle" and entry["servings"] == 2
+    assert entry["recipe"]["salt_g"] == 1.5 and entry["recipe"]["other"][0]["name"] == "Caffeine powder"
+    assert entry["fluid_ml"] == 1500 and entry["carbs_g"] == 180 and entry["sugars_g"] == 60
+    assert entry["sodium_mg"] == pytest.approx(2 * 1.5 * 393.4) and entry["caffeine_mg"] == 200
+    assert entry["kcal"] == 720  # 4 kcal per gram of carbs
+    # Edited without its recipe: one bottle fewer scales the totals; the recipe stays.
+    fewer = nutrition.save_entry(store.conn, {**link, "servings": 1}, entry["id"])
+    assert fewer and fewer["kind"] == "drink" and fewer["carbs_g"] == 90 and fewer["recipe"]["maltodextrin_g"] == 60
+    # A new recipe recomputes everything.
+    water = nutrition.save_entry(store.conn, {**link, "drink": {"water_ml": 500, "bottles": 1}}, entry["id"])
+    assert water and water["fluid_ml"] == 500 and water["carbs_g"] is None and water["sodium_mg"] is None
+
+    fueling = nutrition.workout_fueling(store.conn, "strava", "1")
+    assert fueling and fueling["drinks"]["bottles"] == 1 and fueling["drinks"]["water_ml"] == 500
+
+
+def test_drink_summary_splits_glucose_and_fructose(store: Store) -> None:
+    ride(store)
+    analyze(store)
+    link = {"local_date": "2026-10-12", "meal": "during_workout", "activity_source": "strava", "activity_source_id": "1"}
+    nutrition.save_entry(store.conn, {**link, "drink": {**MIX_BOTTLE, "bottles": 2}})
+    nutrition.save_entry(store.conn, {**link, "name": "Gel", "carbs_g": 25})  # food: not a bottle
+    drinks = nutrition.workout_fueling(store.conn, "strava", "1")["drinks"]  # type: ignore[index]
+    assert drinks == {"bottles": 2, "water_ml": 1500, "salt_g": 3, "maltodextrin_g": 120, "sucrose_g": 60,
+                      "other_carbs_g": 0, "glucose_g": 150, "fructose_g": 30, "fructose_per_glucose": 0.2}  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("drink", "message"),
+    [
+        ({}, "at least one ingredient"),
+        ({"water_ml": -1}, "zero or more"),
+        ({"water_ml": 500, "other": [{"grams": 2}]}, "other\\[0\\].name is required"),
+        ({"water_ml": 500, "other": "salt"}, "must be a list"),
+        ({"water_ml": 500, "bottles": 0}, "bottles must be positive"),
+    ],
+)
+def test_drink_validation(store: Store, drink: dict, message: str) -> None:
+    with pytest.raises(InputError, match=message):
+        nutrition.save_entry(store.conn, {"local_date": "2026-10-12", "meal": "during_workout", "drink": drink})
+
+
+def test_an_entry_is_a_food_or_a_drink(store: Store) -> None:
+    gel = nutrition.save_food(store.conn, GEL)
+    assert gel
+    with pytest.raises(InputError, match="not both"):
+        nutrition.save_entry(store.conn, {"local_date": "2026-10-12", "meal": "snack", "food_id": gel["id"],
+                                          "drink": {"water_ml": 500}})  # fmt: skip
+
+
+def test_workout_weight_and_sweat_rate(store: Store) -> None:
+    ride(store, "s1")  # 2 h
+    store.upsert_activities([{"source": "garmin", "source_id": "g1", "start_time": "2026-10-12T16:00:40Z",
+                              "local_date": "2026-10-12", "activity_type": "cycling", "raw": {}}])  # fmt: skip
+    analyze(store)
+    assert nutrition.set_workout_weight(store.conn, "strava", "nope", 70, 69) is None
+    saved = nutrition.set_workout_weight(store.conn, "garmin", "g1", 72.0, 70.8, "hot day")
+    assert saved and saved["pre_kg"] == 72 and saved["post_kg"] == 70.8
+    link = {"local_date": "2026-10-12", "meal": "during_workout", "activity_source": "strava", "activity_source_id": "s1"}
+    nutrition.save_entry(store.conn, {**link, "drink": {"water_ml": 750, "bottles": 2}})
+    fueling = nutrition.workout_fueling(store.conn, "strava", "s1")  # the weights were saved on the Garmin copy
+    assert fueling and fueling["weight"]["pre_kg"] == 72
+    sweat = fueling["sweat"]
+    assert sweat["change_kg"] == pytest.approx(-1.2) and sweat["change_pct"] == pytest.approx(-1.67, abs=0.01)
+    assert sweat["sweat_l"] == pytest.approx(1.2 + 1.5) and sweat["sweat_l_per_h"] == pytest.approx(2.7 / 2, abs=0.01)
+    # Saving on another copy replaces it (one row per workout); saving neither clears.
+    nutrition.set_workout_weight(store.conn, "strava", "s1", 72.0, None)
+    assert store.conn.execute("SELECT COUNT(*) FROM workout_weights").fetchone()[0] == 1
+    assert nutrition.workout_fueling(store.conn, "strava", "s1")["sweat"] is None  # type: ignore[index]
+    nutrition.set_workout_weight(store.conn, "strava", "s1", None, None)
+    assert nutrition.get_workout_weight(store.conn, "strava", "s1") is None
+    with pytest.raises(InputError, match="between 20 and 300 kg"):
+        nutrition.set_workout_weight(store.conn, "strava", "s1", 720, 71)
+
+
+def test_api_drinks_and_weight(client: TestClient) -> None:
+    link = {"local_date": "2026-10-12", "meal": "during_workout", "activity_source": "strava", "activity_source_id": "1"}
+    made = client.post("/api/nutrition/entries", json={**link, "drink": {**MIX_BOTTLE, "bottles": 2}})
+    assert made.status_code == 201 and made.json()["carbs_g"] == 180 and made.json()["recipe"]["sucrose_g"] == 30
+    assert client.post("/api/nutrition/entries", json={**link, "drink": {"water_ml": "500"}}).status_code == 422
+    assert client.post("/api/nutrition/entries", json={**link, "drink": {"bottles": 0, "water_ml": 1}}).status_code == 422
+    weight = client.put("/api/activities/strava/1/weight", json={"pre_kg": 72.0, "post_kg": 71})
+    assert weight.status_code == 200 and weight.json()["post_kg"] == 71
+    assert client.put("/api/activities/strava/1/weight", json={"pre_kg": 5}).status_code == 422
+    assert client.put("/api/activities/strava/nope/weight", json={"pre_kg": 70}).status_code == 404
+    fueling = client.get("/api/activities/strava/1/fueling").json()
+    assert fueling["sweat"]["change_kg"] == -1 and fueling["drinks"]["bottles"] == 2
+    evil = client.put("/api/activities/strava/1/weight", json={"pre_kg": 70}, headers={"Origin": "https://evil.example"})
+    assert evil.status_code == 403

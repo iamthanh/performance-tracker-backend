@@ -98,6 +98,37 @@ class FoodIn(Nutrients):
     archived: bool = False
 
 
+class OtherIngredient(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    name: str = Field(min_length=1, max_length=100)
+    grams: Amount = None
+    carbs_g: Amount = None
+    sodium_mg: Amount = None
+    caffeine_mg: Amount = None
+
+
+class DrinkIn(BaseModel):
+    """Bottles of sports drink: how many, and what ONE bottle holds."""
+
+    model_config = ConfigDict(strict=True)
+
+    bottles: float = Field(default=1.0, gt=0, le=50)
+    water_ml: Amount = None
+    salt_g: Amount = Field(default=None, description="Table salt; 1 g is 393 mg of sodium")
+    maltodextrin_g: Amount = None
+    sucrose_g: Amount = None
+    other: list[OtherIngredient] = Field(default_factory=list, max_length=20)
+
+
+class WeightIn(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+    pre_kg: Annotated[float | None, Field(ge=20, le=300)] = None
+    post_kg: Annotated[float | None, Field(ge=20, le=300)] = None
+    note: str | None = Field(default=None, max_length=1000)
+
+
 class EntryIn(Nutrients):
     local_date: str = Field(description="YYYY-MM-DD, the athlete's local date")
     meal: Meal
@@ -109,6 +140,7 @@ class EntryIn(Nutrients):
     activity_source_id: str | None = None
     offset_s: float | None = Field(default=None, ge=0, description="Seconds into the workout")
     note: str | None = Field(default=None, max_length=1000)
+    drink: DrinkIn | None = Field(default=None, description="Bottles with a recipe instead of a food")
 
 
 def _read(request: Request) -> Iterator[sqlite3.Connection]:
@@ -522,6 +554,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def nutrition_daily(conn: Conn, start_date: DateQuery = None, end_date: DateQuery = None) -> list[dict[str, Any]]:
         """Per day: intake totals, workout kcal, the watch's total and active kcal, and the balance."""
         return nutrition.daily_nutrition(conn, start_date or "", end_date or "")
+
+    @app.put("/api/activities/{source}/{source_id}/weight")
+    def set_weight(source: str, source_id: str, body: WeightIn) -> dict[str, Any]:
+        """Body weight just before and just after the workout (kg); send neither to clear them."""
+        with Store(settings.db_path) as store:
+            saved = nutrition.set_workout_weight(store.conn, source, source_id, body.pre_kg, body.post_kg, body.note)
+        if saved is None:
+            raise HTTPException(status_code=404, detail=f"no activity {source}/{source_id}")
+        return saved
 
     @app.get("/api/activities/{source}/{source_id}/fueling")
     def fueling(conn: Conn, source: str, source_id: str) -> dict[str, Any]:
