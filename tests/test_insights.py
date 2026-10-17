@@ -32,20 +32,31 @@ def intervals(reps: int = 3, on: int = 60, off: int = 120, hard: float = 350, ea
 
 
 def test_durability_by_kj_per_kg() -> None:
-    power = np.full(3600, 300.0)  # 1080 kJ: 14.4 kJ/kg at 75 kg
+    power = np.full(3600, 300.0)  # 1080 kJ: 14.4 kJ/kg at 75 kg, six 2.5 kJ/kg steps cover it
     result = durability(power, 75)
-    assert result is not None and result["unit"] == "kJ/kg" and result["steps"] == [0, 10] and result["total"] == 14.4
+    assert result is not None and result["unit"] == "kJ/kg" and result["total"] == 14.4
+    assert result["steps"] == [0, 2.5, 5, 7.5, 10, 12.5]
     rows = {r["duration_s"]: r["watts"] for r in result["rows"]}
     # 10 kJ/kg (750 kJ) is done after 2500 s: 1100 s are left, too few for 20 minutes.
-    assert rows == {60: [300, 300], 300: [300, 300], 1200: [300, None]}
+    assert rows[60] == [300] * 6 and rows[1200] == [300, 300, 300, 300, None, None]
+    # No step in the last half step of the ride: 13.6 kJ/kg leaves 12.5 out (0.4 kJ/kg after it).
+    assert durability(np.full(3400, 300.0), 75)["steps"] == [0, 2.5, 5, 7.5, 10]
+    # A long ride keeps the research's 10 kJ/kg steps (60 kJ/kg here, at most six steps) ...
+    assert durability(np.full(4 * 3600, 300.0), 72)["steps"] == [0, 10, 20, 30, 40, 50]
+    # ... and a mid-length one keeps its late steps (35 kJ/kg: 10 kJ/kg steps, not 5 cut off at 25).
+    assert durability(np.full(3600, 700.0), 72)["steps"] == [0, 10, 20, 30]
 
 
 def test_durability_shows_the_fade_and_counts_kj_without_a_weight() -> None:
     power = np.concatenate([np.full(1800, 400.0), np.full(9000, 250.0)])  # hard start, then steady
     result = durability(power, None)
-    assert result is not None and result["unit"] == "kJ" and result["steps"] == [0, 1000, 2000]
+    assert result is not None and result["unit"] == "kJ" and result["steps"] == [0, 500, 1000, 1500, 2000, 2500]
     five = next(r["watts"] for r in result["rows"] if r["duration_s"] == 300)
-    assert five == [400, 250, 250]  # the 720 kJ hard start is over before 1000 kJ
+    assert five == [400, 400, 250, 250, 250, 250]  # the 720 kJ hard start is over before 1000 kJ
+    # A two-hour ride of ~1400 kJ gets 250 kJ steps, not just "start" and "after 1000 kJ".
+    assert durability(np.full(7200, 195.0), None)["steps"] == [0, 250, 500, 750, 1000, 1250]
+    # Exactly 1000 kJ from float watts: 250 kJ steps, the last one dropped (nothing left after it).
+    assert durability(np.full(3000, 1000 / 3), None)["steps"] == [0, 250, 500, 750]
     assert durability(np.full(30, 200.0), 70) is None
 
 
