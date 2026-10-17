@@ -26,6 +26,7 @@ database (metres, seconds, watts, bpm) unless a field name says otherwise.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
 import sqlite3
@@ -234,6 +235,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     allowed_origins = {o.rstrip("/") for o in settings.api_cors_origins}
+    import_slot = asyncio.Semaphore(1)
     lan = is_lan_bind(settings.api_host)
     # Computed once: host names are looked up on every request.
     lan_names = machine_host_names() | {host_name(h).rstrip(".") for h in settings.api_allowed_hosts}
@@ -339,13 +341,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if len(body) > uploads.MAX_UPLOAD_BYTES:
                 raise HTTPException(status_code=413, detail=f"files up to {uploads.MAX_UPLOAD_BYTES // 1_000_000} MB")
 
+        data = bytes(body)
+        del body  # one copy of the file in memory, not two
+
         def run() -> dict[str, Any]:
             with Store(settings.db_path) as store:
                 return uploads.import_activity_file(
-                    store, filename, bytes(body), timezone=timezone, name=name, activity_type=activity_type
+                    store, filename, data, timezone=timezone, name=name, activity_type=activity_type
                 )
 
-        return await run_in_threadpool(run)
+        # One import at a time: each parses a file and runs the analysis, which two at once would
+        # repeat for each other (and memory would add up).
+        async with import_slot:
+            return await run_in_threadpool(run)
 
     @app.get("/api/activities/{source}/{source_id}")
     def activity(conn: Conn, source: str, source_id: str) -> dict[str, Any]:

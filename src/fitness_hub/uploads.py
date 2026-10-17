@@ -15,20 +15,24 @@ each other, and the import reports which ones it matched.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import queries
-from .activity_files import FileTooLarge, ParsedActivity, UnsupportedFile, parse_bytes, supported
+from .activity_files import FileTooLarge, ParsedActivity, UnsupportedFile, gunzip, parse_bytes, supported
 from .analysis import analyze
 from .db import Store
 from .util import InputError, parse_ts, utc_iso
 
+log = logging.getLogger(__name__)
+
 SOURCE = "upload"
 MAX_UPLOAD_BYTES = 50_000_000  # a long ride's FIT file is a few MB; a GPX with every extension maybe 20
-MAX_DECOMPRESSED_BYTES = 200_000_000
+MAX_DECOMPRESSED_BYTES = 60_000_000
+MAX_SPAN_S = 48 * 3600  # longer: a device clock that jumped (and a 1 Hz analysis of years)
 ELEVATION_HYSTERESIS_M = 2.0  # GPS/barometric noise below this is not climbing (closest to Strava's totals)
 GPS_MIN_STEP_M = 3.0  # jitter while slow or standing: a point under this from the last counted one is noise
 _EARTH_RADIUS_M = 6_371_000.0
@@ -45,6 +49,7 @@ _TYPES = {
     "swimming": "Swim",
     "rowing": "Rowing",
     "training": "Workout",
+    "multisport": "Multisport",
     "generic": "Workout",
 }
 _LABELS = {"cycling": "Ride", "running": "Run", "walking": "Walk", "hiking": "Hike", "swimming": "Swim"}
@@ -183,42 +188,78 @@ def import_activity_file(
     if len(data) > MAX_UPLOAD_BYTES:
         raise InputError(f"{filename} is larger than {MAX_UPLOAD_BYTES // 1_000_000} MB")
     try:
-        parsed = parse_bytes(filename, data, MAX_DECOMPRESSED_BYTES)
+        # Unzipped first, so the same recording identifies the same way gzipped or not.
+        contents = gunzip(data, MAX_DECOMPRESSED_BYTES) if filename.lower().endswith(".gz") else data
+        parsed = parse_bytes(filename.removesuffix(".gz").removesuffix(".GZ"), contents)
     except (UnsupportedFile, FileTooLarge) as exc:
         raise InputError(f"{filename}: {exc}") from None
     except Exception as exc:  # noqa: BLE001 - a corrupt or foreign file: tell the user, not a 500
         raise InputError(f"could not read {filename}: it does not look like a valid activity file") from exc
     if parsed.start_time is None or parsed.sample_count < 2:
         raise InputError(f"{filename} has no recorded samples (a course or route file rather than a workout?)")
+    times = [t for t in parsed.streams.get("time", ()) if isinstance(t, (int, float))]
+    if times and times[-1] - times[0] > MAX_SPAN_S:
+        raise InputError(
+            f"{filename} spans {round((times[-1] - times[0]) / 86400)} days: the device's clock probably jumped "
+            f"(workouts up to {MAX_SPAN_S // 3600} h can be imported)"
+        )
 
-    source_id = hashlib.sha256(data).hexdigest()[:24]
+    digest = hashlib.sha256(contents).hexdigest()
     start_iso = utc_iso(parsed.start_time)
+    # The same workout uploaded before in another form (a GPX of the same ride, the file gzipped):
+    # replace that one rather than add a second copy that every total would count again.
+    previous = _upload_of_the_same_workout(store, start_iso)
+    source_id = previous["source_id"] if previous else digest[:24]
     local_date, local_start = _local_date(parsed.start_time, parsed.local_offset_s, timezone)
-    stored_type = (activity_type or "").strip() or _activity_type(parsed)
+    stored_type = (activity_type or "").strip() or (previous["activity_type"] if previous and previous["kept_type"] else None)
+    stored_type = stored_type or _activity_type(parsed)
     summary = summarize(parsed)
-    existed = store.conn.execute(
-        "SELECT 1 FROM activities WHERE source = ? AND source_id = ?", (SOURCE, source_id)
-    ).fetchone() is not None
+    chosen_name = (name or "").strip()[:200] or (previous["name"] if previous and previous["kept_name"] else None)
     row = {
         "source": SOURCE,
         "source_id": source_id,
         "start_time": start_iso,
         "local_date": local_date,
         "activity_type": stored_type,
-        "name": (name or "").strip()[:200] or parsed.meta.get("name") or _default_name(local_start, stored_type),
+        "name": chosen_name or parsed.meta.get("name") or _default_name(local_start, stored_type),
         **summary,
-        "raw": {"file": filename, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
-                "format": parsed.meta.get("format"), "session": parsed.meta.get("session"),
-                "local_offset_s": parsed.local_offset_s, "timezone": timezone},  # fmt: skip
+        "raw": {"file": filename, "bytes": len(data), "sha256": digest, "format": parsed.meta.get("format"),
+                "session": parsed.meta.get("session"), "local_offset_s": parsed.local_offset_s, "timezone": timezone,
+                # A name or sport set by the user (kept when the workout is imported again without one).
+                "name_given": bool(chosen_name), "type_given": bool((activity_type or "").strip())
+                or bool(previous and previous["kept_type"])},  # fmt: skip
     }
     meta = {**parsed.meta, "file": filename, "local_offset_s": parsed.local_offset_s}
     store.upsert_activities([row])
-    store.upsert_activity_streams([{"source": SOURCE, "source_id": source_id, "streams": parsed.streams, "meta": meta}])
-    analysis = analyze(store)
+    try:
+        store.upsert_activity_streams([{"source": SOURCE, "source_id": source_id, "streams": parsed.streams, "meta": meta}])
+    except Exception:
+        # Never leave a workout without its samples behind (a new one; a re-import keeps the old samples).
+        if previous is None:
+            with store.conn:
+                store.conn.execute("DELETE FROM activities WHERE source = ? AND source_id = ?", (SOURCE, source_id))
+        raise
+    try:
+        analysis: dict[str, Any] | None = analyze(store)
+        analysis_error = None
+    except Exception as exc:  # noqa: BLE001 - stored; the next analysis (any import or sync) retries
+        log.exception("import: analysing %s failed", filename)
+        analysis, analysis_error = None, f"stored, but the analysis failed ({type(exc).__name__}); it is retried next time"
+    metrics = store.conn.execute(
+        "SELECT timer_s FROM activity_metrics WHERE source = ? AND source_id = ?", (SOURCE, source_id)
+    ).fetchone()
+    if summary["moving_s"] is None and metrics and metrics["timer_s"]:
+        # GPX and TCX carry no timer: moving time is what the analysis kept (pauses left out),
+        # so every screen shows the same hours.
+        with store.conn:
+            store.conn.execute("UPDATE activities SET moving_s = ? WHERE source = ? AND source_id = ?",
+                               (metrics["timer_s"], SOURCE, source_id))  # fmt: skip
+        summary["moving_s"] = metrics["timer_s"]
+    existed = previous is not None
 
     duplicates = _same_workout_elsewhere(store, start_iso)
     metrics = store.conn.execute(
-        "SELECT tss, tss_method, intensity_factor, normalized_power_w, timer_s FROM activity_metrics "
+        "SELECT tss, tss_method, intensity_factor, normalized_power_w FROM activity_metrics "
         "WHERE source = ? AND source_id = ?",
         (SOURCE, source_id),
     ).fetchone()
@@ -233,7 +274,7 @@ def import_activity_file(
             "activity_type": stored_type,
             "sport": queries.sport_family(stored_type),
             "duration_s": summary["duration_s"],
-            "moving_s": summary["moving_s"] or (metrics["timer_s"] if metrics else None),
+            "moving_s": summary["moving_s"],
             "distance_m": summary["distance_m"],
             "samples": parsed.sample_count,
             "channels": sorted(parsed.streams),
@@ -244,8 +285,35 @@ def import_activity_file(
         },
         # The same workout already stored from another service; the lists show one of them.
         "also_stored_as": duplicates,
+        # The earlier upload of this workout (another file of it) that this one replaced.
+        "replaced_file": previous["file"] if previous and previous["file"] != filename else None,
         "analysis": analysis,
+        "analysis_error": analysis_error,
     }
+
+
+def _upload_of_the_same_workout(store: Store, start_iso: str) -> dict[str, Any] | None:
+    """An earlier upload starting within the de-duplication window of this one, if any."""
+    start = parse_ts(start_iso)
+    assert start is not None
+    window = timedelta(seconds=queries.DEDUPE_WINDOW_S)
+    best = None
+    for r in store.conn.execute(
+        "SELECT source_id, start_time, name, activity_type, json_extract(raw, '$.file') AS file, "
+        "json_extract(raw, '$.name_given') AS name_given, json_extract(raw, '$.type_given') AS type_given "
+        "FROM activities WHERE source = ? AND local_date BETWEEN ? AND ?",
+        (SOURCE, (start - timedelta(days=1)).date().isoformat(), (start + timedelta(days=1)).date().isoformat()),
+    ):
+        ts = parse_ts(r["start_time"])
+        if ts is not None and abs(ts - start) <= window:
+            gap = abs(ts - start)
+            if best is None or gap < best[0]:
+                best = (gap, r)
+    if best is None:
+        return None
+    r = best[1]
+    return {"source_id": r["source_id"], "name": r["name"], "activity_type": r["activity_type"], "file": r["file"],
+            "kept_name": bool(r["name_given"]), "kept_type": bool(r["type_given"])}  # fmt: skip
 
 
 def _same_workout_elsewhere(store: Store, start_iso: str) -> list[dict[str, Any]]:

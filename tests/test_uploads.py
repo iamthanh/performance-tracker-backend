@@ -168,3 +168,100 @@ def test_api_import(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None
     assert evil.status_code == 403
     monkeypatch.setattr(uploads, "MAX_UPLOAD_BYTES", 100)
     assert post(client, FIT, filename="ride.fit").status_code == 413
+
+
+# -- review follow-ups ---------------------------------------------------------------------------
+
+
+def gpx(times: list[str], name: str = "") -> bytes:
+    points = "".join(f'<trkpt lat="48.85{i}" lon="2.35"><time>{t}</time></trkpt>' for i, t in enumerate(times))
+    return f'<gpx><trk><name>{name}</name><trkseg>{points}</trkseg></trk></gpx>'.encode()
+
+
+def test_a_clock_jump_is_refused_not_analysed(store: Store) -> None:
+    years = gpx(["2023-01-01T08:00:00Z", "2026-01-01T08:00:00Z"])
+    with pytest.raises(InputError, match="clock probably jumped"):
+        uploads.import_activity_file(store, "odd.gpx", years)
+    assert store.conn.execute("SELECT COUNT(*) FROM activities").fetchone()[0] == 0
+
+
+def test_the_analysis_bounds_a_long_pause() -> None:
+    from fitness_hub.analysis import MAX_PAUSE_S, timer_series
+
+    series = timer_series({"time": [0, 1, 3 * 365 * 86400], "power": [100, 100, 100]}, ("power",), keep_pauses=True)
+    assert series["power"].size <= 3 + MAX_PAUSE_S
+
+
+def test_one_workout_whatever_the_file(store: Store) -> None:
+    first = uploads.import_activity_file(store, "ride.fit.gz", gzip.compress(FIT))
+    same_bytes = uploads.import_activity_file(store, "ride.fit", FIT)
+    assert same_bytes["created"] is False and same_bytes["activity"]["source_id"] == first["activity"]["source_id"]
+    # A GPX of the same ride: a different file, the same workout. It replaces the upload.
+    other = gpx(["2026-09-01T03:00:30Z", "2026-09-01T03:10:00Z"])
+    replaced = uploads.import_activity_file(store, "ride.gpx", other)
+    assert replaced["created"] is False and replaced["activity"]["source_id"] == first["activity"]["source_id"]
+    assert replaced["replaced_file"] == "ride.fit"
+    assert store.conn.execute("SELECT COUNT(*) FROM activities WHERE source = 'upload'").fetchone()[0] == 1
+    assert store.conn.execute("SELECT COUNT(*) FROM activity_streams WHERE source = 'upload'").fetchone()[0] == 1
+
+
+def test_a_reimport_keeps_the_name_and_sport_you_chose(store: Store) -> None:
+    uploads.import_activity_file(store, "ride.fit", FIT, name="My race", activity_type="VirtualRide")
+    again = uploads.import_activity_file(store, "ride.fit", FIT)
+    assert again["activity"]["name"] == "My race" and again["activity"]["activity_type"] == "VirtualRide"
+    renamed = uploads.import_activity_file(store, "ride.fit", FIT, name="Renamed")
+    assert renamed["activity"]["name"] == "Renamed"
+
+
+def test_multisport_sessions_are_added_up() -> None:
+    from fitness_hub.activity_files import ParsedActivity, _combined_session
+
+    combined = _combined_session([
+        {"sport": "swimming", "total_elapsed_time": 1800, "total_distance": 1500, "total_calories": 300, "max_heart_rate": 160},
+        {"sport": "cycling", "total_elapsed_time": 3600, "total_distance": 40000, "total_calories": 900, "max_heart_rate": 170},
+    ])  # fmt: skip
+    assert combined["sport"] == "multisport" and combined["legs"] == ["swimming", "cycling"]
+    assert combined["total_elapsed_time"] == 5400 and combined["total_distance"] == 41500
+    assert combined["total_calories"] == 1200 and combined["max_heart_rate"] == 170
+    parsed = ParsedActivity(start_time=START, streams={"time": [0, 1]}, meta={"session": combined})
+    assert uploads._activity_type(parsed) == "Multisport"
+
+
+def test_gpx_moving_time_is_stored(store: Store) -> None:
+    result = uploads.import_activity_file(store, "run.gpx", GPX, timezone="Europe/Paris")
+    row = activity(store, result["activity"]["source_id"])
+    assert row["moving_s"] is not None and row["moving_s"] == result["activity"]["moving_s"]
+
+
+def test_a_failed_import_leaves_nothing_half_stored(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(rows: object) -> int:
+        raise ValueError("cannot encode")
+
+    monkeypatch.setattr(store, "upsert_activity_streams", broken)
+    with pytest.raises(ValueError):
+        uploads.import_activity_file(store, "ride.fit", FIT)
+    assert store.conn.execute("SELECT COUNT(*) FROM activities").fetchone()[0] == 0
+
+
+def test_an_analysis_failure_still_stores_the_workout(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(store: object) -> dict:
+        raise MemoryError
+
+    monkeypatch.setattr(uploads, "analyze", boom)
+    result = uploads.import_activity_file(store, "ride.fit", FIT)
+    assert result["analysis"] is None and "analysis failed" in result["analysis_error"]
+    assert store.conn.execute("SELECT COUNT(*) FROM activity_streams").fetchone()[0] == 1
+
+
+def test_gzip_is_capped_while_inflating(store: Store, monkeypatch: pytest.MonkeyPatch) -> None:
+    from fitness_hub.activity_files import gunzip
+
+    with pytest.raises(InputError, match="could not read"):
+        uploads.import_activity_file(store, "cut.fit.gz", gzip.compress(FIT)[:-20])  # truncated
+    assert gunzip(gzip.compress(b"x" * 10), 100) == b"x" * 10
+
+
+def test_api_refuses_a_gzip_bomb(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(uploads, "MAX_DECOMPRESSED_BYTES", 1_000_000)
+    bomb = post(client, gzip.compress(b" " * 5_000_000), filename="bomb.gpx.gz")
+    assert bomb.status_code == 400 and "larger than 1 MB once decompressed" in bomb.json()["detail"]
