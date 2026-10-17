@@ -211,8 +211,9 @@ def test_insights_for_a_ride(client: TestClient) -> None:
     body = client.get("/api/activities/strava/2/insights").json()
     assert body["best_efforts"][0]["duration_s"] == 30 and body["best_efforts"][0]["avg_power_w"] == 400
     assert body["best_efforts"][0]["avg_hr"] == 150
-    assert body["weight"] == {"kg": 72.5, "origin": "trend", "kind": "carried", "date": "2026-10-03", "weigh_in": None,
-                              "gap_days": 13, "last_weigh_in": "2026-09-20"}  # fmt: skip
+    assert body["weight"] == {"kg": 72.5, "origin": "trend", "value_is": "trend", "kind": "carried",
+                              "date": "2026-10-03", "weigh_in": None, "weigh_ins": 0, "gap_days": 13,
+                              "last_weigh_in": "2026-09-20"}  # fmt: skip
     assert body["durability"]["unit"] == "kJ" and body["durability"]["steps"][0] == 0
     efforts = body["efforts"]
     assert efforts["count"] == 5 and efforts["items"][0]["duration_s"] == 60

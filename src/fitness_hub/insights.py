@@ -88,18 +88,21 @@ def _round(value: float | None, digits: int = 1) -> float | None:
 
 def ride_weight(conn: sqlite3.Connection, source: str, source_id: str, local_date: str) -> dict[str, Any] | None:
     """The weight for the ride's per-kg values, or None, and where it comes from (``origin``):
-    ``pre_workout``, weighed for this ride; else ``trend``, the daily trend weight of its day
-    (``bodyweight``), with ``kind`` (weigh_in, interpolated, estimated, carried), the day's raw
-    ``weigh_in`` if there was one, ``gap_days`` and ``last_weigh_in``. Measured values are never
+    ``pre_workout``, weighed for this ride (``value_is`` "measured"); else ``trend``, the daily
+    trend weight of its day (``bodyweight``; ``value_is`` "trend", smoothed even on a weigh-in day),
+    with ``kind`` (weigh_in, interpolated, estimated, carried), the day's raw ``weigh_in`` if there
+    was one, ``gap_days`` and ``last_weigh_in``. Measured values are never
     mixed up with filled ones: ``kind`` always says which it is."""
     saved = get_workout_weight(conn, source, source_id)
     if saved and saved.get("pre_kg"):
-        return {"kg": saved["pre_kg"], "origin": "pre_workout", "kind": "weigh_in", "date": local_date,
-                "weigh_in": saved["pre_kg"], "gap_days": 0, "last_weigh_in": local_date}  # fmt: skip
+        return {"kg": saved["pre_kg"], "origin": "pre_workout", "value_is": "measured", "kind": "weigh_in",
+                "date": local_date, "weigh_in": saved["pre_kg"], "weigh_ins": 1, "gap_days": 0,
+                "last_weigh_in": local_date}  # fmt: skip
     day = weight_on(conn, local_date)
     if day is None:
         return None
-    return {"origin": "trend", **day}
+    # The trend is smoothed even on a day with a weigh-in: kg is never the raw reading here.
+    return {"origin": "trend", "value_is": "trend", **day}
 
 
 # -- durability -----------------------------------------------------------------------------

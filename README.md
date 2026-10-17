@@ -197,10 +197,11 @@ updates those days. Ride insights use these for W/kg and kJ/kg.
 Weigh-ins in `body_measurements` are never changed or added to. `bodyweight.py` (`GET /api/weight`) derives a daily
 trend from them on every read, and labels each day:
 
-- **weigh_in**: a day with a measurement (its raw value is returned alongside the trend). The trend moves 10 % of
+- **weigh_in**: a day with a measurement (pre-ride weights included; the same reading on two services counts once). The
+  day's raw value is returned alongside; the trend itself is still smoothed. The trend moves 10 % of
   the way to each weigh-in (more after a gap), smoothing out water and food swings.
 - **interpolated**: no weigh-in, but weigh-ins at most 42 days apart around it: a straight line between them.
-- **estimated**: inside a longer gap: still a straight line, but a guess (the change may have come at any time).
+- **estimated**: inside a longer gap (up to a year; longer gaps stay empty): still a straight line, but a guess.
 - **carried**: up to 30 days after the latest weigh-in, held flat. Later, and before the first weigh-in, there is no
   value.
 

@@ -144,7 +144,7 @@ def test_a_weigh_in_from_several_sources_counts_once(settings: Settings) -> None
         rows = []
         for source in ("garmin", "google_health", SOURCE):
             for day, kg in (("2020-03-01", 70.0), ("2020-03-02", 80.0)):
-                rows.append({"source": source, "ts": f"{day}T07:00:00Z", "metric": "weight_kg", "value": kg})
+                rows.append({"source": source, "ts": f"{day}T19:00:00Z", "metric": "weight_kg", "value": kg})
         store.upsert_body_measurements(rows)
         store.upsert_activities([{"source": "strava", "source_id": "r", "start_time": "2020-03-02T08:00:00Z",
                                   "local_date": "2020-03-02", "activity_type": "Ride", "raw": {}}])  # fmt: skip
