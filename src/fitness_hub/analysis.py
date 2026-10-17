@@ -306,7 +306,7 @@ def decoupling(power: np.ndarray, hr: np.ndarray) -> float | None:
 def base_metrics(streams: Mapping[str, list[Any]]) -> tuple[dict[str, Any], dict[int, float]]:
     """Threshold-independent metrics and the power curve of one activity."""
     series = timer_series(streams, ("power", "heart_rate"))
-    _, is_pause, paused = timer_clock(streams, ("power", "heart_rate", "temperature"))
+    clock, is_pause, paused = timer_clock(streams, ("power", "heart_rate", "temperature"))
     for s in (series, paused):
         hr_values = s["heart_rate"]
         with np.errstate(invalid="ignore"):
@@ -344,7 +344,7 @@ def base_metrics(streams: Mapping[str, list[Any]]) -> tuple[dict[str, Any], dict
             metrics["decoupling_pct"] = decoupling(np.nan_to_num(raw_power, nan=0.0), hr)
             has_gps = any(v is not None for v in streams.get("lat") or [])
             metrics["cardio"] = ride_cardio(
-                paused["power"], paused["heart_rate"], paused["temperature"], is_pause, has_gps
+                paused["power"], paused["heart_rate"], paused["temperature"], is_pause, has_gps, clock
             )
     return metrics, curve
 

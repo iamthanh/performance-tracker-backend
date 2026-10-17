@@ -56,11 +56,13 @@ def _round(value: float, digits: int = 1) -> float | None:
 
 
 def steady_blocks(
-    power: np.ndarray, hr: np.ndarray, temperature: np.ndarray, is_pause: np.ndarray
+    power: np.ndarray, hr: np.ndarray, temperature: np.ndarray, is_pause: np.ndarray, clock: np.ndarray | None = None
 ) -> list[list[float | None]]:
-    """``[[start_s, watts, bpm, temp_c, kj_before]]``: the steady blocks (see the module docstring)
-    of 1 Hz series on the timer clock with pauses kept as NaN (``analysis.timer_clock``). A missing
-    power sample (not a pause) counts as 0 W, as everywhere in the analysis."""
+    """``[[start_s, watts, bpm, temp_c, kj_before, clock_s]]``: the steady blocks (see the module
+    docstring) of 1 Hz series on the timer clock with pauses kept as NaN (``analysis.timer_clock``).
+    ``start_s`` is riding time; ``clock_s`` the start on the stream's own clock (pauses included, as
+    the stream charts show it; None without ``clock``). A missing power sample (not a pause) counts
+    as 0 W, as everywhere in the analysis."""
     n = power.size
     if n < LEAD_S + BLOCK_S:
         return []
@@ -85,6 +87,7 @@ def steady_blocks(
             out.append([
                 int(riding[i]), _round(mean), _round(np.nanmean(hr[i : i + BLOCK_S])),
                 _round(np.nanmean(temps)) if np.isfinite(temps).any() else None, _round(work[i]),
+                None if clock is None or clock.size != n else _round(clock[i], 0),
             ])  # fmt: skip
             i += BLOCK_S
         else:
@@ -107,7 +110,9 @@ def hr_recoveries(power: np.ndarray, hr: np.ndarray, is_pause: np.ndarray) -> li
     starts = np.arange(EFFORT_S, n - PEAK_SEARCH_S - RECOVERY_S)
     with np.errstate(invalid="ignore"):
         before = effort[starts - EFFORT_S]
-        candidates = starts[(before >= MIN_EFFORT_W) & (ease[starts] <= MAX_RECOVERY_SHARE * before)]
+        # The effort has stopped: this second and the next PEAK_SEARCH_S average at most the share.
+        stopped = (watts[starts] <= MAX_RECOVERY_SHARE * before) & (ease[starts] <= MAX_RECOVERY_SHARE * before)
+        candidates = starts[(before >= MIN_EFFORT_W) & stopped]
     out: list[list[float]] = []
     next_free = 0
     for i in candidates:
@@ -127,11 +132,12 @@ def hr_recoveries(power: np.ndarray, hr: np.ndarray, is_pause: np.ndarray) -> li
 
 
 def ride_cardio(
-    power: np.ndarray, hr: np.ndarray, temperature: np.ndarray, is_pause: np.ndarray, has_gps: bool
+    power: np.ndarray, hr: np.ndarray, temperature: np.ndarray, is_pause: np.ndarray, has_gps: bool,
+    clock: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """What ``ride_cardio`` stores for a workout with power and heart rate."""
     return {
         "has_gps": has_gps,
-        "blocks": steady_blocks(power, hr, temperature, is_pause),
+        "blocks": steady_blocks(power, hr, temperature, is_pause, clock),
         "recoveries": hr_recoveries(power, hr, is_pause),
     }

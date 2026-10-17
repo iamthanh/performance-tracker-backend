@@ -67,7 +67,7 @@ nutrients as totals for the entry, note, kind food|drink, recipe: one bottle's J
 eating and drinking; workout_weights(source, source_id, pre_kg, post_kg, note) their weight around a workout. \
 activity_metrics, power_curve, durability_bests(source, source_id, after_kj, duration_s, watts: best \
 efforts started after that much work), ride_cardio(source, source_id, has_gps, blocks: JSON [[start_s, watts, bpm, \
-temp_c, kj_before]] of steady riding, recoveries: JSON [[peak_bpm, drop_bpm, effort_w, recovery_w]]) and \
+temp_c, kj_before, clock_s]] of steady riding, recoveries: JSON [[peak_bpm, drop_bpm, effort_w, recovery_w]]) and \
 athlete_settings are filled by the training analysis and may be empty. \
 `raw` holds the provider JSON (use json_extract). \
 query_sql does NOT de-duplicate activities.

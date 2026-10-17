@@ -631,7 +631,7 @@ local clock. Every row keeps the provider payload in `raw` and an `updated_at` s
 | `nutrition_entries` | `id` (and `(source, source_id)` for imports) | `local_date, consumed_at, meal` (`breakfast, lunch, dinner, snack, pre_workout, during_workout, post_workout`), `activity_source, activity_source_id, offset_s` (the workout it fuelled, seconds into it), `food_id, name, servings` (bottles, for a drink), the same nutrients as **totals for the entry**, `note`, `kind` (`food` or `drink`), `recipe` (one bottle, JSON) |
 | `workout_weights` | `(source, source_id)` | `pre_kg, post_kg, note`: body weight before and after the workout |
 | `durability_bests` | `(source, source_id, after_kj, duration_s)` | `watts`: the best average power over `duration_s` started after `after_kj` (1000 … 3000) of work in that ride |
-| `ride_cardio` | `(source, source_id)` | `has_gps`; `blocks` (JSON `[[start_s, watts, bpm, temp_c, kj_before]]`: steady riding) and `recoveries` (JSON `[[peak_bpm, drop_bpm, effort_w, recovery_w]]`) for the cardio index |
+| `ride_cardio` | `(source, source_id)` | `has_gps`; `blocks` (JSON `[[start_s, watts, bpm, temp_c, kj_before, clock_s]]`: steady riding; `start_s` in riding time, `clock_s` on the stream's clock) and `recoveries` (JSON `[[peak_bpm, drop_bpm, effort_w, recovery_w]]`) for the cardio index |
 | `app_settings` | `key` | `value` (JSON): settings such as the performance and cardio index weights |
 
 **Schema versions.** The version is kept in `PRAGMA user_version`. Opening the database applies any missing migrations

@@ -4,7 +4,7 @@ The fitter the aerobic system, the fewer beats it takes to deliver the same powe
 volume, more blood, more mitochondria). Raw heart rate moves with much else, so every value is put
 on the same footing first. The figures in brackets are from the author's 1,582 rides with both
 power and heart rate, where each correction lowered the error of predicting a ride from the ones
-before it (``backtest``: from 4.9 to 4.3 bpm).
+before it (``backtest``: from 4.9 to 4.1 bpm).
 
 - **Steady riding only** (``steady``): 5 min blocks of even power, after 3 min at that power (heart
   rate settles with a time constant of about a minute), from ``WARMUP_S`` into the ride (earlier
@@ -24,7 +24,7 @@ before it (``backtest``: from 4.9 to 4.3 bpm).
   pass for heat or form), all three together, repeatedly until they settle (backfitting).
   Bounded by ``CORRECTION_BOUNDS``; with too few rides for one, its default (``DEFAULTS``).
 
-Components, each day from the rides before it:
+Components, each day from the rides up to it:
 
 - **aerobic** (scored): the median corrected heart rate at the reference power over the last
   ``WINDOW_DAYS``, with at least ``MIN_RIDES``; reported both ways: heart rate at the reference
@@ -43,7 +43,12 @@ Components, each day from the rides before it:
 Each scored component is an index, 100 = the average of its first ``BASELINE_DAYS`` of values
 (resting heart rate inverted, so up is fitter), and the score their weighted geometric mean
 (``DEFAULT_WEIGHTS``), over those with a value; it needs the aerobic one. Unlike the performance
-index it falls as well as rises: aerobic fitness comes and goes.
+index it falls as well as rises: aerobic fitness comes and goes. Each component's baseline is its own
+first year (resting heart rate may start years after the rides), and a day's values do not depend
+on the range asked for. The model (references, slopes, corrections) is fitted on every ride, so
+history shifts slightly as rides are added; ``backtest`` predicts each ride only from the rides
+before it, but with those fitted values (three parameters: on the author's history, fitting them
+on the first half only changed the error by 0.02 bpm).
 
 ``vo2max`` estimates VO2max from the aerobic value (as watches do from heart rate and power): the
 oxygen cost of the reference power (ACSM: 10.8 ml/min per W per kg + 7), over the share of heart
@@ -70,8 +75,8 @@ import numpy as np
 from .analysis import DEFAULT_RESTING_HR, _load_timeline
 from .bodyweight import daily_weigh_ins, trend
 from .nutrition import same_workout
-from .queries import dedupe_activities, sport_family, training_load
-from .util import InputError, now_utc_iso
+from .queries import _priority, dedupe_activities, sport_family, training_load
+from .util import InputError, now_utc_iso, parse_date
 
 COMPONENTS = ("aerobic", "resting_hr", "hr_recovery", "drift")
 SCORED = ("aerobic", "resting_hr", "hr_recovery")
@@ -187,7 +192,9 @@ def is_indoor(activity_type: str | None, raw: Mapping[str, Any], has_gps: bool) 
         return True
     if raw.get("trainer") is True:
         return True
-    gear = raw.get("Activity Gear") or raw.get("Bike") or (raw.get("gear") or {}).get("name") or ""
+    gear_info = raw.get("gear")
+    named = gear_info.get("name") if isinstance(gear_info, dict) else gear_info
+    gear = raw.get("Activity Gear") or raw.get("Bike") or named or ""
     return bool(isinstance(gear, str) and _TRAINER.search(gear))
 
 
@@ -217,6 +224,15 @@ class _Ride:
         return 0.0 if self.indoor or self.temp_c is None else max(self.temp_c - HEAT_FROM_C, 0.0)
 
 
+def _raw(text: str | None) -> dict[str, Any]:
+    """The provider JSON as a dict ({} when missing or not an object)."""
+    try:
+        raw = json.loads(text) if text else {}
+    except ValueError:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def _load_rides(conn: sqlite3.Connection) -> list[_Ride]:
     rows = conn.execute(
         """
@@ -227,14 +243,12 @@ def _load_rides(conn: sqlite3.Connection) -> list[_Ride]:
     ).fetchall()
     rides = [dict(r) for r in rows if sport_family(r["activity_type"]) == "cycling"]
     out = []
-    for r in sorted(dedupe_activities(rides), key=lambda r: (r["local_date"], r["start_time"], r["source"])):
-        try:
-            raw = json.loads(r["raw"]) if r["raw"] else {}
-        except ValueError:
-            raw = {}
+    # Of several copies of a ride, the one with the most steady riding (a copy synced without streams has none).
+    kept = dedupe_activities(rides, rank=lambda r: (-len(json.loads(r["blocks"])), _priority(r["source"])))
+    for r in sorted(kept, key=lambda r: (r["local_date"], r["start_time"], r["source"])):
         out.append(
             _Ride(r["source"], r["source_id"], r["name"], r["local_date"],
-                  is_indoor(r["activity_type"], raw if isinstance(raw, dict) else {}, bool(r["has_gps"])),
+                  is_indoor(r["activity_type"], _raw(r["raw"]), bool(r["has_gps"])),
                   json.loads(r["blocks"]), json.loads(r["recoveries"]))
         )  # fmt: skip
     return out
@@ -506,7 +520,8 @@ def cardio(conn: sqlite3.Connection, start_date: str | None = None, end_date: st
     at most today), with the model it rests on and the rides in the range. A day's values do not
     depend on the range."""
     today = date.today().isoformat()
-    end = min(end_date or today, today)
+    start_date = parse_date(start_date, "start_date").isoformat() if start_date else None
+    end = min(parse_date(end_date, "end_date").isoformat() if end_date else today, today)
     if start_date and start_date > end:
         raise InputError(f"start_date {start_date} is after end_date {end}")
     settings = get_settings(conn)
@@ -537,7 +552,8 @@ def cardio(conn: sqlite3.Connection, start_date: str | None = None, end_date: st
     first = min([rides[0].date, *rest_dates[:1]])
     raw_days = []
     day = date.fromisoformat(first)
-    while day.isoformat() <= end:
+    # Always to today, so the baselines (and a day's indexes) do not depend on the range asked for.
+    while day.isoformat() <= today:
         iso = day.isoformat()
         bpm, count = _windowed(a_dates, a_values, iso, WINDOW_DAYS, MIN_RIDES)
         values = {
@@ -554,7 +570,7 @@ def cardio(conn: sqlite3.Connection, start_date: str | None = None, end_date: st
         baselines[c] = float(np.mean(seen)) if seen else None
     days = []
     for iso, bpm, count, values in raw_days:
-        if (start_date and iso < start_date) or not any(v is not None for v in values.values()):
+        if (start_date and iso < start_date) or iso > end or not any(v is not None for v in values.values()):
             continue
         indexes = {c: _index(c, values[c], baselines[c]) for c in SCORED}
         total = score(indexes, weights)
@@ -601,7 +617,7 @@ def ride_cardio(conn: sqlite3.Connection, source: str, source_id: str) -> dict[s
     rate at the reference power before and after the corrections, the median of the other rides of
     the ``WINDOW_DAYS`` up to it, and its HR recoveries. None without stored steady riding data."""
     row = conn.execute(
-        "SELECT a.local_date, a.activity_type, a.name, a.raw, c.has_gps, c.blocks, c.recoveries "
+        "SELECT a.local_date, a.activity_type, c.blocks "
         "FROM ride_cardio c JOIN activities a USING (source, source_id) WHERE c.source = ? AND c.source_id = ?",
         (source, source_id),
     ).fetchone()
@@ -609,24 +625,21 @@ def ride_cardio(conn: sqlite3.Connection, source: str, source_id: str) -> dict[s
         return None
     model, rides = build(conn)
     copies = {(c["source"], c["source_id"]) for c in same_workout(conn, source, source_id)} | {(source, source_id)}
+    # The ride as the index counts it: this activity, or the copy of it from another service that was kept.
     ride = next((r for r in rides if (r.source, r.source_id) in copies), None)
-    if ride is None:  # not a cycling ride (or its copy was kept): values from this row alone
-        raw = json.loads(row["raw"]) if row["raw"] else {}
-        ride = _Ride(source, source_id, row["name"], row["local_date"],
-                     is_indoor(row["activity_type"], raw if isinstance(raw, dict) else {}, bool(row["has_gps"])),
-                     json.loads(row["blocks"]), json.loads(row["recoveries"]))  # fmt: skip
-        if model is not None:
-            ride.tsb = _form(conn, ride.date).get(ride.date, 0.0)
-            _ride_value(ride, model)
-            if ride.raw_bpm is not None:
-                ride.bpm = ride.raw_bpm - sum(model.correction(ride).values())
-    blocks = [
-        {"start_s": b[0], "watts": b[1], "bpm": b[2], "temp_c": b[3], "kj_before": b[4], "used": i in ride.used,
-         "warm_up": b[0] < WARMUP_S}
-        for i, b in enumerate(ride.blocks)
-    ]  # fmt: skip
-    if model is None:
-        return {"model": None, "blocks": blocks, "ride": None, "normal": None, "recoveries": []}
+
+    def block_rows(stored: list[list[Any]], used: list[int]) -> list[dict[str, Any]]:
+        return [
+            {"start_s": b[0], "clock_s": b[5] if len(b) > 5 else None, "watts": b[1], "bpm": b[2], "temp_c": b[3],
+             "kj_before": b[4], "used": i in used, "warm_up": b[0] < WARMUP_S}
+            for i, b in enumerate(stored)
+        ]  # fmt: skip
+
+    if model is None or ride is None:  # no model yet, or not a ride (a run with power is not on the cycling scale)
+        blocks = block_rows(json.loads(row["blocks"]), [])
+        return {"model": None if model is None else model.as_dict(), "blocks": blocks, "ride": None, "normal": None,
+                "recoveries": []}  # fmt: skip
+    blocks = block_rows(ride.blocks, ride.used)
     others = [r for r in rides if r.bpm is not None and (r.source, r.source_id) not in copies]
     start = (date.fromisoformat(ride.date) - timedelta(days=WINDOW_DAYS - 1)).isoformat()
     window = [float(r.bpm) for r in others if start <= r.date <= ride.date]  # type: ignore[arg-type]

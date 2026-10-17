@@ -315,7 +315,7 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             source TEXT NOT NULL,
             source_id TEXT NOT NULL,
             has_gps INTEGER NOT NULL,        -- 0: no position recorded (indoors)
-            blocks TEXT NOT NULL,            -- JSON [[start_s, watts, bpm, temp_c, kj_before]]
+            blocks TEXT NOT NULL,            -- JSON [[start_s, watts, bpm, temp_c, kj_before, clock_s]]
             recoveries TEXT NOT NULL,        -- JSON [[peak_bpm, drop_bpm, effort_w, recovery_w]]
             updated_at TEXT NOT NULL,
             PRIMARY KEY (source, source_id)

@@ -293,3 +293,63 @@ def test_cli(home: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert "bpm at 185 W" in out and "Corrections: indoors" in out
     assert main(["cardio", "--backtest"]) == 0
     assert "CORRECTIONS" in capsys.readouterr().out
+
+
+def test_recovery_is_measured_from_the_actual_stop() -> None:
+    # Exactly two minutes at 300 W after easier riding: an early trigger would mix the 150 W in.
+    power = series((600, 150.0), (120, 300.0), (200, 40.0))
+    hr = series((600, 130.0), (120, 160.0), (200, 140.0))
+    hr[720:724] = 161.0  # heart rate lags the stop by a few seconds
+    peak, _, effort, _ = hr_recoveries(power, hr, no_pause(power.size))[0]
+    assert effort == 300.0 and peak == 161.0
+
+
+def test_blocks_carry_their_time_on_the_streams_clock() -> None:
+    power = series((900, 200.0))
+    is_pause = no_pause(900)
+    clock = np.arange(900, dtype=float) + 1000  # the stream's clock: a 1000 s stop before the timer started
+    blocks = steady_blocks(power, np.full(900, 140.0), np.full(900, np.nan), is_pause, clock)
+    assert blocks[0][0] == LEAD_S and blocks[0][5] == 1000 + LEAD_S
+
+
+def test_a_days_values_do_not_depend_on_the_range(store: Store) -> None:
+    for i in range(150):
+        add_ride(store, str(i), day(2 * i), 150.0 - i / 30)
+    full = {d["date"]: d for d in C.cardio(store.conn)["days"]}
+    part = {d["date"]: d for d in C.cardio(store.conn, day(60), day(80))["days"]}
+    assert part and all(part[k] == full[k] for k in part)
+    assert max(part) == day(80) and min(part) == day(60)
+
+
+def test_a_copy_from_another_service_is_the_same_ride(store: Store) -> None:
+    for i in range(10):
+        add_ride(store, str(i), day(i), 150.0)
+    add_ride(store, "today", day(10), 146.0)
+    store.upsert_activities([{"source": "garmin", "source_id": "g", "start_time": day(10) + "T08:00:30Z",
+                              "local_date": day(10), "activity_type": "road_biking", "raw": {}}])  # fmt: skip
+    store.replace_ride_cardio("garmin", "g", {"has_gps": True, "blocks": [], "recoveries": []})
+    for asked in (("strava", "today"), ("garmin", "g")):
+        result = C.ride_cardio(store.conn, *asked)
+        assert result["normal"]["rides"] == 10  # neither copy is in its own normal
+        assert result["ride"]["raw_bpm"] == pytest.approx(146.0, abs=0.1)
+
+
+def test_a_run_with_power_is_not_put_on_the_cycling_scale(store: Store) -> None:
+    for i in range(10):
+        add_ride(store, str(i), day(i), 150.0)
+    add_ride(store, "run", day(10), 160.0, activity_type="Run")
+    result = C.ride_cardio(store.conn, "strava", "run")
+    assert result["ride"] is None and len(result["blocks"]) == 6 and not any(b["used"] for b in result["blocks"])
+
+
+def test_corrections_with_slow_form_and_a_fixed_effect() -> None:
+    rng = np.random.default_rng(2)
+    n = 700
+    days = np.sort(rng.integers(0, 1000, n)).astype(float)
+    form = 25 * np.sin(days / 20) + rng.normal(0, 3, n)  # form moves over weeks, as TSB does
+    fitness = 150 - 5 * np.sin(days / 200)
+    heat = np.where(rng.random(n) < 0.3, rng.uniform(0, 10, n), 0.0)
+    raw = fitness + 0.5 * heat + 0.15 * form + rng.normal(0, 1.0, n)
+    found, fitted = C.fit_corrections(days, raw, np.zeros(n, dtype=bool), heat, form)
+    assert found["form"] == pytest.approx(0.15, abs=0.03) and found["heat"] == pytest.approx(0.5, abs=0.08)
+    assert found["indoor"] == C.DEFAULTS["indoor"] and not fitted["indoor"]  # no indoor rides: its default
