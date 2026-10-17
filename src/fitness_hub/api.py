@@ -44,7 +44,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import __version__, nutrition, queries, uploads
+from . import __version__, insights, nutrition, queries, uploads
 from .analysis import analyze, thresholds_on
 from .config import Settings
 from .db import ATHLETE_SETTINGS, Store, open_readonly, schema_version
@@ -403,11 +403,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         max_points: Annotated[int, Query(ge=10, le=20000)] = 2000,
     ) -> dict[str, list[Any]]:
         """Per-sample channels (time, power, heart_rate, cadence, speed, distance, altitude,
-        lat, lng, temperature; only those recorded), averaged down to ``max_points``."""
-        streams = queries.activity_streams(conn, source, source_id, max_points)
+        lat, lng, temperature; only those recorded), averaged down to ``max_points``; a ride
+        with power and an FTP also gets ``w_bal``, the W' left in J."""
+        streams = insights.activity_streams(conn, source, source_id, max_points)
         if streams is None:
             raise HTTPException(status_code=404, detail="no streams for this activity")
         return streams
+
+    @app.get("/api/activities/{source}/{source_id}/insights")
+    def activity_insights(conn: Conn, source: str, source_id: str) -> dict[str, Any]:
+        """Body weight for per-kg values, durability (best efforts after accumulated work),
+        W' balance with matches, and the efforts above FTP."""
+        result = insights.activity_insights(conn, source, source_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="activity not found")
+        return result
 
     @app.get("/api/summary")
     def summary(

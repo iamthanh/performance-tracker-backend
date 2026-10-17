@@ -180,6 +180,21 @@ each (60 MB once unzipped), through `POST /api/activities/import`. Imports run o
 - **Duplicates from other services:** a workout already stored from another service (e.g. a later Strava export) is
   merged in the lists, as for any duplicate, and the import says so.
 
+### Ride insights (computed on demand)
+
+`GET /api/activities/{source}/{id}/insights` adds what coaches look at beyond NP/IF/TSS (`insights.py`):
+
+- **Per kg:** the body weight saved before the workout, else the latest weigh-in up to its day.
+- **Durability:** the best 1, 5 and 20 minutes after the ride had already done 10, 20, 30 ... kJ/kg of work
+  (1000, 2000 ... kJ without a weight), next to the same efforts from the start. Professionals' best efforts
+  fade with accumulated work, most clearly beyond about 20 kJ/kg, and how little separates riders that fresh
+  power does not.
+- **W' balance and matches:** Skiba's differential model, with CP = the ride's FTP and W' from the
+  critical-power fit of the year's best efforts up to the ride (20 kJ without a fit). The streams endpoint
+  carries it as the `w_bal` channel. A match is a drop of 2 kJ or more within 5 minutes.
+- **Efforts above FTP:** stretches above FTP of 30 s or more (5 s or more above 120 % of FTP), on a 10 s
+  centred average, with power, HR, cadence, work and W' spent.
+
 ### Nutrition (logged by you)
 
 Meals and fueling during workouts are logged in the web UI (or through the API) and stored in `nutrition_entries`;
@@ -412,7 +427,8 @@ Reads use read-only connections. Writes are threshold overrides, which re-score 
 | `GET /api/activities?start_date&end_date&activity_type&limit` | Workouts newest first, one per workout (an analysed copy wins over an unanalysed duplicate), with TSS, IF, NP, work, VI, EF, decoupling, `kcal` burned (recorded calories from any copy of the workout, else a ride's kJ of work), `has_streams` |
 | `POST /api/activities/import?filename&name&activity_type&timezone` | Import one `.fit`, `.gpx` or `.tcx` file (optionally `.gz`); the body is the file, as `application/octet-stream`. Stored as source `upload` and analysed; returns the workout and any copy already stored from another service |
 | `GET /api/activities/{source}/{id}` | One workout: `activity`, `analysis` (zones, power curve, thresholds used), `laps`, `device`, available `streams` channels |
-| `GET /api/activities/{source}/{id}/streams?max_points=2000` | Per-sample channels averaged down to `max_points` (`time` in seconds from the start) |
+| `GET /api/activities/{source}/{id}/streams?max_points=2000` | Per-sample channels averaged down to `max_points` (`time` in seconds from the start); `w_bal` (W' left, J) for a ride with power and an FTP |
+| `GET /api/activities/{source}/{id}/insights` | Body weight for per-kg values, durability (best efforts after accumulated work), W' balance with matches, efforts above FTP |
 | `GET /api/summary?start_date&end_date&group_by=week` | Totals per day/week (Monday start)/month, overall and per sport: count, distance, hours, elevation, TSS, kJ, kcal burned |
 | `GET /api/training-load?start_date&end_date` | Daily TSS, CTL, ATL, TSB and `unscored` workouts (default 90 days) |
 | `GET /api/power-curve?start_date&end_date&activity_type` | Best power per duration with the activity that set it (cycling unless `activity_type=all`) |
@@ -493,6 +509,7 @@ src/fitness_hub/
 ├── queries.py           # read side: activities, summaries, metrics, sleep, body, run_select, de-dup
 ├── analysis.py          # training analysis: NP, TSS, zones, power curve, auto thresholds, load
 ├── nutrition.py         # foods, nutrition entries, daily energy in/out, workout fueling
+├── insights.py          # per-ride durability, W' balance and matches, efforts above FTP, weight for W/kg
 ├── api.py               # FastAPI read/write API for the web UI
 ├── activity_files.py    # FIT / GPX / TCX / Strava JSON parsing
 └── providers/
