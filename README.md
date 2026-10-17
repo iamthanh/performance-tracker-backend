@@ -183,11 +183,11 @@ each (60 MB once unzipped), through `POST /api/activities/import`. Imports run o
 ### Body weight from a CSV
 
 `fitness-hub import-weight-csv weights.csv [--unit kg|lb]` imports dated weigh-ins (a spreadsheet log or a scale
-app's export) as `weight_kg` under source `weight_csv`. The date column is the first whose header mentions "date",
-the weight column the first that mentions "weight"; dates may be ISO, long ("Tuesday, June 26, 2018") or US
-(06/26/2018; day/month dates are refused). The unit comes from the header or `--unit` (never guessed, and the
-  two must agree). Blank days are skipped, a weigh-in stored by several sources counts once, and
-importing again updates those days. Ride insights use these for W/kg and kJ/kg.
+app's export) as `weight_kg` under source `weight_csv`. It reads the column headed "Date" and the one headed "Weight"
+(else the first with the word, skipping goal, target and body-composition columns). Dates may be ISO (with or
+without a time), long ("Tuesday, June 26, 2018") or US (06/26/2018); day/month dates are refused. The unit comes from
+the header or `--unit`: never guessed, and the two must agree. Blank days are skipped, a weigh-in stored by several
+sources counts once, and importing again updates those days. Ride insights use these for W/kg and kJ/kg.
 
 ### Performance index (how good you are, over time)
 
