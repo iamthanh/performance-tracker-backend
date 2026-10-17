@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 """
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # MIGRATIONS[v] upgrades a database from version v - 1 to v. Each one runs in a
 # single transaction together with the ``user_version`` bump.
@@ -284,6 +284,27 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             note TEXT,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (source, source_id)
+        )
+        """,
+    ),
+    # Performance index: each ride's best efforts after accumulated work, and app-wide settings.
+    6: (
+        """
+        CREATE TABLE durability_bests (
+            source TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            after_kj INTEGER NOT NULL,       -- the effort starts after this much work in the ride
+            duration_s INTEGER NOT NULL,
+            watts REAL NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source, source_id, after_kj, duration_s)
+        )
+        """,
+        """
+        CREATE TABLE app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,             -- JSON
+            updated_at TEXT NOT NULL
         )
         """,
     ),
@@ -685,6 +706,19 @@ class Store:
             self.conn.execute("DELETE FROM power_curve WHERE source = ? AND source_id = ?", (source, source_id))
             self.conn.executemany(
                 "INSERT INTO power_curve (source, source_id, duration_s, watts, updated_at) VALUES (?, ?, ?, ?, ?)",
+                params,
+            )
+        return len(params)
+
+    def replace_durability_bests(self, source: str, source_id: str, bests: Mapping[tuple[int, int], float]) -> int:
+        """Store one activity's ``{(after_kj, duration_s): watts}``, replacing the old ones."""
+        now = now_utc_iso()
+        params = [(source, source_id, int(a), int(d), float(w), now) for (a, d), w in sorted(bests.items())]
+        with self.conn:
+            self.conn.execute("DELETE FROM durability_bests WHERE source = ? AND source_id = ?", (source, source_id))
+            self.conn.executemany(
+                "INSERT INTO durability_bests (source, source_id, after_kj, duration_s, watts, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 params,
             )
         return len(params)

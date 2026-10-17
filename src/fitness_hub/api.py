@@ -44,7 +44,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import __version__, insights, nutrition, queries, uploads
+from . import __version__, insights, nutrition, performance, queries, uploads
 from .analysis import analyze, thresholds_on
 from .config import Settings
 from .db import ATHLETE_SETTINGS, Store, open_readonly, schema_version
@@ -119,6 +119,13 @@ class DrinkIn(BaseModel):
     maltodextrin_g: Amount = None
     sucrose_g: Amount = None
     other: list[OtherIngredient] = Field(default_factory=list, max_length=20)
+
+
+class PerformanceSettingsIn(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    weights: dict[str, float]  # all six components, checked by performance.set_settings
+    decay_per_week: Annotated[float | None, Field(ge=0, le=0.05)] = None
 
 
 class WeightIn(BaseModel):
@@ -419,6 +426,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if result is None:
             raise HTTPException(status_code=404, detail="activity not found")
         return result
+
+    @app.get("/api/performance")
+    def performance_index(conn: Conn, start_date: DateQuery = None, end_date: DateQuery = None) -> dict[str, Any]:
+        """The performance index per day (score, six components with when each was last tested,
+        aerobic efficiency), what raised it, and the weights used. All history by default."""
+        start = parse_date(start_date, "start_date").isoformat() if start_date else None
+        end = parse_date(end_date, "end_date").isoformat() if end_date else None
+        return performance.performance(conn, start, end)
+
+    @app.get("/api/performance/settings")
+    def performance_settings(conn: Conn) -> dict[str, Any]:
+        return {**performance.get_settings(conn), "presets": performance.PRESETS}
+
+    @app.put("/api/performance/settings")
+    def set_performance_settings(body: PerformanceSettingsIn) -> dict[str, Any]:
+        with Store(settings.db_path) as store:
+            saved = performance.set_settings(store.conn, body.weights, body.decay_per_week)
+        return {**saved, "presets": performance.PRESETS}
 
     @app.get("/api/summary")
     def summary(

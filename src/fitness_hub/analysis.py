@@ -59,7 +59,7 @@ from .util import now_utc_iso, parse_date
 
 log = logging.getLogger(__name__)
 
-ANALYSIS_VERSION = 1
+ANALYSIS_VERSION = 2  # 2: durability bests
 BATCH = 200
 MAX_GAP_S = 5
 MOVING_SPEED_MPS = 1.0
@@ -90,6 +90,9 @@ MAX_HR_WINDOW_S = 30
 MAX_HR_RANK = 3  # the third-highest activity max: one or two noisy sessions do not set it
 DEFAULT_RESTING_HR = 50.0
 THRESHOLD_OF_MAX_HR = 0.92  # typical; used when max HR is unknown or not above threshold HR
+# Durability: each ride's best efforts that start after this much work (kJ), for the performance index.
+DURABILITY_AFTER_KJ = (1000, 1500, 2000, 2500, 3000)
+DURABILITY_BEST_DURATIONS_S = (300, 1200)
 POWER_CURVE_DURATIONS = (
     1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 300, 420, 600, 720, 900, 1200,
     1800, 2400, 3600, 5400, 7200, 10800, 14400, 18000,
@@ -236,6 +239,28 @@ def power_curve(power: np.ndarray, durations: Iterable[int] = POWER_CURVE_DURATI
     return {d: float(np.max(c[d:] - c[:-d]) / d) for d in durations if d <= power.size}
 
 
+def fatigued_bests(power: np.ndarray) -> dict[tuple[int, int], float]:
+    """``{(after_kj, duration_s): watts}``: the best average power of each duration in
+    ``DURABILITY_BEST_DURATIONS_S`` over windows that start once ``after_kj`` of work is done
+    (NaN counts as 0 W, as in ``power_curve``); only what fits in the ride."""
+    power = np.nan_to_num(power, nan=0.0)
+    if power.size == 0:
+        return {}
+    work = np.cumsum(power) / 1000
+    sums = np.concatenate(([0.0], np.cumsum(power)))
+    out: dict[tuple[int, int], float] = {}
+    for d in DURABILITY_BEST_DURATIONS_S:
+        if d > power.size:
+            continue
+        averages = (sums[d:] - sums[:-d]) / d
+        best_from = np.maximum.accumulate(averages[::-1])[::-1]
+        for after in DURABILITY_AFTER_KJ:
+            start = int(np.searchsorted(work, after - 1e-9)) + 1  # the first second after it
+            if start < averages.size:
+                out[(after, d)] = float(best_from[start])
+    return out
+
+
 def best_average(values: np.ndarray, window: int, min_coverage: float = 0.9) -> float | None:
     """Best ``window``-second average of a series with gaps (NaN), counting only
     windows where at least ``min_coverage`` of the samples exist."""
@@ -302,6 +327,7 @@ def base_metrics(streams: Mapping[str, list[Any]]) -> tuple[dict[str, Any], dict
             power_hist=_histogram(power),
         )
         curve = power_curve(paused["power"])
+        metrics["durability_bests"] = fatigued_bests(paused["power"])
     if has_hr:
         avg_hr = float(np.nanmean(hr))
         metrics.update(
@@ -613,6 +639,7 @@ def analyze(store: Store, *, full: bool = False, progress: Callable[[int, int], 
             (source, source_id),
         ).fetchone()
         metrics, curve = base_metrics(decode_streams(encoding, data))
+        store.replace_durability_bests(source, source_id, metrics.pop("durability_bests", {}))
         # The threshold-dependent columns stay empty until the re-scoring pass below.
         batch.append(
             {
