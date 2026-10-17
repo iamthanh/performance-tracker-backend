@@ -185,7 +185,7 @@ each (60 MB once unzipped), through `POST /api/activities/import`. Imports run o
 `GET /api/activities/{source}/{id}/insights` adds what coaches look at beyond NP/IF/TSS (`insights.py`):
 
 - **Per kg:** the body weight saved before the workout, else the latest weigh-in up to its day.
-- **Durability:** the best 1, 5 and 20 minutes after the ride had already done 100, 200, 300 ... kJ of work
+- **Durability:** the best 1, 5, 8, 10, 15 and 20 minutes after the ride had already done 100, 200, 300 ... kJ of work
   (a multiple of 100 kJ past 100 steps), next to the same efforts from the start; the UI adds kJ/kg with a
   weight. Professionals' best efforts fade with accumulated work, most clearly beyond about 20 kJ/kg, and how little separates riders that fresh
   power does not.

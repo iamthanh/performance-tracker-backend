@@ -2,7 +2,7 @@
 
 - **Body weight** for per-kg values: the weight saved before the workout, else the latest
   body-weight measurement on or before its day.
-- **Durability** (fatigue resistance): the best 1-, 5- and 20-minute power *after* the
+- **Durability** (fatigue resistance): the best 1-, 5-, 8-, 10-, 15- and 20-minute power *after* the
   ride had already done 100, 200, 300 ... kJ of work (a multiple of 100 kJ past
   ``DURABILITY_MAX_STEPS`` steps; none in the ride's last half step), next to the same
   efforts from the start. Professionals' best efforts fall progressively with
@@ -50,7 +50,7 @@ from .queries import downsample, get_activity, sport_family
 
 log = logging.getLogger(__name__)
 
-DURABILITY_DURATIONS_S = (60, 300, 1200)
+DURABILITY_DURATIONS_S = (60, 300, 480, 600, 900, 1200)
 DURABILITY_STEP_KJ = 100
 DURABILITY_MAX_STEPS = 100  # a longer ride takes a multiple of DURABILITY_STEP_KJ instead
 DURABILITY_MIN_LEFT = 0.5  # of a step: a step is shown only with at least this much riding after it
