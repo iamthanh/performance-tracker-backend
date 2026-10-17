@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 """
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # MIGRATIONS[v] upgrades a database from version v - 1 to v. Each one runs in a
 # single transaction together with the ``user_version`` bump.
@@ -209,6 +209,65 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             PRIMARY KEY (source, source_id)
         )
         """,
+    ),
+    # Nutrition: what was eaten and drunk (meals and fueling during workouts) and
+    # saved foods for quick logging. See nutrition.py.
+    4: (
+        """
+        CREATE TABLE foods (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            brand TEXT,
+            serving TEXT,                    -- what one serving is, e.g. "1 gel (40 g)", "750 ml bottle"
+            kcal REAL,                       -- nutrients per serving; NULL = unknown
+            carbs_g REAL,
+            sugars_g REAL,
+            protein_g REAL,
+            fat_g REAL,
+            fiber_g REAL,
+            sodium_mg REAL,
+            potassium_mg REAL,
+            caffeine_mg REAL,
+            fluid_ml REAL,
+            note TEXT,
+            archived INTEGER NOT NULL DEFAULT 0,  -- hidden from pickers, kept for old entries
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE nutrition_entries (
+            id INTEGER PRIMARY KEY,
+            source TEXT NOT NULL DEFAULT 'manual',  -- manual, or the app an import came from
+            source_id TEXT,                  -- the importer's id, so a re-import updates instead of duplicating
+            local_date TEXT NOT NULL,
+            consumed_at TEXT,                -- UTC, when known
+            meal TEXT NOT NULL,              -- breakfast, lunch, dinner, snack, pre_workout, during_workout, post_workout
+            activity_source TEXT,            -- the workout this fuelled (activities.source/source_id)
+            activity_source_id TEXT,
+            offset_s REAL,                   -- seconds into that workout
+            food_id INTEGER,                 -- the saved food it was logged from (NULL if typed in or deleted)
+            name TEXT NOT NULL,
+            servings REAL NOT NULL DEFAULT 1,
+            kcal REAL,                       -- totals for this entry (servings applied), copied at logging
+            carbs_g REAL,                    -- time so editing a saved food never rewrites history
+            sugars_g REAL,
+            protein_g REAL,
+            fat_g REAL,
+            fiber_g REAL,
+            sodium_mg REAL,
+            potassium_mg REAL,
+            caffeine_mg REAL,
+            fluid_ml REAL,
+            note TEXT,
+            raw TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (source, source_id)
+        )
+        """,
+        "CREATE INDEX nutrition_entries_by_date ON nutrition_entries (local_date)",
+        "CREATE INDEX nutrition_entries_by_activity ON nutrition_entries (activity_source, activity_source_id)",
     ),
 }
 

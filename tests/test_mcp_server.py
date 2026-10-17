@@ -13,7 +13,8 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import get_default_environment, stdio_client
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from fitness_hub import queries
+from fitness_hub import nutrition, queries
+from fitness_hub.analysis import analyze
 from fitness_hub.config import Settings
 from fitness_hub.db import Store
 from fitness_hub.mcp_server import create_server, is_loopback, serve
@@ -30,6 +31,8 @@ EXPECTED_TOOLS = {
     "training_load",
     "power_curve",
     "get_activity_analysis",
+    "nutrition_daily",
+    "workout_fueling",
     "sync_now",
 }
 
@@ -272,3 +275,22 @@ def test_stdio_subprocess(seeded: Settings, args: list[str]) -> None:
     assert not out["result_error"]
     assert out["result"] == {"columns": ["source", "n"], "rows": [["garmin", 1], ["strava", 2]], "truncated": False}
     assert out["bad_error"]
+
+
+def nutrition_ride(store: Store) -> None:
+    store.upsert_activities([{"source": "strava", "source_id": "1", "start_time": "2026-10-12T16:00:00Z",
+                              "local_date": "2026-10-12", "activity_type": "Ride", "moving_s": 3600.0, "raw": {}}])  # fmt: skip
+    streams = {"time": list(range(3600)), "power": [200] * 3600, "heart_rate": [140] * 3600}
+    store.upsert_activity_streams([{"source": "strava", "source_id": "1", "streams": streams}])
+
+
+def test_nutrition_tools(settings: Settings) -> None:
+    with Store(settings.db_path) as s:
+        nutrition_ride(s)
+        analyze(s)
+        nutrition.save_entry(s.conn, {"local_date": "2026-10-12", "meal": "during_workout", "name": "Gel",
+                                      "carbs_g": 25, "activity_source": "strava", "activity_source_id": "1"})  # fmt: skip
+    error, days = call(settings, "nutrition_daily", {"start_date": "2026-10-12", "end_date": "2026-10-12"})
+    assert not error and days["days"][0]["intake"]["carbs_g"] == 25  # type: ignore[index]
+    error, fueling = call(settings, "workout_fueling", {"source": "strava", "source_id": "1"})
+    assert not error and fueling["during"]["carbs_g"] == 25  # type: ignore[index]
