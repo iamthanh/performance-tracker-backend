@@ -271,3 +271,45 @@ def test_sport_family() -> None:
     assert queries.sport_family("trail_running") == "running"
     assert queries.sport_family("Pilates") == "pilates"
     assert queries.sport_family(None) == "other"
+
+
+def _kcal_rows(store, rows):
+    store.upsert_activities([{"local_date": r["start_time"][:10], "raw": {}, **r} for r in rows])
+
+
+def test_workout_kcal_from_the_merged_copies(store) -> None:
+    """kcal: the kept copy's calories, else a merged copy's (preferred source first), else a ride's kJ."""
+    _kcal_rows(store, [
+        {"source": "strava", "source_id": "own", "start_time": "2026-10-12T07:00:00Z", "activity_type": "Run",
+         "calories": 500.0},
+        {"source": "garmin", "source_id": "own-g", "start_time": "2026-10-12T07:00:30Z", "activity_type": "running",
+         "calories": 999.0},  # the kept row's own calories win
+        {"source": "strava", "source_id": "s", "start_time": "2026-10-13T07:00:00Z", "activity_type": "Run"},
+        {"source": "google_health", "source_id": "gh", "start_time": "2026-10-13T07:00:20Z",
+         "activity_type": "running", "calories": 610.0},
+        {"source": "garmin_export", "source_id": "ge", "start_time": "2026-10-13T07:00:40Z",
+         "activity_type": "running", "calories": 650.0},
+        {"source": "strava", "source_id": "zero", "start_time": "2026-10-14T07:00:00Z", "activity_type": "Walk",
+         "calories": 0.0},
+    ])  # fmt: skip
+    rows = {r["source_id"]: r for r in queries.activities_with_metrics(store.conn, "2026-10-12", "2026-10-14")}
+    assert rows["own-g"]["kcal"] == 999.0  # garmin is kept over strava (no analysis either way)
+    kept_13 = next(r for r in rows.values() if r["local_date"] == "2026-10-13")
+    assert kept_13["kcal"] in (610.0, 650.0)
+    assert rows["zero"]["kcal"] is None  # 0 recorded and not a ride: unknown
+    assert "_copies" not in kept_13
+
+
+def test_workout_kcal_never_borrows_from_another_workout(store) -> None:
+    """Two Garmin activities 4.5 min apart (a stopped and restarted ride) and one Strava copy of the
+    first: the Strava row must not take the second Garmin ride's calories (it would be counted twice)."""
+    _kcal_rows(store, [
+        {"source": "strava", "source_id": "k", "start_time": "2026-10-12T07:00:00Z", "activity_type": "Run"},
+        {"source": "garmin", "source_id": "g2", "start_time": "2026-10-12T06:58:20Z", "activity_type": "running"},
+        {"source": "garmin", "source_id": "g1", "start_time": "2026-10-12T07:02:50Z", "activity_type": "running",
+         "calories": 900.0},
+    ])  # fmt: skip
+    rows = queries.activities_with_metrics(store.conn, "2026-10-12", "2026-10-12")
+    assert sorted(r["kcal"] or 0 for r in rows) == [0, 900.0]
+    total = queries.period_totals(store.conn, "2026-10-12", "2026-10-12", "day")["periods"][0]["total"]
+    assert total["kcal"] == 900.0

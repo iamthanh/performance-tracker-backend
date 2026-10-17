@@ -302,7 +302,7 @@ Then ask, for example:
 | `sync_status` | Row counts and per-stream cursor, last success and last error |
 | `list_activities` | Workouts newest first; filter by dates, sport (`cycling`, `running`, … or a provider type) and source; de-duplicated unless `source` is set |
 | `get_activity` | One activity, optionally with the raw provider JSON |
-| `activity_summary` | Totals per week (Monday start), month, day or sport: count, distance_km, moving_hours, elevation, calories, average HR. Never double counts |
+| `activity_summary` | Totals per week (Monday start), month, day or sport: count, distance_km, moving_hours, elevation, calories (as recorded by the kept copy; the web API's `kcal` also falls back to a ride's kJ), average HR. Never double counts |
 | `get_daily_metrics` | `{date, metric, source, value}` rows; default last 30 days. Sources are not merged |
 | `get_sleep` | Sleep sessions by wake-up date; default last 30 days, main sleep only |
 | `get_body_measurements` | Weight (kg) and body fat (%); default last 90 days |
@@ -367,10 +367,10 @@ Reads use read-only connections. Writes are threshold overrides, which re-score 
 |---|---|
 | `GET /api/health` | Status, version, schema version, latest activity date, last analysis time |
 | `GET /api/status` | Row counts and per-source sync state |
-| `GET /api/activities?start_date&end_date&activity_type&limit` | Workouts newest first, one per workout (an analysed copy wins over an unanalysed duplicate), with TSS, IF, NP, work, VI, EF, decoupling, `has_streams` |
+| `GET /api/activities?start_date&end_date&activity_type&limit` | Workouts newest first, one per workout (an analysed copy wins over an unanalysed duplicate), with TSS, IF, NP, work, VI, EF, decoupling, `kcal` burned (recorded calories from any copy of the workout, else a ride's kJ of work), `has_streams` |
 | `GET /api/activities/{source}/{id}` | One workout: `activity`, `analysis` (zones, power curve, thresholds used), `laps`, `device`, available `streams` channels |
 | `GET /api/activities/{source}/{id}/streams?max_points=2000` | Per-sample channels averaged down to `max_points` (`time` in seconds from the start) |
-| `GET /api/summary?start_date&end_date&group_by=week` | Totals per day/week (Monday start)/month, overall and per sport: count, distance, hours, elevation, TSS, kJ |
+| `GET /api/summary?start_date&end_date&group_by=week` | Totals per day/week (Monday start)/month, overall and per sport: count, distance, hours, elevation, TSS, kJ, kcal burned |
 | `GET /api/training-load?start_date&end_date` | Daily TSS, CTL, ATL, TSB and `unscored` workouts (default 90 days) |
 | `GET /api/power-curve?start_date&end_date&activity_type` | Best power per duration with the activity that set it (cycling unless `activity_type=all`) |
 | `GET /api/daily-metrics?metric=…`, `/api/sleep`, `/api/body` | Health data, as in the MCP tools |

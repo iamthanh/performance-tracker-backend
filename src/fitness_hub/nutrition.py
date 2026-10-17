@@ -356,15 +356,6 @@ def _sum(entries: list[dict[str, Any]]) -> dict[str, float | None]:
     return totals
 
 
-def workout_kcal(row: Mapping[str, Any]) -> float | None:
-    """A workout's energy: its recorded calories, else its work in kJ (~kcal for cycling)."""
-    if row.get("calories"):
-        return float(row["calories"])
-    if row.get("work_kj") and row.get("sport", "cycling") == "cycling":
-        return float(row["work_kj"])
-    return None
-
-
 def daily_nutrition(conn: sqlite3.Connection, start_date: str, end_date: str) -> list[dict[str, Any]]:
     """Per day from ``start_date`` to ``end_date``: intake totals (``entries`` counted),
     workout kcal, the watch's total and active kcal, and ``balance_kcal`` (intake minus
@@ -384,10 +375,7 @@ def daily_nutrition(conn: sqlite3.Connection, start_date: str, end_date: str) ->
     for entry in list_entries(conn, start.isoformat(), end.isoformat()):
         days[entry["local_date"]]["entries"].append(entry)
     for row in queries.activities_with_metrics(conn, start.isoformat(), end.isoformat()):
-        if not row.get("calories") and row.get("also_recorded_by"):
-            # The copy shown may lack calories that another service's copy recorded.
-            row = {**row, "calories": _best_calories(same_workout(conn, row["source"], row["source_id"]))}
-        kcal = workout_kcal(row)
+        kcal = row["kcal"]  # recorded calories (from any copy of the workout), else kJ of work for rides
         if kcal is not None and row["local_date"] in days:
             bucket = days[row["local_date"]]
             bucket["workout_kcal"] = (bucket["workout_kcal"] or 0.0) + kcal
@@ -446,7 +434,6 @@ def workout_fueling(conn: sqlite3.Connection, source: str, source_id: str) -> di
         (source, source_id),
     ).fetchone()
     row = {**activity, **(dict(metrics) if metrics else {}), "sport": queries.sport_family(activity["activity_type"])}
-    row["calories"] = _best_calories(same_workout(conn, source, source_id))
     entries = list_entries(conn, activity=(source, source_id))
     during = [e for e in entries if e["meal"] == DURING]
     totals = _sum(during)
@@ -457,7 +444,7 @@ def workout_fueling(conn: sqlite3.Connection, source: str, source_id: str) -> di
         value = totals[nutrient]
         return round(value / hours, 1) if value is not None and hours > 0 else None
 
-    burned = workout_kcal(row)
+    burned = queries.workout_kcal(row, _best_calories(same_workout(conn, source, source_id)))
     intensity = row.get("intensity_factor")
     share = carb_share(intensity) if intensity else None
     carbs_burned = round(burned * share / KCAL_PER_G_CARB) if burned and share else None

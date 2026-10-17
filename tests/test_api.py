@@ -80,6 +80,9 @@ def test_activities_prefer_the_analysed_copy(client: TestClient) -> None:
     assert second["also_recorded_by"] == ["garmin"] and second["has_streams"] is True
     assert second["tss"] > 0 and second["tss_method"] == "power" and second["sport"] == "cycling"
     assert rows[0]["has_streams"] is False and rows[0]["tss"] is None and rows[0]["analysed"] is False
+    assert second["kcal"] == pytest.approx(200 * 1.8) and rows[0]["kcal"] is None  # a ride's kJ; a run with nothing
+    week = client.get("/api/summary", params={"start_date": "2026-09-01", "end_date": "2026-09-08"}).json()
+    assert week["periods"][0]["total"]["kcal"] == pytest.approx(250 * 3.6 + 200 * 1.8)
     newest = client.get("/api/activities", params={"limit": 1}).json()
     assert len(newest) == 1 and newest[0]["source_id"] == "4"
     assert newest[0]["has_streams"] is True and newest[0]["analysed"] is False  # streams, not analysed yet
