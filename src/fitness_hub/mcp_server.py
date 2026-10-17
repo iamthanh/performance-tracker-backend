@@ -61,7 +61,8 @@ sample_count, encoding, data, updated_at; all-day heart rate); their `data` is a
 foods(id, name, brand, serving, nutrients per serving: kcal, carbs_g, sugars_g, protein_g, fat_g, fiber_g, \
 sodium_mg, potassium_mg, caffeine_mg, fluid_ml; note, archived) and nutrition_entries(id, source, source_id, \
 local_date, consumed_at, meal, activity_source, activity_source_id, offset_s, food_id, name, servings, the same \
-nutrients as totals for the entry, note) hold what the user logged eating and drinking. \
+nutrients as totals for the entry, note, kind food|drink, recipe: one bottle's JSON) hold what the user logged \
+eating and drinking; workout_weights(source, source_id, pre_kg, post_kg, note) their weight around a workout. \
 activity_metrics, power_curve and athlete_settings are filled by the training analysis and may be empty. \
 `raw` holds the provider JSON (use json_extract). \
 query_sql does NOT de-duplicate activities.

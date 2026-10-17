@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 """
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # MIGRATIONS[v] upgrades a database from version v - 1 to v. Each one runs in a
 # single transaction together with the ``user_version`` bump.
@@ -268,6 +268,24 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         """,
         "CREATE INDEX nutrition_entries_by_date ON nutrition_entries (local_date)",
         "CREATE INDEX nutrition_entries_by_activity ON nutrition_entries (activity_source, activity_source_id)",
+    ),
+    # Workout drinks as bottles with a recipe, and body weight before and after a workout.
+    5: (
+        "ALTER TABLE nutrition_entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'food' CHECK (kind IN ('food', 'drink'))",
+        # JSON recipe of ONE bottle (water_ml, salt_g, maltodextrin_g, sucrose_g, other: [...]);
+        # servings is the number of bottles and the nutrient columns hold the totals.
+        "ALTER TABLE nutrition_entries ADD COLUMN recipe TEXT",
+        """
+        CREATE TABLE workout_weights (
+            source TEXT NOT NULL,            -- the workout (activities.source/source_id)
+            source_id TEXT NOT NULL,
+            pre_kg REAL,                     -- body weight just before
+            post_kg REAL,                    -- and just after
+            note TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source, source_id)
+        )
+        """,
     ),
 }
 
