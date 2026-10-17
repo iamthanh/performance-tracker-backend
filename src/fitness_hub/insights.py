@@ -55,6 +55,7 @@ DURABILITY_STEP_KJ = 100
 DURABILITY_MAX_STEPS = 100  # a longer ride takes a multiple of DURABILITY_STEP_KJ instead
 TIME_MARK_EVERY_S = (300, 600, 900, 1800, 3600, 7200)
 TIME_MARKS = 10
+TIME_MARK_GAP = 0.06  # of the kJ axis: closer marks would overlap (the UI leaves them out)
 DURABILITY_MIN_LEFT = 0.5  # of a step: a step is shown only with at least this much riding after it
 DEFAULT_W_PRIME_J = 20000.0
 MATCH_J = 2000.0
@@ -130,17 +131,32 @@ def durability(power: np.ndarray, clock: np.ndarray | None = None) -> dict[str, 
 
 
 def _time_marks(clock: np.ndarray, work: np.ndarray, up_to_kj: float) -> list[dict[str, float]]:
-    """``[{time_s, kj}]`` every round interval of elapsed time (at most ``TIME_MARKS`` of them up
-    to ``up_to_kj``): the work done by then."""
+    """``[{time_s, kj}]`` every round interval of elapsed time up to ``up_to_kj``: the work done by
+    then. The interval is the finest whose marks, counting only those at least ``TIME_MARK_GAP`` of
+    the axis apart (a stop adds time but no work), number at most ``TIME_MARKS``."""
     end = int(np.searchsorted(work, up_to_kj - 1e-9))  # the second the last step is reached
     span = float(clock[min(end, clock.size - 1)])
-    every = next((m for m in TIME_MARK_EVERY_S if span / m <= TIME_MARKS), TIME_MARK_EVERY_S[-1])
-    marks = []
-    for t in np.arange(every, span + 1e-9, every):
-        i = int(np.searchsorted(clock, t))  # the first timer second at or after it
-        if i < work.size:
-            marks.append({"time_s": float(t), "kj": _round(float(work[i - 1]) if i else 0.0, 1)})
-    return marks
+
+    def marks_every(every: float) -> list[dict[str, float]]:
+        out = []
+        for t in np.arange(every, span + 1e-9, every):
+            i = int(np.searchsorted(clock, t))  # the first timer second at or after it
+            if i < work.size:
+                out.append({"time_s": float(t), "kj": _round(float(work[i - 1]) if i else 0.0, 1)})
+        return out
+
+    def distinct(marks: list[dict[str, float]]) -> int:
+        count, prev = 0, 0.0
+        for m in marks:
+            if up_to_kj > 0 and (m["kj"] - prev) / up_to_kj >= TIME_MARK_GAP:
+                count, prev = count + 1, m["kj"]
+        return count
+
+    for every in TIME_MARK_EVERY_S:
+        marks = marks_every(every)
+        if distinct(marks) <= TIME_MARKS:
+            return marks
+    return marks_every(TIME_MARK_EVERY_S[-1])
 
 
 # -- W' balance -----------------------------------------------------------------------------
