@@ -189,11 +189,11 @@ each (60 MB once unzipped), through `POST /api/activities/import`. Imports run o
   (1000, 2000 ... kJ without a weight), next to the same efforts from the start. Professionals' best efforts
   fade with accumulated work, most clearly beyond about 20 kJ/kg, and how little separates riders that fresh
   power does not.
-- **W' balance and matches:** Skiba's differential model, with CP = the ride's FTP and W' from the
-  critical-power fit of the year's best efforts up to the ride (20 kJ without a fit). The streams endpoint
+- **W' balance and matches:** Skiba's differential model, with CP and W' from the
+  critical-power fit of the year's best efforts up to the ride (the FTP and 20 kJ without a fit). The streams endpoint
   carries it as the `w_bal` channel. A match is a drop of 2 kJ or more within 5 minutes.
-- **Efforts above FTP:** stretches above FTP of 30 s or more (5 s or more above 120 % of FTP), on a 10 s
-  centred average, with power, HR, cadence, work and W' spent.
+- **Efforts above FTP:** from when the 10 s average reaches FTP until it drops below 90 % of it, 30 s or
+  more (and sprints of 5 s or more above 120 % of FTP), with power, HR, cadence, work and W' spent.
 
 ### Nutrition (logged by you)
 

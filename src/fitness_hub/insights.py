@@ -10,22 +10,24 @@
   2022 and 2025; Spragg et al. 2024).
 - **W' balance**: how much of the work capacity above critical power (W') is left at
   each second, with Skiba's differential model (Skiba et al. 2015: spent 1:1 above CP,
-  recovered in proportion to what is missing and how far below CP the rider is). CP is
-  the FTP in effect for the ride; W' comes from the critical-power fit of the trailing
-  year's best efforts up to the ride, else ``DEFAULT_W_PRIME_J``. A **match** is a drop
+  recovered in proportion to what is missing and how far below CP the rider is). CP and W'
+  come from the critical-power fit of the trailing year's best efforts up to the ride (a
+  pair that belongs together); without a fit, CP is the ride's FTP and W' ``DEFAULT_W_PRIME_J``. A **match** is a drop
   of at least ``MATCH_J`` within ``MATCH_IDLE_S`` of a high point (GoldenCheetah counts
   matches from 2 kJ), ended once ``MATCH_RECOVERED`` of W' (or half the drop, if less) is
   back, or once W' has not fallen another ``MATCH_PROGRESS_J`` in ``MATCH_IDLE_S``.
-- **Efforts**: every stretch above FTP of at least ``MIN_EFFORT_S`` seconds (``MIN_SURGE_S``
-  for an anaerobic one, from ``SURGE_OF_FTP``), found on
-  a ``SMOOTH_S``-second centred average so a short dip does not split an interval, and
-  trimmed to the seconds that were at or above FTP.
+- **Efforts**: from the moment the ``SMOOTH_S``-second centred average reaches FTP until it
+  drops below ``EXIT_OF_FTP`` of it (so a short dip does not split an interval), taken out
+  to the first and last seconds at or above FTP; kept when at least ``MIN_EFFORT_S`` long
+  and averaging ``MIN_AVG_OF_FTP`` of FTP. Shorter runs of seconds at or above FTP count
+  as sprints or kicks when they last ``MIN_SURGE_S`` and average ``SURGE_OF_FTP`` of it.
 
 All of it needs cycling power; efforts and W' balance also need an FTP.
 """
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import date, timedelta
 from typing import Any
@@ -44,6 +46,8 @@ from .db import load_streams
 from .nutrition import get_workout_weight
 from .queries import downsample, get_activity, sport_family
 
+log = logging.getLogger(__name__)
+
 DURABILITY_DURATIONS_S = (60, 300, 1200)
 DURABILITY_STEP_KJ_KG = 10
 DURABILITY_STEP_KJ = 1000  # without a body weight
@@ -53,8 +57,10 @@ MATCH_J = 2000.0
 MATCH_RECOVERED = 0.1  # of W'
 MATCH_IDLE_S = 300  # a match also ends once W' has not fallen by MATCH_PROGRESS_J for this long
 MATCH_PROGRESS_J = 1000.0
+MATCH_START_J = 200.0
 SMOOTH_S = 10
-MERGE_GAP_S = 10
+EXIT_OF_FTP = 0.9  # an effort starts when the 10 s average reaches FTP and lasts until it drops below this
+MIN_AVG_OF_FTP = 0.98  # ... and counts if it averaged this much of FTP (a dip or two can pull it just under)
 MIN_EFFORT_S = 30
 MIN_SURGE_S = 5  # shorter efforts count when they are anaerobic (sprints, kicks) ...
 SURGE_OF_FTP = 1.2  # ... at this share of FTP or more (Coggan Z6 and up)
@@ -114,8 +120,12 @@ def durability(power: np.ndarray, weight_kg: float | None) -> dict[str, Any] | N
 # -- W' balance -----------------------------------------------------------------------------
 
 
-def w_prime_for(conn: sqlite3.Connection, local_date: str) -> tuple[float, str]:
-    """``(W' in J, "fit" | "default")``: from the critical-power fit of the trailing year's best efforts."""
+def cp_model(conn: sqlite3.Connection, local_date: str, ftp: float) -> tuple[float, float, str]:
+    """``(CP in W, W' in J, "fit" | "ftp")`` for the ride's W' balance: the critical-power fit of the
+    trailing year's best efforts up to the ride, a CP and W' that belong together; without a fit,
+    the ride's FTP as CP with a typical ``DEFAULT_W_PRIME_J``. (The FTP itself can sit above the fit:
+    it declines slowly after a peak, or is set by hand. Pairing it with the fit's W' would make W'
+    run out on efforts the rider can do.)"""
     start = (date.fromisoformat(local_date) - timedelta(days=AUTO_WINDOW_DAYS - 1)).isoformat()
     best: dict[int, float] = {}
     for day, curve in _ride_curves(conn):
@@ -123,7 +133,7 @@ def w_prime_for(conn: sqlite3.Connection, local_date: str) -> tuple[float, str]:
             for d, w in curve.items():
                 best[d] = max(best.get(d, 0.0), w)
     fit = critical_power(best)
-    return (fit[1], "fit") if fit else (DEFAULT_W_PRIME_J, "default")
+    return (fit[0], fit[1], "fit") if fit else (ftp, DEFAULT_W_PRIME_J, "ftp")
 
 
 def w_balance(power: np.ndarray, cp: float, w_prime: float) -> np.ndarray:
@@ -140,18 +150,18 @@ def w_balance(power: np.ndarray, cp: float, w_prime: float) -> np.ndarray:
     return out
 
 
-def matches(balance: np.ndarray, w_prime: float) -> list[tuple[int, int]]:
-    """``(high, low)`` second indices of each drop of at least ``MATCH_J`` within ``MATCH_IDLE_S`` of
+def matches(balance: np.ndarray, w_prime: float) -> list[tuple[int, int, int]]:
+    """``(start, high, low)`` second indices of each drop of at least ``MATCH_J`` within ``MATCH_IDLE_S`` of
     a high point."""
     found: list[tuple[int, int]] = []
     high = low = mark = 0  # mark: when the match last fell by MATCH_PROGRESS_J
     burning = False
     for i, b in enumerate(balance):
         if not burning:
-            if b >= balance[high] or i - high >= MATCH_IDLE_S:  # a slow drain is not a match
-                high = i
-            elif balance[high] - b >= MATCH_J:
+            if balance[high] - b >= MATCH_J:
                 burning, low, mark = True, i, i
+            elif b >= balance[high] or i - high >= MATCH_IDLE_S:  # a slow drain is not a match
+                high = i
             continue
         if b < balance[low]:
             low = i
@@ -163,7 +173,8 @@ def matches(balance: np.ndarray, w_prime: float) -> list[tuple[int, int]]:
             burning, high = False, i
     if burning:
         found.append((high, low))
-    return found
+    # Each match starts where the dig began: the last second still within MATCH_START_J of its high.
+    return [(h + int(np.flatnonzero(balance[h : lo + 1] >= balance[h] - MATCH_START_J)[-1]), h, lo) for h, lo in found]
 
 
 # -- efforts --------------------------------------------------------------------------------
@@ -177,27 +188,42 @@ def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
 
 def effort_spans(power: np.ndarray, paused: np.ndarray, ftp: float) -> list[tuple[int, int]]:
     """``[(start, end)]`` seconds of the efforts above ``ftp`` (see the module docstring)."""
-    if power.size < SMOOTH_S:
+    if power.size == 0:
         return []
     riding = (~paused).astype(float)
     kernel = np.ones(SMOOTH_S)
     with np.errstate(invalid="ignore", divide="ignore"):  # the riding seconds of each window only
         smooth = np.convolve(power * riding, kernel, mode="same") / np.convolve(riding, kernel, mode="same")
-    above = (smooth >= ftp) & ~paused
-    spans: list[list[int]] = []
-    for start, end in _runs(above):
-        hot = np.flatnonzero(power[start:end] >= ftp)
-        if hot.size == 0:
+    hot = (power >= ftp) & ~paused
+    spans: list[tuple[int, int]] = []
+    i, n = 0, power.size
+    while i < n:
+        if paused[i] or not smooth[i] >= ftp:
+            i += 1
             continue
-        start, end = start + int(hot[0]), start + int(hot[-1]) + 1
-        if spans and start - spans[-1][1] <= MERGE_GAP_S and not paused[spans[-1][1] : start].any():
-            spans[-1][1] = end
-        else:
-            spans.append([start, end])
-    return [
-        (s, e) for s, e in spans
-        if e - s >= MIN_EFFORT_S or (e - s >= MIN_SURGE_S and power[s:e].mean() >= SURGE_OF_FTP * ftp)
-    ]  # fmt: skip
+        end = i  # hysteresis: stay in the effort while the average holds EXIT_OF_FTP
+        while end < n and not paused[end] and smooth[end] >= EXIT_OF_FTP * ftp:
+            end += 1
+        inside = np.flatnonzero(hot[i:end])
+        if inside.size:
+            s, e = i + int(inside[0]), i + int(inside[-1]) + 1
+            while s > 0 and hot[s - 1]:  # out to the first and last seconds at FTP
+                s -= 1
+            while e < n and hot[e]:
+                e += 1
+            if spans and s <= spans[-1][1]:
+                s = spans[-1][0]
+                spans.pop()
+            if e - s >= MIN_EFFORT_S and power[s:e].mean() >= MIN_AVG_OF_FTP * ftp:
+                spans.append((s, e))
+        i = max(end, i + 1)
+    # Sprints and kicks too short for the average to notice.
+    for s, e in _runs(hot):
+        if e - s >= MIN_SURGE_S and power[s:e].mean() >= SURGE_OF_FTP * ftp and not any(
+            a < e and s < b for a, b in spans
+        ):
+            spans.append((s, e))
+    return sorted(spans)
 
 
 def _mean(values: np.ndarray) -> float | None:
@@ -256,19 +282,19 @@ def activity_insights(conn: sqlite3.Connection, source: str, source_id: str) -> 
     out["durability"] = durability(power, weight["kg"] if weight else None)
     if not ftp:
         return out
-    w_prime, origin = w_prime_for(conn, activity["local_date"])
-    balance = w_balance(power, ftp, w_prime)
+    cp, w_prime, origin = cp_model(conn, activity["local_date"], ftp)
+    balance = w_balance(power, cp, w_prime)
     low = int(np.argmin(balance))
     out["w_prime"] = {
-        "cp_w": _round(ftp, 0),
+        "cp_w": _round(cp, 0),
         "w_prime_j": _round(w_prime, 0),
         "origin": origin,
         "min_j": _round(balance[low], 0),
         "min_at_s": _round(clock[low], 0),
         "matches": [
-            {"start_s": _round(clock[h], 0), "low_at_s": _round(clock[lo], 0),
+            {"start_s": _round(clock[start], 0), "low_at_s": _round(clock[lo], 0),
              "spent_j": _round(balance[h] - balance[lo], 0), "low_j": _round(balance[lo], 0)}
-            for h, lo in matches(balance, w_prime)
+            for start, h, lo in matches(balance, w_prime)
         ],  # fmt: skip
     }
     spans = effort_spans(power, ride["paused"], ftp)
@@ -307,15 +333,19 @@ def activity_streams(
 ) -> dict[str, list[Any]] | None:
     """The workout's channels for charts (like ``queries.activity_streams``) plus ``w_bal`` (W'
     left, J) for a ride with power and an FTP. ``None`` if it has no streams."""
-    ride = _ride_power(conn, source, source_id)
-    if ride is None or not ride["ftp"]:
-        streams = load_streams(conn, source, str(source_id))
-        return None if streams is None else downsample(streams, max(10, int(max_points)))
-    streams = dict(ride["streams"])
-    w_prime, _ = w_prime_for(conn, ride["activity"]["local_date"])
-    balance = w_balance(ride["power"], ride["ftp"], w_prime)
-    t = np.asarray(streams["time"], dtype=float)
-    # The timer clock is increasing; each sample takes the balance at its second.
-    at = np.clip(np.searchsorted(ride["clock"], t - t.min(), side="right") - 1, 0, balance.size - 1)
-    streams["w_bal"] = [round(float(b), 0) for b in balance[at]]
-    return downsample(streams, max(10, int(max_points)))
+    points = max(10, int(max_points))
+    try:
+        ride = _ride_power(conn, source, source_id)
+        if ride is not None and ride["ftp"]:
+            streams = dict(ride["streams"])
+            cp, w_prime, _ = cp_model(conn, ride["activity"]["local_date"], ride["ftp"])
+            balance = w_balance(ride["power"], cp, w_prime)
+            t = np.asarray(streams["time"], dtype=float)
+            # The timer clock is increasing; each sample takes the balance at its second.
+            at = np.clip(np.searchsorted(ride["clock"], t - t.min(), side="right") - 1, 0, balance.size - 1)
+            streams["w_bal"] = [round(float(b), 0) for b in balance[at]]
+            return downsample(streams, points)
+    except Exception:  # the charts must not fail with the extra channel
+        log.exception("W' balance failed for %s/%s", source, source_id)
+    streams = load_streams(conn, source, str(source_id))
+    return None if streams is None else downsample(streams, points)
