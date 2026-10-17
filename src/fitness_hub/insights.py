@@ -1,7 +1,7 @@
 """Per-ride insights that pros and coaches use beyond NP/IF/TSS, computed on demand from the streams.
 
-- **Body weight** for per-kg values: the weight saved before the workout, else the latest
-  body-weight measurement on or before its day.
+- **Body weight** for per-kg values: the weight saved before the workout, else the average
+  of the weigh-ins of the week up to its day (none older than a month).
 - **Durability** (fatigue resistance): the best 1-, 5-, 8-, 10-, 15- and 20-minute power *after* the
   ride had already done 100, 200, 300 ... kJ of work (a multiple of 100 kJ past
   ``DURABILITY_MAX_STEPS`` steps; none in the ride's last half step), next to the same
@@ -54,6 +54,8 @@ from .queries import downsample, get_activity, sport_family
 
 log = logging.getLogger(__name__)
 
+WEIGHT_AVERAGE_DAYS = 7
+WEIGHT_MAX_AGE_DAYS = 30
 DURABILITY_DURATIONS_S = (60, 300, 480, 600, 900, 1200)
 DURABILITY_STEP_KJ = 100
 DURABILITY_MAX_STEPS = 100  # a longer ride takes a multiple of DURABILITY_STEP_KJ instead
@@ -86,17 +88,31 @@ def _round(value: float | None, digits: int = 1) -> float | None:
 
 
 def ride_weight(conn: sqlite3.Connection, source: str, source_id: str, local_date: str) -> dict[str, Any] | None:
-    """``{kg, origin: "pre_workout" | "body", date}`` for per-kg values, or None."""
+    """``{kg, origin: "pre_workout" | "body", date, count}`` for per-kg values, or None: the weight
+    saved before the workout, else the average of the weigh-ins in the ``WEIGHT_AVERAGE_DAYS`` up to
+    its day (daily weights swing by a kilo), ``date`` being the latest of them. A weigh-in older than
+    ``WEIGHT_MAX_AGE_DAYS`` is not used: a weight from years before says little about the ride."""
     saved = get_workout_weight(conn, source, source_id)
     if saved and saved.get("pre_kg"):
-        return {"kg": saved["pre_kg"], "origin": "pre_workout", "date": local_date}
-    end = (date.fromisoformat(local_date) + timedelta(days=1)).isoformat()
-    row = conn.execute(
-        "SELECT ts, value FROM body_measurements WHERE metric = 'weight_kg' AND value > 0 AND ts < ? "
-        "ORDER BY ts DESC LIMIT 1",
+        return {"kg": saved["pre_kg"], "origin": "pre_workout", "date": local_date, "count": 1}
+    day = date.fromisoformat(local_date)
+    end = (day + timedelta(days=1)).isoformat()
+    latest = conn.execute(
+        "SELECT ts FROM body_measurements WHERE metric = 'weight_kg' AND value > 0 AND ts < ? ORDER BY ts DESC LIMIT 1",
         (end,),
     ).fetchone()
-    return {"kg": row["value"], "origin": "body", "date": row["ts"][:10]} if row else None
+    if latest is None or latest["ts"][:10] < (day - timedelta(days=WEIGHT_MAX_AGE_DAYS)).isoformat():
+        return None
+    since = (date.fromisoformat(latest["ts"][:10]) - timedelta(days=WEIGHT_AVERAGE_DAYS - 1)).isoformat()
+    values = [
+        r[0]
+        for r in conn.execute(
+            "SELECT value FROM body_measurements WHERE metric = 'weight_kg' AND value > 0 AND ts >= ? AND ts < ?",
+            (since, end),
+        )
+    ]
+    kg = round(sum(values) / len(values), 2)
+    return {"kg": kg, "origin": "body", "date": latest["ts"][:10], "count": len(values)}
 
 
 # -- durability -----------------------------------------------------------------------------

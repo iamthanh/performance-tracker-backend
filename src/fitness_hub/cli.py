@@ -8,6 +8,7 @@ import sys
 import threading
 from collections.abc import Sequence
 from contextlib import closing
+from pathlib import Path
 
 import httpx
 
@@ -77,6 +78,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     strava.add_argument("--force", action="store_true", help="re-parse files whose streams are already stored")
     strava.add_argument("--workers", type=int, default=None, help="parallel file parsers (default: up to 8)")
+
+    weight = sub.add_parser("import-weight-csv", help="import body weight from a CSV of dated weigh-ins")
+    weight.add_argument("path", type=Path)
+    weight.add_argument("--unit", choices=("kg", "lb"), help="the weights' unit, when the header does not say")
 
     analyze = sub.add_parser("analyze", help="compute TSS, NP, zones, power curves and auto FTP from stored streams")
     analyze.add_argument("--full", action="store_true", help="re-analyse every activity, not only new ones")
@@ -193,6 +198,27 @@ def cmd_import(settings: Settings, args: argparse.Namespace) -> int:
     print(f"Imported {result['imported']} activities ({result['skipped']} rows skipped) as source garmin_export.")
     if not args.timezone:
         print("Tip: pass --timezone so these activities de-duplicate against other sources.")
+    return 0
+
+
+def cmd_import_weight(settings: Settings, args: argparse.Namespace) -> int:
+    from .db import Store
+    from .util import InputError
+    from .weights import SOURCE, import_weight_csv
+
+    try:
+        text = args.path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"error: cannot read {args.path}: {exc.strerror}", file=sys.stderr)
+        return 1
+    try:
+        with Store(settings.db_path) as store:
+            result = import_weight_csv(store, text, args.unit)
+    except InputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Imported {result['imported']} weigh-ins ({result['unit']}) from {result['first']} to {result['last']} "
+          f"as source {SOURCE}; {result['skipped']} days without a weight skipped.")  # fmt: skip
     return 0
 
 
@@ -359,6 +385,7 @@ COMMANDS = {
     "status": cmd_status,
     "import-garmin-csv": cmd_import,
     "import-strava-export": cmd_import_strava,
+    "import-weight-csv": cmd_import_weight,
     "analyze": cmd_analyze,
     "thresholds": cmd_thresholds,
     "performance": cmd_performance,
