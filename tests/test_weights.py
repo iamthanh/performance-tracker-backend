@@ -53,9 +53,8 @@ def test_import_and_ride_weight_average(settings: Settings) -> None:
         store.upsert_activities([{"source": "strava", "source_id": "r", "start_time": "2020-03-10T08:00:00Z",
                                   "local_date": "2020-03-10", "activity_type": "Ride", "raw": {}}])  # fmt: skip
         weight = ride_weight(store.conn, "strava", "r", "2020-03-10")
-        # The week up to the ride: Mar 4-10, 70.4 ... 71.0 kg.
-        assert weight == {"kg": 70.7, "origin": "body", "date": "2020-03-10", "count": 7}
-        assert ride_weight(store.conn, "strava", "r", "2020-04-09")["date"] == "2020-03-10"  # 30 days on
+        assert weight["origin"] == "trend" and weight["kind"] == "weigh_in" and weight["weigh_in"] == 71.0
+        assert ride_weight(store.conn, "strava", "r", "2020-04-09")["kind"] == "carried"  # 30 days on
         assert ride_weight(store.conn, "strava", "r", "2020-04-10") is None  # too old to say
         assert ride_weight(store.conn, "strava", "r", "2020-02-28") is None  # before any
 
@@ -145,13 +144,12 @@ def test_a_weigh_in_from_several_sources_counts_once(settings: Settings) -> None
         rows = []
         for source in ("garmin", "google_health", SOURCE):
             for day, kg in (("2020-03-01", 70.0), ("2020-03-02", 80.0)):
-                rows.append({"source": source, "ts": f"{day}T07:00:00Z", "metric": "weight_kg", "value": kg})
+                rows.append({"source": source, "ts": f"{day}T19:00:00Z", "metric": "weight_kg", "value": kg})
         store.upsert_body_measurements(rows)
         store.upsert_activities([{"source": "strava", "source_id": "r", "start_time": "2020-03-02T08:00:00Z",
                                   "local_date": "2020-03-02", "activity_type": "Ride", "raw": {}}])  # fmt: skip
-        assert ride_weight(store.conn, "strava", "r", "2020-03-02") == {
-            "kg": 75.0, "origin": "body", "date": "2020-03-02", "count": 2
-        }  # fmt: skip
+        weight = ride_weight(store.conn, "strava", "r", "2020-03-02")
+        assert weight["weigh_in"] == 80.0  # the day's mean of three copies of the same weigh-in
 
 
 def test_cli_reads_spreadsheet_encodings(home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

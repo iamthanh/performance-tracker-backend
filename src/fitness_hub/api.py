@@ -44,7 +44,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import __version__, insights, nutrition, performance, queries, uploads
+from . import __version__, bodyweight, insights, nutrition, performance, queries, uploads
 from .analysis import analyze, thresholds_on
 from .config import Settings
 from .db import ATHLETE_SETTINGS, Store, open_readonly, schema_version
@@ -493,6 +493,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def body(conn: Conn, start_date: DateQuery = None, end_date: DateQuery = None) -> list[dict[str, Any]]:
         """Weight (kg) and body fat (%) samples; default last 90 days."""
         return queries.body_measurements(conn, start_date, end_date)
+
+    @app.get("/api/weight")
+    def weight(conn: Conn, start_date: DateQuery = None, end_date: DateQuery = None) -> dict[str, Any]:
+        """The daily trend weight from the weigh-ins, each day labelled weigh_in, interpolated, estimated
+        or carried (raw weigh-ins are unchanged; see /api/body). All of it by default."""
+        start = parse_date(start_date, "start_date").isoformat() if start_date else None
+        end = parse_date(end_date, "end_date").isoformat() if end_date else None
+        return bodyweight.weight_trend(conn, start, end)
 
     @app.get("/api/heart-rate/{day}")
     def heart_rate(conn: Conn, day: str) -> dict[str, Any]:
