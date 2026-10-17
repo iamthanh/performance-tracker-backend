@@ -207,10 +207,18 @@ def cmd_import_weight(settings: Settings, args: argparse.Namespace) -> int:
     from .weights import SOURCE, import_weight_csv
 
     try:
-        text = args.path.read_text(encoding="utf-8")
+        data = args.path.read_bytes()
     except OSError as exc:
         print(f"error: cannot read {args.path}: {exc.strerror}", file=sys.stderr)
         return 1
+    # Spreadsheet exports come as UTF-8 (often with a BOM), UTF-16 ("Unicode text") or Windows-1252.
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = data.decode("utf-16")
+    else:
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = data.decode("cp1252", errors="replace")
     try:
         with Store(settings.db_path) as store:
             result = import_weight_csv(store, text, args.unit)

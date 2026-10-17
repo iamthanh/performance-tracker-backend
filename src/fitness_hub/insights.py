@@ -89,8 +89,8 @@ def _round(value: float | None, digits: int = 1) -> float | None:
 
 def ride_weight(conn: sqlite3.Connection, source: str, source_id: str, local_date: str) -> dict[str, Any] | None:
     """``{kg, origin: "pre_workout" | "body", date, count}`` for per-kg values, or None: the weight
-    saved before the workout, else the average of the weigh-ins in the ``WEIGHT_AVERAGE_DAYS`` up to
-    its day (daily weights swing by a kilo), ``date`` being the latest of them. A weigh-in older than
+    saved before the workout, else the average of the days' weights in the ``WEIGHT_AVERAGE_DAYS`` up
+    to its day (daily weights swing by a kilo; ``count`` days), ``date`` being the latest of them. A weigh-in older than
     ``WEIGHT_MAX_AGE_DAYS`` is not used: a weight from years before says little about the ride."""
     saved = get_workout_weight(conn, source, source_id)
     if saved and saved.get("pre_kg"):
@@ -104,15 +104,17 @@ def ride_weight(conn: sqlite3.Connection, source: str, source_id: str, local_dat
     if latest is None or latest["ts"][:10] < (day - timedelta(days=WEIGHT_MAX_AGE_DAYS)).isoformat():
         return None
     since = (date.fromisoformat(latest["ts"][:10]) - timedelta(days=WEIGHT_AVERAGE_DAYS - 1)).isoformat()
-    values = [
+    # One value per day: a scale synced to several services (and a CSV of the same days) counts once.
+    days = [
         r[0]
         for r in conn.execute(
-            "SELECT value FROM body_measurements WHERE metric = 'weight_kg' AND value > 0 AND ts >= ? AND ts < ?",
+            "SELECT avg(value) FROM body_measurements WHERE metric = 'weight_kg' AND value > 0 AND ts >= ? AND ts < ? "
+            "GROUP BY substr(ts, 1, 10)",
             (since, end),
         )
     ]
-    kg = round(sum(values) / len(values), 2)
-    return {"kg": kg, "origin": "body", "date": latest["ts"][:10], "count": len(values)}
+    kg = round(sum(days) / len(days), 2)
+    return {"kg": kg, "origin": "body", "date": latest["ts"][:10], "count": len(days)}
 
 
 # -- durability -----------------------------------------------------------------------------
