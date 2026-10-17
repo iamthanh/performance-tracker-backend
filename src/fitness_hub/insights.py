@@ -3,12 +3,12 @@
 - **Body weight** for per-kg values: the weight saved before the workout, else the latest
   body-weight measurement on or before its day.
 - **Durability** (fatigue resistance): the best 1-, 5- and 20-minute power *after* the
-  ride had already done 10, 20, 30 ... kJ/kg of work (1000, 2000 ... kJ without a body
-  weight; finer steps for a ride with less work, none in its last half step), next to the
-  same efforts from the start. Professionals' best efforts fall progressively with
-  accumulated work, most clearly beyond about 20 kJ/kg, and how little they fall
-  separates riders that fresh power does not (Mateo-March et al. 2022 and 2025; Spragg
-  et al. 2024).
+  ride had already done 100, 200, 300 ... kJ of work (a multiple of 100 kJ past
+  ``DURABILITY_MAX_STEPS`` steps; none in the ride's last half step), next to the same
+  efforts from the start. Professionals' best efforts fall progressively with
+  accumulated work, most clearly beyond about 20 kJ per kg of body weight, and how
+  little they fall separates riders that fresh power does not (Mateo-March et al. 2022
+  and 2025; Spragg et al. 2024).
 - **W' balance**: how much of the work capacity above critical power (W') is left at
   each second, with Skiba's differential model (Skiba et al. 2015: spent 1:1 above CP,
   recovered in proportion to what is missing and how far below CP the rider is). CP and W'
@@ -29,6 +29,7 @@ All of it needs cycling power; efforts and W' balance also need an FTP.
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 from datetime import date, timedelta
 from typing import Any
@@ -50,11 +51,8 @@ from .queries import downsample, get_activity, sport_family
 log = logging.getLogger(__name__)
 
 DURABILITY_DURATIONS_S = (60, 300, 1200)
-# Step sizes, finest first: the finest whose DURABILITY_MAX_STEPS steps cover the ride is used, so a two-hour ride
-# is not just "start" and "after 1000 kJ", no ride loses its late steps, and long rides keep 10 kJ/kg steps.
-DURABILITY_STEPS_KJ_KG = (2.5, 5, 10)
-DURABILITY_STEPS_KJ = (250, 500, 1000)  # without a body weight
-DURABILITY_MAX_STEPS = 6
+DURABILITY_STEP_KJ = 100
+DURABILITY_MAX_STEPS = 100  # a longer ride takes a multiple of DURABILITY_STEP_KJ instead
 DURABILITY_MIN_LEFT = 0.5  # of a step: a step is shown only with at least this much riding after it
 DEFAULT_W_PRIME_J = 20000.0
 MATCH_J = 2000.0
@@ -95,32 +93,31 @@ def ride_weight(conn: sqlite3.Connection, source: str, source_id: str, local_dat
 # -- durability -----------------------------------------------------------------------------
 
 
-def durability(power: np.ndarray, weight_kg: float | None) -> dict[str, Any] | None:
+def durability(power: np.ndarray) -> dict[str, Any] | None:
     """Best power per duration after each step of accumulated work (see the module docstring).
 
     ``power`` is the 1 Hz timer series with pauses as 0 W. A cell is None when too little of the
     ride is left after the step for that duration."""
     if power.size < min(DURABILITY_DURATIONS_S):
         return None
-    work = np.cumsum(power)  # J done by the end of each second
-    per = weight_kg * 1000 if weight_kg else 1000.0  # J per unit (kJ/kg or kJ)
-    sizes = DURABILITY_STEPS_KJ_KG if weight_kg else DURABILITY_STEPS_KJ
-    total = work[-1] / per
+    work = np.cumsum(power) / 1000  # kJ done by the end of each second
+    total = float(work[-1])
     reach = total + 1e-9  # whole-kJ totals summed from float watts must not fall just short
-    step = next((x for x in sizes if reach <= DURABILITY_MAX_STEPS * x), sizes[-1])
-    steps = [k * step for k in range(DURABILITY_MAX_STEPS) if k == 0 or k * step <= reach - DURABILITY_MIN_LEFT * step]
-    sums = np.concatenate(([0.0], work))
+    step = DURABILITY_STEP_KJ * max(1, math.ceil(total / DURABILITY_STEP_KJ / DURABILITY_MAX_STEPS))
+    last = reach - DURABILITY_MIN_LEFT * step  # a step needs half a step of riding after it
+    steps = [k * step for k in range(int(reach // step) + 1) if k == 0 or k * step <= last]
+    # The first second after each step (a window may start there or later).
+    starts = [0, *(int(np.searchsorted(work, s)) + 1 for s in steps[1:])]
+    sums = np.concatenate(([0.0], np.cumsum(power)))
     rows = []
     for d in DURABILITY_DURATIONS_S:
         if d > power.size:
             continue
         averages = (sums[d:] - sums[:-d]) / d  # averages[i]: the window starting at second i
-        values = []
-        for s in steps:
-            start = 0 if s == 0 else int(np.searchsorted(work, s * per)) + 1  # the first second after the step
-            values.append(_round(averages[start:].max(), 0) if start < averages.size else None)
+        best_from = np.maximum.accumulate(averages[::-1])[::-1]  # best_from[i]: best window starting at i or later
+        values = [_round(best_from[i], 0) if i < averages.size else None for i in starts]
         rows.append({"duration_s": d, "watts": values})
-    return {"unit": "kJ/kg" if weight_kg else "kJ", "steps": steps, "total": _round(total), "rows": rows}
+    return {"unit": "kJ", "steps": steps, "total": _round(total), "rows": rows}
 
 
 # -- W' balance -----------------------------------------------------------------------------
@@ -285,7 +282,7 @@ def activity_insights(conn: sqlite3.Connection, source: str, source_id: str) -> 
     if ride is None:
         return out
     power, clock, ftp = ride["power"], ride["clock"], ride["ftp"]
-    out["durability"] = durability(power, weight["kg"] if weight else None)
+    out["durability"] = durability(power)
     if not ftp:
         return out
     cp, w_prime, origin = cp_model(conn, activity["local_date"], ftp)
