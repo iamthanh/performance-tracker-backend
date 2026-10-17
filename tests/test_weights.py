@@ -18,15 +18,19 @@ LOG = """Date,Daily Weight in
 """
 
 
+def days(parsed: dict) -> list[dict]:
+    return [{"date": r["date"], "kg": r["kg"]} for r in parsed["rows"]]
+
+
 def test_parse_long_dates_in_pounds() -> None:
     parsed = parse_weight_csv(LOG, unit="lb")
-    assert parsed["rows"] == [{"date": "2018-06-26", "kg": 79.2}, {"date": "2018-06-28", "kg": 77.93}]
+    assert days(parsed) == [{"date": "2018-06-26", "kg": 79.2}, {"date": "2018-06-28", "kg": 77.93}]
     assert parsed["skipped"] == 1 and parsed["unit"] == "lb"
 
 
 def test_unit_from_the_header_or_refused() -> None:
-    assert parse_weight_csv("date,weight (kg)\n2020-01-02,70.5\n")["rows"] == [{"date": "2020-01-02", "kg": 70.5}]
-    assert parse_weight_csv("Day,Weight lbs\n01/02/2020,160\n")["rows"][0] == {"date": "2020-01-02", "kg": 72.57}
+    assert days(parse_weight_csv("date,weight (kg)\n2020-01-02,70.5\n")) == [{"date": "2020-01-02", "kg": 70.5}]
+    assert days(parse_weight_csv("Day,Weight lbs\n01/02/2020,160\n"))[0] == {"date": "2020-01-02", "kg": 72.57}
     with pytest.raises(InputError, match="--unit"):
         parse_weight_csv(LOG)  # "Daily Weight in" does not say
     with pytest.raises(InputError, match="wrong unit"):
@@ -66,15 +70,41 @@ def test_review_edge_cases() -> None:
     with pytest.raises(InputError, match="contradicts"):
         parse_weight_csv("date,weight (kg)\n2020-01-02,70\n", unit="lb")
     picked = parse_weight_csv("Last Updated,Date,Goal Weight (kg),Weight (kg)\nx,2020-01-02,65,70\n")
-    assert picked["columns"] == ("Date", "Weight (kg)") and picked["rows"] == [{"date": "2020-01-02", "kg": 70.0}]
+    assert picked["columns"] == ("Date", "Weight (kg)") and days(picked) == [{"date": "2020-01-02", "kg": 70.0}]
     with pytest.raises(InputError, match="day/month"):
         parse_weight_csv("date,weight kg\n01/02/2020,70\n26/06/2020,70\n")
     with pytest.raises(InputError, match="future"):
         parse_weight_csv("date,weight kg\n2068-06-26,70\n")
-    newest_first = parse_weight_csv("date,weight kg\n2023-03-05 07:12:30,71\n2023-03-04T07:00:00Z,70\n2023-03-05,72\n")
-    assert newest_first["rows"] == [{"date": "2023-03-04", "kg": 70.0}, {"date": "2023-03-05", "kg": 72.0}]
+    newest_first = parse_weight_csv("date,weight kg\n2023-03-05 07:12:30,71\n2023-03-04,70\n2023-03-05,72\n")
+    assert days(newest_first) == [{"date": "2023-03-04", "kg": 70.0}, {"date": "2023-03-05", "kg": 72.0}]
     with pytest.raises(InputError, match="dot for decimals"):
         parse_weight_csv('date,weight kg\n2020-01-02,"70,5"\n')
+
+
+def test_a_scale_export_in_grams_keeps_its_times(settings: Settings) -> None:
+    export = (
+        "timestamp,weight grams,data source\n"
+        "2020-12-21T16:55:25Z,74027,Aria Air\n"
+        "2020-12-21T19:00:00+01:00,74500,Google Health App\n"  # 18:00 UTC: a second weigh-in that day
+        "2026-07-28T15:51:06.659Z,71758,Google Health App\n"
+    )
+    parsed = parse_weight_csv(export)
+    assert parsed["unit"] == "grams" and parsed["columns"] == ("timestamp", "weight grams")
+    assert [(r["ts"], r["kg"], r["device"]) for r in parsed["rows"]] == [
+        ("2020-12-21T16:55:25Z", 74.03, "Aria Air"),
+        ("2020-12-21T18:00:00Z", 74.5, "Google Health App"),
+        ("2026-07-28T15:51:06Z", 71.76, "Google Health App"),
+    ]
+    with Store(settings.db_path) as store:
+        assert import_weight_csv(store, export)["imported"] == 3
+        stored = store.conn.execute("SELECT ts, value FROM body_measurements ORDER BY ts").fetchall()
+        assert [tuple(r) for r in stored][:2] == [("2020-12-21T16:55:25Z", 74.03), ("2020-12-21T18:00:00Z", 74.5)]
+        store.upsert_activities([{"source": "strava", "source_id": "r", "start_time": "2020-12-21T20:00:00Z",
+                                  "local_date": "2020-12-21", "activity_type": "Ride", "raw": {}}])  # fmt: skip
+        day_mean = ride_weight(store.conn, "strava", "r", "2020-12-21")["kg"]
+        assert day_mean == pytest.approx(74.27, abs=0.01)  # two weigh-ins that day: their mean
+    with pytest.raises(InputError, match="contradicts"):
+        parse_weight_csv(export, unit="kg")
 
 
 def test_a_weigh_in_from_several_sources_counts_once(settings: Settings) -> None:

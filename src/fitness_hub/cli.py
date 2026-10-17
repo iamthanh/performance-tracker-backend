@@ -81,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     weight = sub.add_parser("import-weight-csv", help="import body weight from a CSV of dated weigh-ins")
     weight.add_argument("path", type=Path)
-    weight.add_argument("--unit", choices=("kg", "lb"), help="the weights' unit, when the header does not say")
+    weight.add_argument("--unit", choices=("kg", "lb", "g"), help="the weights' unit, when the header does not say")
 
     analyze = sub.add_parser("analyze", help="compute TSS, NP, zones, power curves and auto FTP from stored streams")
     analyze.add_argument("--full", action="store_true", help="re-analyse every activity, not only new ones")

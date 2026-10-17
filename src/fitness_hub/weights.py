@@ -4,12 +4,15 @@ The date column is the one headed "Date" (else the first whose header has the wo
 first column) and the weight column the one headed "Weight" (else the first with the word that is
 not a goal, target, change, BMI or body composition, else the second). Dates may be ISO
 (2018-06-26, with or without a time), long ("Tuesday, June 26, 2018" or "June 26, 2018") or US
-(06/26/2018); day/month/year dates and dates in the future are refused. The unit comes from the
-header ("kg", "lb", "lbs", "pounds") or ``unit`` (refused when they disagree); when neither says,
-the import is refused rather than guessed. Blank weights are skipped, weights outside
-``RANGE_KG`` refused, and several weigh-ins on one date keep the last. Each is stored as
-``weight_kg`` in ``body_measurements`` at noon UTC of its date (a day's value, so that it stays on
-that date in any time zone), under ``SOURCE``: importing the file again updates those days rather
+(06/26/2018); day/month/year dates and dates in the future are refused. A timestamp with a zone
+(a scale's export: 2020-12-21T16:55:25Z) keeps its time; the date column may then be headed
+"Timestamp". The unit comes from the header ("kg", "lb", "lbs", "pounds", "grams") or ``unit``
+(refused when they disagree); when neither says, the import is refused rather than guessed. Blank
+weights are skipped and weights outside ``RANGE_KG`` refused; several weigh-ins with the same date
+(no time) or the same timestamp keep the last. Each is stored as ``weight_kg`` in
+``body_measurements`` (with the device, from a "source" or "device" column, in ``raw``) at its
+timestamp, or at noon UTC of its date (a day's value, so that it stays on that date in any time
+zone), under ``SOURCE``: importing the file again updates those days rather
 than adding copies (days removed from the file stay).
 """
 
@@ -18,7 +21,7 @@ from __future__ import annotations
 import csv
 import io
 import re
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from .db import Store
@@ -28,19 +31,32 @@ SOURCE = "weight_csv"
 LB_KG = 0.45359237
 RANGE_KG = (20.0, 300.0)
 _DATE_FORMATS = ("%Y-%m-%d", "%A, %B %d, %Y", "%B %d, %Y", "%a, %b %d, %Y", "%b %d, %Y", "%m/%d/%Y", "%m/%d/%y")
-_UNITS = {"kg": 1.0, "kgs": 1.0, "kilograms": 1.0, "lb": LB_KG, "lbs": LB_KG, "pounds": LB_KG}
+_UNITS = {
+    "kg": 1.0, "kgs": 1.0, "kilograms": 1.0, "lb": LB_KG, "lbs": LB_KG, "pounds": LB_KG,
+    "g": 0.001, "grams": 0.001, "gram": 0.001,
+}  # fmt: skip
 
 
-def _parse_date(text: str) -> date | None:
+def _parse_when(text: str) -> tuple[date, str | None] | None:
+    """The day of a date cell, and the UTC timestamp when it gives a time with a zone (a scale's export:
+    2020-12-21T16:55:25Z, ...+01:00); None when it cannot be read. A time without a zone is ignored: it
+    says nothing about when in UTC."""
     text = " ".join(text.split())
-    if re.match(r"\d{4}-\d{2}-\d{2}", text):  # ISO, with or without a time (scale exports)
+    if re.match(r"\d{4}-\d{2}-\d{2}", text):
         try:
-            return date.fromisoformat(text[:10])
+            day = date.fromisoformat(text[:10])
         except ValueError:
             return None
+        if re.search(r"(Z|[+-]\d{2}:?\d{2})$", text) and len(text) > 10:
+            try:
+                instant = datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(UTC)
+            except ValueError:
+                return None
+            return instant.date(), instant.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return day, None
     for fmt in _DATE_FORMATS:
         try:
-            return datetime.strptime(text, fmt).date()
+            return datetime.strptime(text, fmt).date(), None
         except ValueError:
             continue
     return None
@@ -73,8 +89,7 @@ def _columns(header: list[str]) -> tuple[int, int]:
         exact = [i for i in candidates if bare[i] == [word]]
         return (exact or candidates or [None])[0]
 
-    date_col = pick("date", set(), None)
-    date_col = 0 if date_col is None else date_col
+    date_col = next((c for c in (pick(w, set(), None) for w in ("date", "timestamp", "time")) if c is not None), 0)
     weight_col = pick("weight", _NOT_WEIGHT, date_col)
     if weight_col is None:
         weight_col = 1 if date_col != 1 else 0
@@ -82,9 +97,10 @@ def _columns(header: list[str]) -> tuple[int, int]:
 
 
 def parse_weight_csv(text: str, unit: str | None = None, today: date | None = None) -> dict[str, Any]:
-    """``{rows: [{date, kg}], skipped, unit, columns}`` from the CSV text, one row per date (the
-    last of several), oldest first; raises InputError when the columns, the unit or a date cannot be
-    told, or a value is not a weight."""
+    """``{rows: [{date, ts, kg, device}], skipped, unit, columns}`` from the CSV text, oldest first: one
+    row per timestamp, or per date when the dates have no time (the last of several); ``ts`` is None
+    then. Raises InputError when the columns, the unit or a date cannot be told, or a value is not a
+    weight."""
     reader = csv.reader(io.StringIO(text.lstrip("\ufeff")))
     header = next(reader, None)
     if not header or len(header) < 2:
@@ -96,15 +112,16 @@ def parse_weight_csv(text: str, unit: str | None = None, today: date | None = No
     used = (unit or stated or "").lower()
     if used not in _UNITS:
         raise InputError(
-            f"cannot tell the unit of {header[weight_col]!r}: pass --unit kg or --unit lb"
+            f"cannot tell the unit of {header[weight_col]!r}: pass --unit kg, lb or g"
             if not unit
-            else f"unknown unit {unit!r}: use kg or lb"
+            else f"unknown unit {unit!r}: use kg, lb or g"
         )
     factor = _UNITS[used]
     low, high = RANGE_KG
     latest = (today or date.today()).isoformat()
-    by_date: dict[str, float] = {}
+    by_key: dict[str, dict[str, Any]] = {}  # by timestamp, or by date for a day's value
     skipped = 0
+    source_col = next((i for i, h in enumerate(header) if "source" in _words(h) or "device" in _words(h)), None)
     for n, record in enumerate(reader, start=2):
         if not any(cell.strip() for cell in record):
             continue
@@ -115,9 +132,10 @@ def parse_weight_csv(text: str, unit: str | None = None, today: date | None = No
                 f"line {n}: {raw_date!r} is day/month/year; this importer reads 06/26/2018 as month/day, "
                 "so convert the dates to 2018-06-26 first"
             )
-        day = _parse_date(raw_date)
-        if day is None:
+        when = _parse_when(raw_date)
+        if when is None:
             raise InputError(f"line {n}: cannot read the date {raw_date!r}")
+        day, ts = when
         if day.isoformat() > latest:
             raise InputError(f"line {n}: {raw_date!r} is in the future")
         if not raw_weight:
@@ -130,8 +148,10 @@ def parse_weight_csv(text: str, unit: str | None = None, today: date | None = No
             raise InputError(f"line {n}: {raw_weight!r} is not a number{hint}") from None
         if not low <= kg <= high:
             raise InputError(f"line {n}: {raw_weight} {used} is not a body weight (wrong unit?)")
-        by_date[day.isoformat()] = round(kg, 2)
-    rows = [{"date": d, "kg": kg} for d, kg in sorted(by_date.items())]
+        device = record[source_col].strip() if source_col is not None and source_col < len(record) else None
+        key = ts or day.isoformat()
+        by_key[key] = {"date": day.isoformat(), "ts": ts, "kg": round(kg, 2), "device": device or None}
+    rows = sorted(by_key.values(), key=lambda r: (r["date"], r["ts"] or ""))
     return {"rows": rows, "skipped": skipped, "unit": used, "columns": (header[date_col], header[weight_col])}
 
 
@@ -141,8 +161,8 @@ def import_weight_csv(store: Store, text: str, unit: str | None = None) -> dict[
     rows = parsed["rows"]
     if rows:
         store.upsert_body_measurements(
-            {"source": SOURCE, "ts": f"{r['date']}T12:00:00Z", "metric": "weight_kg", "value": r["kg"],
-             "raw": {"date": r["date"], "unit": parsed["unit"]}}
+            {"source": SOURCE, "ts": r["ts"] or f"{r['date']}T12:00:00Z", "metric": "weight_kg", "value": r["kg"],
+             "raw": {"date": r["date"], "unit": parsed["unit"], "device": r["device"]}}
             for r in rows
         )  # fmt: skip
     return {
