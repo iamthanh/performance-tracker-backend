@@ -37,7 +37,7 @@ def store(settings: Settings):
 
 
 def test_schema_has_the_nutrition_tables(store: Store) -> None:
-    assert schema_version(store.conn) == SCHEMA_VERSION == 5
+    assert schema_version(store.conn) == SCHEMA_VERSION == 6
     tables = {r[0] for r in store.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"foods", "nutrition_entries"} <= tables
 
@@ -291,7 +291,7 @@ def test_a_v3_database_with_data_migrates_to_the_latest(tmp_path) -> None:
     conn.commit()
     conn.close()
     with Store(path) as migrated:
-        assert schema_version(migrated.conn) == 5 and migrated.row_counts()["activities"] == 1
+        assert schema_version(migrated.conn) == SCHEMA_VERSION and migrated.row_counts()["activities"] == 1
         assert nutrition.save_entry(migrated.conn, {"local_date": "2026-10-12", "meal": "during_workout",
                                                     "name": "Gel", "activity_source": "strava",
                                                     "activity_source_id": "1"})  # fmt: skip

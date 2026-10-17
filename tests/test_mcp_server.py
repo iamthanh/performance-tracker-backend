@@ -32,6 +32,7 @@ EXPECTED_TOOLS = {
     "power_curve",
     "get_activity_analysis",
     "nutrition_daily",
+    "performance_index",
     "workout_fueling",
     "sync_now",
 }
@@ -294,3 +295,8 @@ def test_nutrition_tools(settings: Settings) -> None:
     assert not error and days["days"][0]["intake"]["carbs_g"] == 25  # type: ignore[index]
     error, fueling = call(settings, "workout_fueling", {"source": "strava", "source_id": "1"})
     assert not error and fueling["during"]["carbs_g"] == 25  # type: ignore[index]
+
+
+def test_performance_index_tool(settings: Settings) -> None:
+    error, body = call(settings, "performance_index", {"start_date": "2026-10-01"})
+    assert not error and body["days"] == [] and body["weights"]["threshold"] == 30

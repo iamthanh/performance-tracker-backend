@@ -93,6 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
     ftp_del.add_argument("metric", choices=tuple(_THRESHOLD_METRICS))
     ftp_del.add_argument("--from", dest="effective_date", required=True, metavar="YYYY-MM-DD")
 
+    perf = sub.add_parser("performance", help="show the performance index (or check its decay against your rides)")
+    perf.add_argument(
+        "--backtest", action="store_true", help="compare decay rates by how well they predict your efforts"
+    )
+
     serve = sub.add_parser("serve-mcp", help="run the MCP server (stdio for Claude, or localhost HTTP)")
     serve.add_argument("--transport", choices=("stdio", "http"), default="stdio")
     serve.add_argument("--host", default="127.0.0.1", help="HTTP bind address (loopback only)")
@@ -271,6 +276,31 @@ def cmd_thresholds(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_performance(settings: Settings, args: argparse.Namespace) -> int:
+    from . import performance
+
+    with closing(open_readonly(settings.db_path)) as conn:
+        if args.backtest:
+            print(f"{'DECAY/WEEK':>10} {'SAMPLES':>8} {'MAE %':>7} {'BIAS %':>7} {'UNDER %':>8}")
+            for r in performance.backtest(conn):
+                mae, bias, under = r["mae_pct"] or 0, r["bias_pct"] or 0, r["under_pct"] or 0
+                print(f"{r['decay_per_week']:>10.3f} {r['samples']:>8} {mae:>7.2f} {bias:>7.2f} {under:>8.1f}")
+            print("Against the best effort of the next 28 days, on the days that held a hard one. MAE: mean error;")
+            print("BIAS: below 0, the value runs above what you then did; UNDER: efforts over 3 % above the value.")
+            return 0
+        result = performance.performance(conn)
+    if not result["days"]:
+        print("No rides with power yet. Import activities, then run `fitness-hub analyze`.")
+        return 0
+    today = result["days"][-1]
+    print(f"Performance index on {today['date']}: {today['score'] if today['score'] is not None else '—'}")
+    for c in result["components"]:
+        part = today["components"][c["key"]]
+        index = "—" if part["index"] is None else f"{part['index']:.1f}"
+        print(f"  {c['label']:<11} {index:>6}  (last tested {part['tested'] or 'never'})")
+    return 0
+
+
 def cmd_serve_api(settings: Settings, args: argparse.Namespace) -> int:
     from .api import serve
 
@@ -331,6 +361,7 @@ COMMANDS = {
     "import-strava-export": cmd_import_strava,
     "analyze": cmd_analyze,
     "thresholds": cmd_thresholds,
+    "performance": cmd_performance,
     "serve-mcp": cmd_serve,
     "serve-api": cmd_serve_api,
     "run": cmd_run,

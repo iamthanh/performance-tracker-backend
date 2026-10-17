@@ -180,6 +180,23 @@ each (60 MB once unzipped), through `POST /api/activities/import`. Imports run o
 - **Duplicates from other services:** a workout already stored from another service (e.g. a later Strava export) is
   merged in the lists, as for any duplicate, and the import says so.
 
+### Performance index (how good you are, over time)
+
+CTL is how much you have trained; the performance index is what you can produce, from best efforts only
+(`performance.py`, `GET /api/performance`, `fitness-hub performance`). Six components over the trailing 90 days:
+sprint (best 5 s), anaerobic (1 min), VO2max (5 min), threshold (the FTP estimate of the window's curve),
+endurance (60 min) and durability (best 5 and 20 min after 1000 kJ of work, as a share of fresh).
+
+- A component rises only with a new best in the window and otherwise falls by at most 0.5 % a week (set in the
+  UI's Settings). `fitness-hub performance --backtest` compares decay rates by how well each predicts your best
+  efforts of the following 28 days; 0.5 % had the lowest error and least bias on the author's history.
+- Each component is an index, 100 = its average over the first year of data (after the first full window); each
+  day also says when it was last tested (a ride within 97 % of the window's best).
+- The score is their weighted geometric mean (default: threshold 30, durability 20, VO2max 15, endurance 15,
+  anaerobic 10, sprint 10; presets for climbers, time trials and criteriums), so one big weakness is not hidden by
+  a big strength. It needs the threshold.
+- Aerobic efficiency (median EF of steady rides of an hour or more over 42 days) is reported alongside, not in it.
+
 ### Ride insights (computed on demand)
 
 `GET /api/activities/{source}/{id}/insights` adds what coaches look at beyond NP/IF/TSS (`insights.py`):
@@ -370,6 +387,7 @@ Then ask, for example:
 | `power_curve` | Best average power per duration (1 s to 5 h) in a date range, with the activity that set it |
 | `get_activity_analysis` | One activity's NP, IF, TSS, VI, EF, decoupling, zones, thresholds used and power curve |
 | `nutrition_daily` | Per day: calories and nutrients eaten, workout kcal, the watch's total and active kcal, and the balance |
+| `performance_index` | How good the rider is over time (not CTL): score and six components with when each was last tested |
 | `workout_fueling` | A workout's fueling: entries, totals and per-hour carbs, fluid, sodium and caffeine, against kcal burned |
 | `sync_now` | Runs a sync and returns its log. It blocks, and `full=true` can hit rate limits |
 
@@ -430,6 +448,8 @@ Reads use read-only connections. Writes are threshold overrides, which re-score 
 | `POST /api/activities/import?filename&name&activity_type&timezone` | Import one `.fit`, `.gpx` or `.tcx` file (optionally `.gz`); the body is the file, as `application/octet-stream`. Stored as source `upload` and analysed; returns the workout and any copy already stored from another service |
 | `GET /api/activities/{source}/{id}` | One workout: `activity`, `analysis` (zones, power curve, thresholds used), `laps`, `device`, available `streams` channels |
 | `GET /api/activities/{source}/{id}/streams?max_points=2000` | Per-sample channels averaged down to `max_points` (`time` in seconds from the start); `w_bal` (W' left, J) for a ride with power and an FTP |
+| `GET /api/performance?start_date&end_date` | The performance index per day (score, components with last-tested dates, efficiency), what raised it and the weights; all history by default |
+| `GET/PUT /api/performance/settings` | The index's component weights (`{weights: {sprint, …}, decay_per_week}`) and presets |
 | `GET /api/activities/{source}/{id}/insights` | Body weight for per-kg values, best efforts (power with the heart rate over them), durability (best efforts after accumulated work), W' balance with matches, efforts above FTP |
 | `GET /api/summary?start_date&end_date&group_by=week` | Totals per day/week (Monday start)/month, overall and per sport: count, distance, hours, elevation, TSS, kJ, kcal burned |
 | `GET /api/training-load?start_date&end_date` | Daily TSS, CTL, ATL, TSB and `unscored` workouts (default 90 days) |
@@ -542,6 +562,8 @@ local clock. Every row keeps the provider payload in `raw` and an `updated_at` s
 | `foods` | `id` | `name, brand, serving` and nutrients **per serving**: `kcal, carbs_g, sugars_g, protein_g, fat_g, fiber_g, sodium_mg, potassium_mg, caffeine_mg, fluid_ml`; `note, archived` |
 | `nutrition_entries` | `id` (and `(source, source_id)` for imports) | `local_date, consumed_at, meal` (`breakfast, lunch, dinner, snack, pre_workout, during_workout, post_workout`), `activity_source, activity_source_id, offset_s` (the workout it fuelled, seconds into it), `food_id, name, servings` (bottles, for a drink), the same nutrients as **totals for the entry**, `note`, `kind` (`food` or `drink`), `recipe` (one bottle, JSON) |
 | `workout_weights` | `(source, source_id)` | `pre_kg, post_kg, note`: body weight before and after the workout |
+| `durability_bests` | `(source, source_id, after_kj, duration_s)` | `watts`: the best average power over `duration_s` started after `after_kj` (1000 … 3000) of work in that ride |
+| `app_settings` | `key` | `value` (JSON): settings such as the performance index weights |
 
 **Schema versions.** The version is kept in `PRAGMA user_version`. Opening the database applies any missing migrations
 (`db.MIGRATIONS`), each in one transaction. A database created before versioning counts as version 1, and a database

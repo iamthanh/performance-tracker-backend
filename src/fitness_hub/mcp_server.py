@@ -11,6 +11,7 @@ import json
 import logging
 from collections.abc import Callable
 from contextlib import closing
+from datetime import date, timedelta
 from typing import Annotated, Any, Literal, TypeVar
 
 import anyio
@@ -18,7 +19,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from . import nutrition, queries
+from . import nutrition, performance, queries
 from .config import Settings
 from .db import BODY_METRICS, DAILY_METRICS, SOURCES, open_readonly
 from .sync import PROVIDER_NAMES, run_sync
@@ -63,7 +64,8 @@ sodium_mg, potassium_mg, caffeine_mg, fluid_ml; note, archived) and nutrition_en
 local_date, consumed_at, meal, activity_source, activity_source_id, offset_s, food_id, name, servings, the same \
 nutrients as totals for the entry, note, kind food|drink, recipe: one bottle's JSON) hold what the user logged \
 eating and drinking; workout_weights(source, source_id, pre_kg, post_kg, note) their weight around a workout. \
-activity_metrics, power_curve and athlete_settings are filled by the training analysis and may be empty. \
+activity_metrics, power_curve, durability_bests(source, source_id, after_kj, duration_s, watts: best \
+efforts started after that much work) and athlete_settings are filled by the training analysis and may be empty. \
 `raw` holds the provider JSON (use json_extract). \
 query_sql does NOT de-duplicate activities.
 
@@ -232,6 +234,18 @@ def create_server(
         ml/h, sodium mg/h, caffeine) taken during it, the kcal it burned and a rough estimate of the
         carbohydrate burned from its intensity factor."""
         return _dump(await read(lambda c: nutrition.workout_fueling(c, source, source_id)))
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=False)
+    async def performance_index(
+        start_date: Annotated[str | None, Field(description="YYYY-MM-DD; default the last 90 days")] = None,
+        end_date: DateArg = None,
+    ) -> str:
+        """How good the rider is, day by day (unlike CTL, which is how much they trained): a score where
+        100 = their baseline, from six components (sprint 5 s, anaerobic 1 min, VO2max 5 min, threshold,
+        endurance 60 min, durability = power kept after 1000 kJ), each an index with the date it was last
+        tested near-maximally; plus aerobic efficiency (EF of steady rides) and the rides that raised it."""
+        start = start_date or (date.today() - timedelta(days=89)).isoformat()
+        return _dump(await read(lambda c: performance.performance(c, start, end_date)))
 
     @mcp.tool(annotations=READ_ONLY, structured_output=False)
     async def power_curve(
