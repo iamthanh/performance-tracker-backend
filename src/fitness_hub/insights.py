@@ -1,7 +1,7 @@
 """Per-ride insights that pros and coaches use beyond NP/IF/TSS, computed on demand from the streams.
 
-- **Body weight** for per-kg values: the weight saved before the workout, else the average
-  of the weigh-ins of the week up to its day (none older than a month).
+- **Body weight** for per-kg values: the weight saved before the workout, else the day's
+  trend weight (``bodyweight``: measured, interpolated, estimated or carried, and labelled so).
 - **Durability** (fatigue resistance): the best 1-, 5-, 8-, 10-, 15- and 20-minute power *after* the
   ride had already done 100, 200, 300 ... kJ of work (a multiple of 100 kJ past
   ``DURABILITY_MAX_STEPS`` steps; none in the ride's last half step), next to the same
@@ -48,14 +48,13 @@ from .analysis import (
     critical_power,
     timer_clock,
 )
+from .bodyweight import weight_on
 from .db import load_streams
 from .nutrition import get_workout_weight
 from .queries import downsample, get_activity, sport_family
 
 log = logging.getLogger(__name__)
 
-WEIGHT_AVERAGE_DAYS = 7
-WEIGHT_MAX_AGE_DAYS = 30
 DURABILITY_DURATIONS_S = (60, 300, 480, 600, 900, 1200)
 DURABILITY_STEP_KJ = 100
 DURABILITY_MAX_STEPS = 100  # a longer ride takes a multiple of DURABILITY_STEP_KJ instead
@@ -88,33 +87,19 @@ def _round(value: float | None, digits: int = 1) -> float | None:
 
 
 def ride_weight(conn: sqlite3.Connection, source: str, source_id: str, local_date: str) -> dict[str, Any] | None:
-    """``{kg, origin: "pre_workout" | "body", date, count}`` for per-kg values, or None: the weight
-    saved before the workout, else the average of the days' weights in the ``WEIGHT_AVERAGE_DAYS`` up
-    to its day (daily weights swing by a kilo; ``count`` days), ``date`` being the latest of them. A weigh-in older than
-    ``WEIGHT_MAX_AGE_DAYS`` is not used: a weight from years before says little about the ride."""
+    """The weight for the ride's per-kg values, or None, and where it comes from (``origin``):
+    ``pre_workout``, weighed for this ride; else ``trend``, the daily trend weight of its day
+    (``bodyweight``), with ``kind`` (weigh_in, interpolated, estimated, carried), the day's raw
+    ``weigh_in`` if there was one, ``gap_days`` and ``last_weigh_in``. Measured values are never
+    mixed up with filled ones: ``kind`` always says which it is."""
     saved = get_workout_weight(conn, source, source_id)
     if saved and saved.get("pre_kg"):
-        return {"kg": saved["pre_kg"], "origin": "pre_workout", "date": local_date, "count": 1}
-    day = date.fromisoformat(local_date)
-    end = (day + timedelta(days=1)).isoformat()
-    latest = conn.execute(
-        "SELECT ts FROM body_measurements WHERE metric = 'weight_kg' AND value > 0 AND ts < ? ORDER BY ts DESC LIMIT 1",
-        (end,),
-    ).fetchone()
-    if latest is None or latest["ts"][:10] < (day - timedelta(days=WEIGHT_MAX_AGE_DAYS)).isoformat():
+        return {"kg": saved["pre_kg"], "origin": "pre_workout", "kind": "weigh_in", "date": local_date,
+                "weigh_in": saved["pre_kg"], "gap_days": 0, "last_weigh_in": local_date}  # fmt: skip
+    day = weight_on(conn, local_date)
+    if day is None:
         return None
-    since = (date.fromisoformat(latest["ts"][:10]) - timedelta(days=WEIGHT_AVERAGE_DAYS - 1)).isoformat()
-    # One value per day: a scale synced to several services (and a CSV of the same days) counts once.
-    days = [
-        r[0]
-        for r in conn.execute(
-            "SELECT avg(value) FROM body_measurements WHERE metric = 'weight_kg' AND value > 0 AND ts >= ? AND ts < ? "
-            "GROUP BY substr(ts, 1, 10)",
-            (since, end),
-        )
-    ]
-    kg = round(sum(days) / len(days), 2)
-    return {"kg": kg, "origin": "body", "date": latest["ts"][:10], "count": len(days)}
+    return {"origin": "trend", **day}
 
 
 # -- durability -----------------------------------------------------------------------------

@@ -192,6 +192,20 @@ weigh-ins stores their mean. The unit (kg, lb or grams) comes from the header or
 two must agree. Blank days are skipped, a weigh-in stored by several sources counts once, and importing again
 updates those days. Ride insights use these for W/kg and kJ/kg.
 
+### Trend weight (measured vs filled)
+
+Weigh-ins in `body_measurements` are never changed or added to. `bodyweight.py` (`GET /api/weight`) derives a daily
+trend from them on every read, and labels each day:
+
+- **weigh_in**: a day with a measurement (its raw value is returned alongside the trend). The trend moves 10 % of
+  the way to each weigh-in (more after a gap), smoothing out water and food swings.
+- **interpolated**: no weigh-in, but weigh-ins at most 42 days apart around it: a straight line between them.
+- **estimated**: inside a longer gap: still a straight line, but a guess (the change may have come at any time).
+- **carried**: up to 30 days after the latest weigh-in, held flat. Later, and before the first weigh-in, there is no
+  value.
+
+Rides use the trend of their day (unless a pre-ride weight was saved) and say which kind it is.
+
 ### Performance index (how good you are, over time)
 
 CTL is how much you have trained; the performance index is what you can produce, from best efforts only
@@ -215,8 +229,8 @@ endurance (60 min) and durability (best 5 and 20 min after 1000 kJ of work, as a
 
 `GET /api/activities/{source}/{id}/insights` adds what coaches look at beyond NP/IF/TSS (`insights.py`):
 
-- **Per kg:** the body weight saved before the workout, else the average of the week's weigh-ins up to its day
-  (daily weights swing by a kilo); none when the latest weigh-in is over 30 days old.
+- **Per kg:** the body weight saved before the workout, else the day's trend weight (below), labelled with where it
+  comes from.
 - **Best efforts:** for 30 s, 1, 5, 10, 15, 20, 30 and 60 minutes, then every hour, the stretch with the highest
   average power, when it was, and the min, max and average heart rate over it.
 - **Durability:** the best 1, 5, 8, 10, 15 and 20 minutes after the ride had already done 100, 200, 300 ... kJ of work
@@ -463,6 +477,7 @@ Reads use read-only connections. Writes are threshold overrides, which re-score 
 | `POST /api/activities/import?filename&name&activity_type&timezone` | Import one `.fit`, `.gpx` or `.tcx` file (optionally `.gz`); the body is the file, as `application/octet-stream`. Stored as source `upload` and analysed; returns the workout and any copy already stored from another service |
 | `GET /api/activities/{source}/{id}` | One workout: `activity`, `analysis` (zones, power curve, thresholds used), `laps`, `device`, available `streams` channels |
 | `GET /api/activities/{source}/{id}/streams?max_points=2000` | Per-sample channels averaged down to `max_points` (`time` in seconds from the start); `w_bal` (W' left, J) for a ride with power and an FTP |
+| `GET /api/weight?start_date&end_date` | The daily trend weight, each day labelled weigh_in, interpolated, estimated or carried (raw weigh-ins: `/api/body`) |
 | `GET /api/performance?start_date&end_date` | The performance index per day (score, components with last-tested dates, efficiency), what raised it and the weights; all history by default |
 | `GET/PUT /api/performance/settings` | The index's component weights (`{weights: {sprint, …}, decay_per_week}`) and presets |
 | `GET /api/activities/{source}/{id}/insights` | Body weight for per-kg values, best efforts (power with the heart rate over them), durability (best efforts after accumulated work), W' balance with matches, efforts above FTP |
