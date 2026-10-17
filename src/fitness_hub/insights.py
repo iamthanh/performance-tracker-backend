@@ -17,6 +17,8 @@
   of at least ``MATCH_J`` within ``MATCH_IDLE_S`` of a high point (GoldenCheetah counts
   matches from 2 kJ), ended once ``MATCH_RECOVERED`` of W' (or half the drop, if less) is
   back, or once W' has not fallen another ``MATCH_PROGRESS_J`` in ``MATCH_IDLE_S``.
+- **Best efforts**: for 30 s, 1, 5, 10, 15, 20, 30 and 60 minutes, then every hour, the
+  stretch with the highest average power and the heart rate over it.
 - **Efforts**: from the moment the ``SMOOTH_S``-second centred average reaches FTP until it
   drops below ``EXIT_OF_FTP`` of it (so a short dip does not split an interval), taken out
   to the first and last seconds at or above FTP; kept when at least ``MIN_EFFORT_S`` long
@@ -38,6 +40,8 @@ import numpy as np
 
 from .analysis import (
     AUTO_WINDOW_DAYS,
+    MAX_HR_BPM,
+    MIN_HR_BPM,
     MIN_POWER_SHARE,
     POWER_ZONES,
     _ride_curves,
@@ -53,6 +57,8 @@ log = logging.getLogger(__name__)
 DURABILITY_DURATIONS_S = (60, 300, 480, 600, 900, 1200)
 DURABILITY_STEP_KJ = 100
 DURABILITY_MAX_STEPS = 100  # a longer ride takes a multiple of DURABILITY_STEP_KJ instead
+BEST_EFFORT_DURATIONS_S = (30, 60, 300, 600, 900, 1200, 1800, 3600, 7200, 10800, 14400)  # then every hour
+BEST_EFFORT_HR_COVERAGE = 0.5
 TIME_MARK_EVERY_S = (300, 600, 900, 1800, 3600, 7200)
 TIME_MARKS = 10
 TIME_MARK_GAP = 0.06  # of the kJ axis: closer marks would overlap (the UI leaves them out)
@@ -278,6 +284,42 @@ def _max(values: np.ndarray) -> float | None:
     return float(values.max()) if values.size else None
 
 
+# -- best efforts -------------------------------------------------------------------------
+
+
+def best_efforts(
+    power: np.ndarray, hr: np.ndarray, clock: np.ndarray, paused: np.ndarray | None = None
+) -> list[dict[str, Any]]:
+    """For each of ``BEST_EFFORT_DURATIONS_S`` (then every hour) up to the ride's moving time: the
+    stretch with the highest average power (pauses count as 0 W, as in the power curve; the earliest
+    on a tie), when it was, and the heart rate over it (min, max, average), given HR for at least
+    ``BEST_EFFORT_HR_COVERAGE`` of its riding seconds."""
+    paused = np.zeros(power.size, dtype=bool) if paused is None else paused
+    moving = int((~paused).sum())  # a long stop must not make "best 5 h" of a 2 h ride
+    durations = [d for d in BEST_EFFORT_DURATIONS_S if d <= moving]
+    hours = range(BEST_EFFORT_DURATIONS_S[-1] + 3600, moving + 1, 3600)
+    sums = np.concatenate(([0.0], np.cumsum(power)))
+    out = []
+    for d in [*durations, *hours]:
+        averages = (sums[d:] - sums[:-d]) / d
+        i = int(np.argmax(averages))
+        window = hr[i : i + d]
+        riding = int((~paused[i : i + d]).sum())
+        has_hr = riding > 0 and int((~np.isnan(window)).sum()) >= BEST_EFFORT_HR_COVERAGE * riding
+        out.append(
+            {
+                "duration_s": d,
+                "avg_power_w": _round(averages[i], 0),
+                "start_s": _round(clock[i], 0),
+                "end_s": _round(clock[i + d - 1] + 1, 0),
+                "avg_hr": _round(float(np.nanmean(window)), 0) if has_hr else None,
+                "min_hr": _round(float(np.nanmin(window)), 0) if has_hr else None,
+                "max_hr": _round(float(np.nanmax(window)), 0) if has_hr else None,
+            }
+        )
+    return out
+
+
 # -- putting it together --------------------------------------------------------------------
 
 
@@ -291,6 +333,9 @@ def _ride_power(conn: sqlite3.Connection, source: str, source_id: str) -> dict[s
     if not streams or not any(v for v in streams.get("power") or [] if v):
         return None
     clock, paused, series = timer_clock(streams, ("power", "heart_rate", "cadence"))
+    hr = series["heart_rate"]
+    with np.errstate(invalid="ignore"):
+        hr[(hr < MIN_HR_BPM) | (hr > MAX_HR_BPM)] = np.nan  # a strap that lost contact, spikes
     power = np.nan_to_num(series["power"], nan=0.0)
     if power.size == 0 or float(np.mean(power[~paused] > 0)) < MIN_POWER_SHARE:
         return None
@@ -316,11 +361,14 @@ def activity_insights(conn: sqlite3.Connection, source: str, source_id: str) -> 
     if activity is None:
         return None
     weight = ride_weight(conn, source, str(source_id), activity["local_date"])
-    out: dict[str, Any] = {"weight": weight, "durability": None, "w_prime": None, "efforts": None}
+    out: dict[str, Any] = {
+        "weight": weight, "best_efforts": None, "durability": None, "w_prime": None, "efforts": None
+    }  # fmt: skip
     ride = _ride_power(conn, source, source_id)
     if ride is None:
         return out
     power, clock, ftp = ride["power"], ride["clock"], ride["ftp"]
+    out["best_efforts"] = best_efforts(power, ride["hr"], clock, ride["paused"])
     out["durability"] = durability(power, clock)
     if not ftp:
         return out
