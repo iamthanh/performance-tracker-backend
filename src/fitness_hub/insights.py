@@ -103,11 +103,11 @@ def durability(power: np.ndarray) -> dict[str, Any] | None:
     work = np.cumsum(power) / 1000  # kJ done by the end of each second
     total = float(work[-1])
     reach = total + 1e-9  # whole-kJ totals summed from float watts must not fall just short
-    step = DURABILITY_STEP_KJ * max(1, math.ceil(total / DURABILITY_STEP_KJ / DURABILITY_MAX_STEPS))
+    step = DURABILITY_STEP_KJ * max(1, math.ceil((total - 1e-9) / (DURABILITY_STEP_KJ * DURABILITY_MAX_STEPS)))
     last = reach - DURABILITY_MIN_LEFT * step  # a step needs half a step of riding after it
     steps = [k * step for k in range(int(reach // step) + 1) if k == 0 or k * step <= last]
     # The first second after each step (a window may start there or later).
-    starts = [0, *(int(np.searchsorted(work, s)) + 1 for s in steps[1:])]
+    starts = [0, *(int(np.searchsorted(work, s - 1e-9)) + 1 for s in steps[1:])]
     sums = np.concatenate(([0.0], np.cumsum(power)))
     rows = []
     for d in DURABILITY_DURATIONS_S:

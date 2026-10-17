@@ -50,6 +50,7 @@ def test_durability_shows_the_fade_and_coarsens_very_long_rides() -> None:
     assert five[:7] == [400] * 7 and five[8:20] == [250] * 12  # the 720 kJ start is over by 800 kJ
     long = durability(np.full(12 * 3600, 300.0))  # 12960 kJ: over 100 steps of 100 kJ
     assert long["steps"][1] == 200 and len(long["steps"]) <= 101
+    assert durability(np.full(3600, 10_000_000 / 3600))["steps"][1] == 100  # exactly 10000 kJ: still 100 kJ steps
 
 
 def test_w_balance_spends_above_cp_and_recovers_below() -> None:
