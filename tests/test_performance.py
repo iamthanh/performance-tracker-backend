@@ -27,8 +27,19 @@ def curve(scale: float = 1.0) -> dict[int, float]:
     return {d: w * scale for d, w in base.items()}
 
 
+KG = 75.0
+
+
+def weigh(store: Store, day: str, kg: float) -> None:
+    row = {"source": "weight_csv", "ts": f"{day}T12:00:00Z", "metric": "weight_kg", "value": kg}
+    store.upsert_body_measurements([row])
+
+
 def add_ride(store: Store, source_id: str, day: str, c: dict[int, float], fatigued: dict[int, float] | None = None,
-             activity_type: str = "Ride") -> None:  # fmt: skip
+             activity_type: str = "Ride", kg: float | None = KG) -> None:  # fmt: skip
+    """A ride with its best efforts, weighed that day (``kg``; None: no weigh-in)."""
+    if kg:
+        weigh(store, day, kg)
     store.upsert_activities(
         [{"source": "strava", "source_id": source_id, "start_time": day + "T08:00:00Z", "local_date": day,
           "activity_type": activity_type, "name": f"Ride {source_id}", "raw": {}}]  # fmt: skip
@@ -72,11 +83,11 @@ def test_components_rise_with_a_best_and_fade_slowly_without(store: Store) -> No
     add_ride(store, "2", day(30), curve(0.9))  # not a best: nothing rises
     add_ride(store, "3", day(120), curve(1.1))  # a new best after the first ride left the window
     days = {d["date"]: d for d in P.raw_timeline(store.conn, 0.01, end=day(130))["days"]}
-    assert days[day(0)]["values"]["vo2max"] == 300
+    assert days[day(0)]["values"]["vo2max"] == 300 / KG  # W/kg
     # Ride 1 leaves the 90-day window after day 89; from then the value eases from 300 W (ride 2: 270 W).
-    assert days[day(89)]["values"]["vo2max"] == 300
-    assert days[day(100)]["values"]["vo2max"] == pytest.approx(max(270, 300 * 0.99 ** (11 / 7)))
-    assert days[day(120)]["values"]["vo2max"] == pytest.approx(330)
+    assert days[day(89)]["values"]["vo2max"] == 300 / KG
+    assert days[day(100)]["values"]["vo2max"] == pytest.approx(max(270, 300 * 0.99 ** (11 / 7)) / KG)
+    assert days[day(120)]["values"]["vo2max"] == pytest.approx(330 / KG)
     assert days[day(130)]["tested"]["vo2max"] == day(120)
     events = P.raw_timeline(store.conn, 0.01, end=day(130))["events"]
     rises = [(e["date"], e["component"]) for e in events]
@@ -140,7 +151,7 @@ def test_an_easy_ride_after_a_layoff_is_not_a_test(store: Store) -> None:
     add_ride(store, "best", day(0), curve())
     add_ride(store, "easy", day(150), curve(0.7))  # 70 % of the (slowly easing) value
     last = P.raw_timeline(store.conn, 0.005, end=day(150))["days"][-1]
-    assert last["values"]["vo2max"] > 0.9 * 300 and last["tested"]["vo2max"] is None
+    assert last["values"]["vo2max"] > 0.9 * 300 / KG and last["tested"]["vo2max"] is None
 
 
 def test_range_checks_and_warm_up_events(store: Store) -> None:
@@ -154,6 +165,33 @@ def test_range_checks_and_warm_up_events(store: Store) -> None:
     assert future[-1]["date"] == date.today().isoformat()  # never past today
     with pytest.raises(InputError):
         P.performance(store.conn, start_date=day(100), end_date=day(99))
+
+
+def test_power_is_per_kg_of_each_rides_weight(store: Store) -> None:
+    add_ride(store, "heavy", day(0), curve(), kg=80.0)
+    add_ride(store, "light", day(10), curve(0.98), kg=70.0)  # 2 % less power, but lighter: a new best
+    timeline = P.raw_timeline(store.conn, 0.01, end=day(10))
+    days = {d["date"]: d for d in timeline["days"]}
+    assert days[day(0)]["values"]["vo2max"] == pytest.approx(300 / 80)
+    rise = next(e for e in timeline["events"] if e["component"] == "vo2max")
+    light_kg = rise["ride"]["kg"]  # the trend weight of that day: on its way from 80 to 70 kg
+    assert 70 < light_kg < 80 and rise["ride"]["watts"] == pytest.approx(294)
+    assert days[day(10)]["values"]["vo2max"] == pytest.approx(294 / light_kg, abs=0.001)
+    assert rise["split"] == {"power_pct": -2.0, "weight_pct": pytest.approx(100 * (80 / light_kg - 1), abs=0.05)}
+    # Durability is a ratio of watts: weight cancels.
+    assert days[day(10)]["values"]["durability"] is None or days[day(10)]["values"]["durability"] <= 1
+
+
+def test_rides_without_a_weight_do_not_count_and_estimated_weights_are_flagged(store: Store) -> None:
+    add_ride(store, "unweighed", day(0), curve(), kg=None)
+    assert all(d["values"]["vo2max"] is None for d in P.raw_timeline(store.conn, 0.01, end=day(5))["days"])
+    weigh(store, day(10), 75.0)
+    add_ride(store, "guess", day(60), curve(1.1), kg=None)  # inside a 100-day gap: an estimated weight
+    weigh(store, day(110), 75.0)
+    result = P.performance(store.conn, end_date=day(150))
+    flagged = {d["date"]: d["components"]["vo2max"]["estimated_weight"] for d in result["days"]}
+    assert flagged[day(100)] is True  # the window's best rests on the estimated-weight ride
+    assert flagged[day(150)] is True  # still the value in effect, eased
 
 
 def test_runs_do_not_count(store: Store) -> None:

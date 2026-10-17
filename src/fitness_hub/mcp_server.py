@@ -242,9 +242,10 @@ def create_server(
         end_date: DateArg = None,
     ) -> str:
         """How good the rider is, day by day (unlike CTL, which is how much they trained): a score where
-        100 = their baseline, from six components (sprint 5 s, anaerobic 1 min, VO2max 5 min, threshold,
-        endurance 60 min, durability = power kept after 1000 kJ), each an index with the date it was last
-        tested near-maximally; plus aerobic efficiency (EF of steady rides) and the rides that raised it."""
+        100 = their baseline, from six components in W/kg of each ride's weight (sprint 5 s, anaerobic 1 min,
+        VO2max 5 min, threshold, endurance 60 min) plus durability (power kept after 1000 kJ), each an index
+        with the date it was last tested near-maximally and whether it rests on an estimated weight; plus
+        aerobic efficiency (EF of steady rides) and the rides that raised it, split into power and weight."""
         end = parse_date(end_date, "end_date") if end_date else date.today()
         start = start_date or (end - timedelta(days=89)).isoformat()
         return _dump(await read(lambda c: performance.performance(c, start, end_date)))

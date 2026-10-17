@@ -210,9 +210,12 @@ Rides use the trend of their day (unless a pre-ride weight was saved) and say wh
 ### Performance index (how good you are, over time)
 
 CTL is how much you have trained; the performance index is what you can produce, from best efforts only
-(`performance.py`, `GET /api/performance`, `fitness-hub performance`). Six components over the trailing 90 days:
-sprint (best 5 s), anaerobic (1 min), VO2max (5 min), threshold (the FTP estimate of the window's curve),
-endurance (60 min) and durability (best 5 and 20 min after 1000 kJ of work, as a share of fresh).
+(`performance.py`, `GET /api/performance`, `fitness-hub performance`). Six components over the trailing 90 days, in
+**W/kg** (each ride's efforts over its own weight: pre-ride, else the day's trend weight; rides without a weight do
+not count): sprint (best 5 s), anaerobic (1 min), VO2max (5 min), threshold (the FTP estimate of the window's
+curve), endurance (60 min), and durability (best 5 and 20 min after 1000 kJ of work, as a share of fresh: a ratio
+of watts, so weight cancels). A component resting on an estimated weight is flagged, and each rise is split into
+its power and weight parts.
 
 - A component rises only with a new best in the window and otherwise falls by at most 1 % a week (as the auto FTP;
   set in the UI's Settings). `fitness-hub performance --backtest` compares decay rates by how well each predicts
