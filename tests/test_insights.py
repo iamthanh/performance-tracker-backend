@@ -44,6 +44,27 @@ def test_durability_in_100_kj_steps() -> None:
     assert durability(np.full(30, 200.0)) is None
 
 
+def test_durability_places_the_work_on_the_ride_clock() -> None:
+    # 30 min at 200 W (360 kJ), a 30 min stop, then 60 min at 100 W (360 kJ): time runs on, work does not.
+    streams = {"time": [*range(0, 1800), *range(3600, 7200)], "power": [200.0] * 1800 + [100.0] * 3600}
+    clock, paused, series = timer_clock(streams, ("power",))
+    power = np.nan_to_num(series["power"], nan=0.0)
+    result = durability(power, clock)
+    assert result["steps"][:5] == [0, 100, 200, 300, 400]
+    # 100 kJ after 500 s; 400 kJ only after the stop, 400 s into the second half.
+    assert result["step_times_s"][:5] == [0, 500, 1000, 1500, 4000]
+    marks = {m["time_s"]: m["kj"] for m in result["time_marks"]}
+    assert list(marks)[:3] == [300, 600, 900]  # 5 min apart: the stop leaves few distinct marks
+    assert marks[1800] == 360 and marks[2400] == 360 and marks[3600] == 360  # nothing during the stop
+    assert marks[5400] == 540
+    assert "time_marks" not in durability(power)  # without a clock: kJ only
+    # A long stop does not empty the time axis: the interval comes from the marks that stay apart.
+    long_stop = {"time": [*range(0, 3600), *range(32400, 36000)], "power": [200.0] * 7200}
+    clock, _, series = timer_clock(long_stop, ("power",))
+    marks = durability(np.nan_to_num(series["power"], nan=0.0), clock)["time_marks"]
+    assert any(m["kj"] < 720 for m in marks) and any(m["kj"] > 720 for m in marks)
+
+
 def test_durability_shows_the_fade_and_coarsens_very_long_rides() -> None:
     power = np.concatenate([np.full(1800, 400.0), np.full(9000, 250.0)])  # hard start, then steady
     five = next(r["watts"] for r in durability(power)["rows"] if r["duration_s"] == 300)
