@@ -143,17 +143,19 @@ def _channel(streams: Mapping[str, list[Any]], name: str) -> np.ndarray | None:
     return np.array([np.nan if v is None else v for v in values], dtype=float)
 
 
-def timer_series(
-    streams: Mapping[str, list[Any]], channels: Iterable[str], *, keep_pauses: bool = False
-) -> dict[str, np.ndarray]:
-    """``{channel: 1 Hz float array}`` on the timer clock (NaN where a value is missing).
+@dataclass(frozen=True)
+class _Layout:
+    """How the stream samples map onto the 1 Hz timer clock."""
 
-    With ``keep_pauses`` the paused seconds are kept as NaN instead of being left
-    out, so rolling windows cannot join efforts across a stop.
-    """
+    samples: np.ndarray  # stream sample index (in the stored order) shown in each timer second
+    is_pause: np.ndarray  # True for a paused second (kept only with ``keep_pauses``)
+    clock: np.ndarray  # each timer second's time in the stream's clock (seconds from the start)
+
+
+def _layout(streams: Mapping[str, list[Any]], keep_pauses: bool) -> _Layout | None:
     t = np.asarray(streams.get("time") or [], dtype=float)
     if t.size == 0:
-        return {c: np.empty(0) for c in channels}
+        return None
     order = np.argsort(t, kind="stable")
     sec = np.round(t[order] - t[order][0]).astype(np.int64)
     keep = np.concatenate(([True], np.diff(sec) > 0))  # one sample per second
@@ -175,17 +177,46 @@ def timer_series(
     span = held + paused
     index = np.repeat(np.arange(sec.size), span)
     offset = np.arange(index.size) - np.repeat(np.cumsum(span) - span, span)  # position within each span
-    is_pause = offset >= np.repeat(held, span)
-    out = {}
-    for c in channels:
-        values = _channel(streams, c)
-        if values is None:
-            out[c] = np.full(index.size, np.nan)
-            continue
-        series = values[order][keep][index]
-        series[is_pause] = np.nan
-        out[c] = series
-    return out
+    return _Layout(
+        samples=order[keep][index],
+        is_pause=offset >= np.repeat(held, span),
+        clock=t[order][keep][index] - t[order][0] + offset,
+    )
+
+
+def timer_series(
+    streams: Mapping[str, list[Any]], channels: Iterable[str], *, keep_pauses: bool = False
+) -> dict[str, np.ndarray]:
+    """``{channel: 1 Hz float array}`` on the timer clock (NaN where a value is missing).
+
+    With ``keep_pauses`` the paused seconds are kept as NaN instead of being left
+    out, so rolling windows cannot join efforts across a stop.
+    """
+    layout = _layout(streams, keep_pauses)
+    if layout is None:
+        return {c: np.empty(0) for c in channels}
+    return {c: _on_timer(streams, c, layout) for c in channels}
+
+
+def timer_clock(
+    streams: Mapping[str, list[Any]], channels: Iterable[str]
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """Like ``timer_series`` with ``keep_pauses``, plus each second's time in the stream's own clock
+    (``time`` from the start), so results on the timer clock can be placed on the stream charts, and
+    which seconds are paused: ``(clock, is_pause, series)``."""
+    layout = _layout(streams, keep_pauses=True)
+    if layout is None:
+        return np.empty(0), np.empty(0, dtype=bool), {c: np.empty(0) for c in channels}
+    return layout.clock, layout.is_pause, {c: _on_timer(streams, c, layout) for c in channels}
+
+
+def _on_timer(streams: Mapping[str, list[Any]], channel: str, layout: _Layout) -> np.ndarray:
+    values = _channel(streams, channel)
+    if values is None:
+        return np.full(layout.samples.size, np.nan)
+    series = values[layout.samples]
+    series[layout.is_pause] = np.nan
+    return series
 
 
 def _rolling_mean(x: np.ndarray, window: int) -> np.ndarray:
