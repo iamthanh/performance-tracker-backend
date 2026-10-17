@@ -152,6 +152,19 @@ def test_best_efforts_find_the_hardest_stretch_and_its_heart_rate() -> None:
     assert by[3600]["avg_power_w"] == round((350 * 300 + 150 * 3300) / 3600)
     no_hr = best_efforts(power, np.full(power.size, np.nan), clock)
     assert no_hr[0]["avg_hr"] is None and no_hr[0]["min_hr"] is None
+    sparse = np.full(power.size, np.nan)
+    sparse[1200:1300] = 160  # HR for a third of the best 5 min: too little to report
+    assert best_efforts(power, sparse, clock)[2]["avg_hr"] is None
+
+
+def test_best_efforts_stop_at_the_moving_time() -> None:
+    # 2 h of riding around a 6 h stop: no "best 3 h" made mostly of the stop.
+    streams = {"time": [*range(0, 3600), *range(25200, 28800)], "power": [200.0] * 7200,
+               "heart_rate": [140] * 7200}  # fmt: skip
+    clock, paused, series = timer_clock(streams, ("power", "heart_rate"))
+    power = np.nan_to_num(series["power"], nan=0.0)
+    durations = [e["duration_s"] for e in best_efforts(power, series["heart_rate"], clock, paused)]
+    assert durations[-1] == 7200
 
 
 def test_best_efforts_go_on_hourly_past_four_hours() -> None:

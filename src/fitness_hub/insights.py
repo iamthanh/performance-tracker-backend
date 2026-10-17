@@ -58,6 +58,7 @@ DURABILITY_DURATIONS_S = (60, 300, 480, 600, 900, 1200)
 DURABILITY_STEP_KJ = 100
 DURABILITY_MAX_STEPS = 100  # a longer ride takes a multiple of DURABILITY_STEP_KJ instead
 BEST_EFFORT_DURATIONS_S = (30, 60, 300, 600, 900, 1200, 1800, 3600, 7200, 10800, 14400)  # then every hour
+BEST_EFFORT_HR_COVERAGE = 0.5
 TIME_MARK_EVERY_S = (300, 600, 900, 1800, 3600, 7200)
 TIME_MARKS = 10
 TIME_MARK_GAP = 0.06  # of the kJ axis: closer marks would overlap (the UI leaves them out)
@@ -286,19 +287,25 @@ def _max(values: np.ndarray) -> float | None:
 # -- best efforts -------------------------------------------------------------------------
 
 
-def best_efforts(power: np.ndarray, hr: np.ndarray, clock: np.ndarray) -> list[dict[str, Any]]:
-    """For each of ``BEST_EFFORT_DURATIONS_S`` (then every hour) that fits in the ride: the stretch
-    with the highest average power (pauses count as 0 W, as in the power curve; the earliest on a
-    tie), when it was, and the heart rate over it (min, max, average of the seconds with HR)."""
-    durations = [d for d in BEST_EFFORT_DURATIONS_S if d <= power.size]
-    hours = range(BEST_EFFORT_DURATIONS_S[-1] + 3600, power.size + 1, 3600)
+def best_efforts(
+    power: np.ndarray, hr: np.ndarray, clock: np.ndarray, paused: np.ndarray | None = None
+) -> list[dict[str, Any]]:
+    """For each of ``BEST_EFFORT_DURATIONS_S`` (then every hour) up to the ride's moving time: the
+    stretch with the highest average power (pauses count as 0 W, as in the power curve; the earliest
+    on a tie), when it was, and the heart rate over it (min, max, average), given HR for at least
+    ``BEST_EFFORT_HR_COVERAGE`` of its riding seconds."""
+    paused = np.zeros(power.size, dtype=bool) if paused is None else paused
+    moving = int((~paused).sum())  # a long stop must not make "best 5 h" of a 2 h ride
+    durations = [d for d in BEST_EFFORT_DURATIONS_S if d <= moving]
+    hours = range(BEST_EFFORT_DURATIONS_S[-1] + 3600, moving + 1, 3600)
     sums = np.concatenate(([0.0], np.cumsum(power)))
     out = []
     for d in [*durations, *hours]:
         averages = (sums[d:] - sums[:-d]) / d
         i = int(np.argmax(averages))
         window = hr[i : i + d]
-        has_hr = bool(np.any(~np.isnan(window)))
+        riding = int((~paused[i : i + d]).sum())
+        has_hr = riding > 0 and int((~np.isnan(window)).sum()) >= BEST_EFFORT_HR_COVERAGE * riding
         out.append(
             {
                 "duration_s": d,
@@ -361,7 +368,7 @@ def activity_insights(conn: sqlite3.Connection, source: str, source_id: str) -> 
     if ride is None:
         return out
     power, clock, ftp = ride["power"], ride["clock"], ride["ftp"]
-    out["best_efforts"] = best_efforts(power, ride["hr"], clock)
+    out["best_efforts"] = best_efforts(power, ride["hr"], clock, ride["paused"])
     out["durability"] = durability(power, clock)
     if not ftp:
         return out
