@@ -37,7 +37,7 @@ def store(settings: Settings):
 
 
 def test_schema_has_the_nutrition_tables(store: Store) -> None:
-    assert schema_version(store.conn) == SCHEMA_VERSION == 6
+    assert schema_version(store.conn) == SCHEMA_VERSION == 7
     tables = {r[0] for r in store.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"foods", "nutrition_entries"} <= tables
 

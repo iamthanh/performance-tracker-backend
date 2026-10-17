@@ -19,7 +19,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from . import nutrition, performance, queries
+from . import cardio, nutrition, performance, queries
 from .config import Settings
 from .db import BODY_METRICS, DAILY_METRICS, SOURCES, open_readonly
 from .sync import PROVIDER_NAMES, run_sync
@@ -66,7 +66,9 @@ local_date, consumed_at, meal, activity_source, activity_source_id, offset_s, fo
 nutrients as totals for the entry, note, kind food|drink, recipe: one bottle's JSON) hold what the user logged \
 eating and drinking; workout_weights(source, source_id, pre_kg, post_kg, note) their weight around a workout. \
 activity_metrics, power_curve, durability_bests(source, source_id, after_kj, duration_s, watts: best \
-efforts started after that much work) and athlete_settings are filled by the training analysis and may be empty. \
+efforts started after that much work), ride_cardio(source, source_id, has_gps, blocks: JSON [[start_s, watts, bpm, \
+temp_c, kj_before, clock_s]] of steady riding, recoveries: JSON [[peak_bpm, drop_bpm, effort_w, recovery_w]]) and \
+athlete_settings are filled by the training analysis and may be empty. \
 `raw` holds the provider JSON (use json_extract). \
 query_sql does NOT de-duplicate activities.
 
@@ -249,6 +251,20 @@ def create_server(
         end = parse_date(end_date, "end_date") if end_date else date.today()
         start = start_date or (end - timedelta(days=89)).isoformat()
         return _dump(await read(lambda c: performance.performance(c, start, end_date)))
+
+    @mcp.tool(annotations=READ_ONLY, structured_output=False)
+    async def cardio_index(
+        start_date: Annotated[str | None, Field(description="YYYY-MM-DD; default the last 90 days")] = None,
+        end_date: DateArg = None,
+    ) -> str:
+        """How fit the rider's heart and lungs are, day by day: a score where 100 = their baseline, from
+        aerobic efficiency (heart rate at a reference power and power at a reference heart rate on steady
+        riding over 42 days, corrected for heat, riding indoors and fatigue, which lowers heart rate),
+        resting heart rate, heart-rate recovery after hard efforts and cardiac drift (not scored), with an
+        estimated VO2max, the fitted model (slopes and corrections) and each ride's corrected value."""
+        end = parse_date(end_date, "end_date") if end_date else date.today()
+        start = start_date or (end - timedelta(days=89)).isoformat()
+        return _dump(await read(lambda c: cardio.cardio(c, start, end_date)))
 
     @mcp.tool(annotations=READ_ONLY, structured_output=False)
     async def power_curve(

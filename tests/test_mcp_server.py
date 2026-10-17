@@ -30,6 +30,7 @@ EXPECTED_TOOLS = {
     "query_sql",
     "training_load",
     "power_curve",
+    "cardio_index",
     "get_activity_analysis",
     "nutrition_daily",
     "performance_index",

@@ -44,7 +44,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import __version__, bodyweight, insights, nutrition, performance, queries, uploads
+from . import __version__, bodyweight, cardio, insights, nutrition, performance, queries, uploads
 from .analysis import analyze, thresholds_on
 from .config import Settings
 from .db import ATHLETE_SETTINGS, Store, open_readonly, schema_version
@@ -126,6 +126,14 @@ class PerformanceSettingsIn(BaseModel):
 
     weights: dict[str, float]  # all six components, checked by performance.set_settings
     decay_per_week: Annotated[float | None, Field(ge=0, le=0.05)] = None
+
+
+class CardioSettingsIn(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    weights: dict[str, float]  # aerobic, resting_hr, hr_recovery: checked by cardio.set_settings
+    reference_power_w: Annotated[float | None, Field(ge=50, le=600)] = None  # None: automatic
+    reference_hr_bpm: Annotated[float | None, Field(ge=60, le=220)] = None
 
 
 class WeightIn(BaseModel):
@@ -444,6 +452,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with Store(settings.db_path) as store:
             saved = performance.set_settings(store.conn, body.weights, body.decay_per_week)
         return {**saved, "presets": performance.PRESETS}
+
+    @app.get("/api/cardio")
+    def cardio_index(conn: Conn, start_date: DateQuery = None, end_date: DateQuery = None) -> dict[str, Any]:
+        """The cardio index per day (score; heart rate at the reference power and power at the reference
+        heart rate on steady riding, corrected for heat, indoors and fatigue; resting heart rate; HR
+        recovery; cardiac drift; an estimated VO2max), the fitted model and the rides in the range."""
+        start = parse_date(start_date, "start_date").isoformat() if start_date else None
+        end = parse_date(end_date, "end_date").isoformat() if end_date else None
+        return cardio.cardio(conn, start, end)
+
+    @app.get("/api/cardio/settings")
+    def cardio_settings(conn: Conn) -> dict[str, Any]:
+        return cardio.get_settings(conn)
+
+    @app.put("/api/cardio/settings")
+    def set_cardio_settings(body: CardioSettingsIn) -> dict[str, Any]:
+        with Store(settings.db_path) as store:
+            return cardio.set_settings(store.conn, body.weights, body.reference_power_w, body.reference_hr_bpm)
+
+    @app.get("/api/activities/{source}/{source_id}/cardio")
+    def activity_cardio(conn: Conn, source: str, source_id: str) -> dict[str, Any]:
+        """A ride's steady riding against the rider's recent normal: heart rate at the reference power
+        (raw and corrected), its steady blocks and HR recoveries."""
+        result = cardio.ride_cardio(conn, source, source_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="no heart rate and power analysis for this activity")
+        return result
 
     @app.get("/api/summary")
     def summary(

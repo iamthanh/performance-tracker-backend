@@ -108,6 +108,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--backtest", action="store_true", help="compare decay rates by how well they predict your efforts"
     )
 
+    heart = sub.add_parser("cardio", help="show the cardio index (or check its corrections against your rides)")
+    heart.add_argument(
+        "--backtest", action="store_true", help="compare the corrections by how well they predict your rides"
+    )
+
     serve = sub.add_parser("serve-mcp", help="run the MCP server (stdio for Claude, or localhost HTTP)")
     serve.add_argument("--transport", choices=("stdio", "http"), default="stdio")
     serve.add_argument("--host", default="127.0.0.1", help="HTTP bind address (loopback only)")
@@ -349,6 +354,41 @@ def cmd_performance(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cardio(settings: Settings, args: argparse.Namespace) -> int:
+    from . import cardio
+
+    with closing(open_readonly(settings.db_path)) as conn:
+        if args.backtest:
+            print(f"{'CORRECTIONS':<12} {'RIDES':>6} {'MAE bpm':>8} {'SD bpm':>7}")
+            for r in cardio.backtest(conn):
+                print(f"{r['corrections']:<12} {r['rides']:>6} {r['mae_bpm'] or 0:>8.2f} {r['sd_bpm'] or 0:>7.2f}")
+            print("Each ride's heart rate at the reference power, predicted from the corrected rides of the 42 days")
+            print("before it put back to its own conditions. Lower is better.")
+            return 0
+        result = cardio.cardio(conn)
+    model = result["model"]
+    if model is None or not result["days"]:
+        print("No rides with power and heart rate yet. Import activities, then run `fitness-hub analyze`.")
+        return 0
+    today = result["days"][-1]
+    ref = model["reference"]
+    c = model["corrections"]
+    print(f"Cardio index on {today['date']}: {today['score'] if today['score'] is not None else '—'}")
+    if today["hr_at_ref"] is not None:
+        print(f"  {today['hr_at_ref']:.1f} bpm at {ref['power_w']:g} W  =  {today['power_at_ref']:.0f} W at "
+              f"{ref['hr_bpm']:g} bpm  ({today['rides']} rides in {result['window_days']} days)")  # fmt: skip
+    for comp in result["components"]:
+        part = today["components"][comp["key"]]
+        value = "—" if part["value"] is None else f"{part['value']:g} {comp['unit']}"
+        index = "" if part["index"] is None else f"  index {part['index']:.1f}"
+        print(f"  {comp['label']:<19} {value:>16}{index}")
+    if today["vo2max"] is not None:
+        print(f"  Estimated VO2max    {today['vo2max']:.1f} ml/kg/min (resting HR {today['vo2max_basis']['resting']})")
+    print(f"Corrections: indoors {c['indoor_bpm']:+.1f} bpm, heat {c['heat_bpm_per_c']:+.2f} bpm/°C above "
+          f"{c['heat_from_c']:g} °C, form {c['form_bpm_per_tsb']:+.3f} bpm per TSB point")  # fmt: skip
+    return 0
+
+
 def cmd_serve_api(settings: Settings, args: argparse.Namespace) -> int:
     from .api import serve
 
@@ -411,6 +451,7 @@ COMMANDS = {
     "analyze": cmd_analyze,
     "thresholds": cmd_thresholds,
     "performance": cmd_performance,
+    "cardio": cmd_cardio,
     "serve-mcp": cmd_serve,
     "serve-api": cmd_serve_api,
     "run": cmd_run,
