@@ -126,6 +126,7 @@ def dedupe_activities(
     rows: Iterable[dict[str, Any]],
     window_s: int = DEDUPE_WINDOW_S,
     rank: Callable[[dict[str, Any]], Any] | None = None,
+    keep_copies: bool = False,
 ) -> list[dict[str, Any]]:
     """Merge rows from *different* sources that record the same workout.
 
@@ -136,8 +137,9 @@ def dedupe_activities(
     within ``window_s`` seconds and the group has no row from the same source;
     otherwise it starts a new group. Every merged duplicate therefore starts
     within ``window_s`` of the kept activity, and groups cannot chain. The kept
-    row lists the other sources in ``also_recorded_by``. Output is sorted by
-    start time, oldest first.
+    row lists the other sources in ``also_recorded_by`` (and, with ``keep_copies``,
+    the merged rows themselves in ``_copies``). Output is sorted by start time,
+    oldest first.
     """
     timed: list[tuple[datetime, dict[str, Any]]] = []
     untimed: list[dict[str, Any]] = []
@@ -172,6 +174,8 @@ def dedupe_activities(
     for members in groups:
         keep = dict(members[0])
         keep["also_recorded_by"] = [m["source"] for m in members[1:]]
+        if keep_copies:
+            keep["_copies"] = members[1:]
         result.append(keep)
     for row in untimed:
         result.append({**row, "also_recorded_by": []})
@@ -533,7 +537,7 @@ def activities_with_metrics(
         sql += " WHERE " + " AND ".join(clauses)
     rows = [dict(r) for r in conn.execute(sql, params)]
     kept = dedupe_activities(
-        rows, rank=lambda r: (not r["analysed"], not r["has_streams"], _priority(r["source"]))
+        rows, rank=lambda r: (not r["analysed"], not r["has_streams"], _priority(r["source"])), keep_copies=True
     )
     kept.sort(key=lambda r: r.get("start_time") or "", reverse=True)
     out = []
@@ -542,28 +546,18 @@ def activities_with_metrics(
         item.update(sport=sport_family(row["activity_type"]), also_recorded_by=row["also_recorded_by"],
                     has_streams=bool(row["has_streams"]), analysed=bool(row["analysed"]))  # fmt: skip
         item.update({c: row[f"m_{c}"] for c in _LIST_METRIC_COLUMNS})
-        item["kcal"] = workout_kcal(item, _copies_calories(row, rows))
+        item["kcal"] = workout_kcal(item, _recorded_calories(row))
         out.append(item)
     return out
 
 
-def _copies_calories(kept: Mapping[str, Any], rows: list[dict[str, Any]]) -> float | None:
-    """Recorded calories of the kept row, else of a duplicate from another service (the
-    preferred source first): Strava summaries have none, a Garmin copy may."""
+def _recorded_calories(kept: Mapping[str, Any]) -> float | None:
+    """Recorded calories of a de-duplicated workout: the kept row's, else those of a copy merged
+    into it (``_copies``), the preferred source first. Strava summaries have none, a Garmin copy may."""
     if kept.get("calories"):
         return float(kept["calories"])
-    if not kept.get("also_recorded_by"):
-        return None
-    start = parse_ts(kept.get("start_time"))
-    if start is None:
-        return None
-    window = timedelta(seconds=DEDUPE_WINDOW_S)
-    copies = [
-        r for r in rows
-        if r["source"] in kept["also_recorded_by"] and r.get("calories")
-        and (ts := parse_ts(r.get("start_time"))) is not None and abs(ts - start) <= window
-    ]  # fmt: skip
-    return float(min(copies, key=lambda r: _priority(r["source"]))["calories"]) if copies else None
+    copies = [c for c in kept.get("_copies", ()) if c.get("calories")]
+    return float(min(copies, key=lambda c: _priority(c["source"]))["calories"]) if copies else None
 
 
 def workout_kcal(row: Mapping[str, Any], calories: float | None = None) -> float | None:

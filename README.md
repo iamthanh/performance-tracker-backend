@@ -302,7 +302,7 @@ Then ask, for example:
 | `sync_status` | Row counts and per-stream cursor, last success and last error |
 | `list_activities` | Workouts newest first; filter by dates, sport (`cycling`, `running`, … or a provider type) and source; de-duplicated unless `source` is set |
 | `get_activity` | One activity, optionally with the raw provider JSON |
-| `activity_summary` | Totals per week (Monday start), month, day or sport: count, distance_km, moving_hours, elevation, calories, average HR. Never double counts |
+| `activity_summary` | Totals per week (Monday start), month, day or sport: count, distance_km, moving_hours, elevation, calories (as recorded by the kept copy; the web API's `kcal` also falls back to a ride's kJ), average HR. Never double counts |
 | `get_daily_metrics` | `{date, metric, source, value}` rows; default last 30 days. Sources are not merged |
 | `get_sleep` | Sleep sessions by wake-up date; default last 30 days, main sleep only |
 | `get_body_measurements` | Weight (kg) and body fat (%); default last 90 days |

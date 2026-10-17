@@ -159,8 +159,10 @@ def create_server(
         ] = "week",
         activity_type: Annotated[str | None, Field(description="Optional sport family or provider type filter")] = None,
     ) -> str:
-        """Totals per period or sport: count, distance_km, moving_hours, elevation_gain_m, calories,
-        avg_of_avg_hr. De-duplicated across services, so a workout is never counted twice."""
+        """Totals per period or sport: count, distance_km, moving_hours, elevation_gain_m, calories
+        (as recorded by the kept copy: Strava summaries have none; nutrition_daily's workout_kcal also
+        uses a duplicate's calories or a ride's kJ), avg_of_avg_hr. De-duplicated across services, so a
+        workout is never counted twice."""
         return _dump(await read(lambda c: queries.activity_summary(c, start_date, end_date, group_by, activity_type)))
 
     @mcp.tool(annotations=READ_ONLY, structured_output=False)

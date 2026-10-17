@@ -434,7 +434,6 @@ def workout_fueling(conn: sqlite3.Connection, source: str, source_id: str) -> di
         (source, source_id),
     ).fetchone()
     row = {**activity, **(dict(metrics) if metrics else {}), "sport": queries.sport_family(activity["activity_type"])}
-
     entries = list_entries(conn, activity=(source, source_id))
     during = [e for e in entries if e["meal"] == DURING]
     totals = _sum(during)

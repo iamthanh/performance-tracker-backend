@@ -298,6 +298,7 @@ def test_a_v3_database_with_data_migrates_to_v4(tmp_path) -> None:
 
 
 
+
 def test_workouts_report_kcal_burned(store: Store) -> None:
     """kcal in the activity list and summaries: recorded calories (from any copy), else a ride's kJ of work."""
     from fitness_hub import queries
