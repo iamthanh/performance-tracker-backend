@@ -412,7 +412,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/activities/{source}/{source_id}/insights")
     def activity_insights(conn: Conn, source: str, source_id: str) -> dict[str, Any]:
-        """Body weight for per-kg values, durability (best efforts after accumulated work),
+        """Body weight for per-kg values, best efforts (power, with the heart rate over them),
+        durability (best efforts after accumulated work),
         W' balance with matches, and the efforts above FTP."""
         result = insights.activity_insights(conn, source, source_id)
         if result is None:

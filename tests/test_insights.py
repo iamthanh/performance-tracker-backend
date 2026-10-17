@@ -16,6 +16,7 @@ from fitness_hub.config import Settings
 from fitness_hub.db import Store
 from fitness_hub.insights import (
     DEFAULT_W_PRIME_J,
+    best_efforts,
     cp_model,
     durability,
     effort_spans,
@@ -135,6 +136,30 @@ def test_cp_model_pairs_cp_and_w_prime_from_the_fit(settings: Settings) -> None:
         assert cp_model(store.conn, "2026-09-01", 280) == (280, DEFAULT_W_PRIME_J, "ftp")  # before any ride
 
 
+def test_best_efforts_find_the_hardest_stretch_and_its_heart_rate() -> None:
+    # 20 min easy, 5 min hard (HR climbing 150 -> 179, one dropout), 50 min easy: 75 min in all.
+    power = np.array([150.0] * 1200 + [350.0] * 300 + [150.0] * 3000)
+    hr = np.full(power.size, 130.0)
+    hr[1200:1500] = 150 + np.arange(300) / 10
+    hr[1300] = np.nan
+    clock = np.arange(power.size, dtype=float) + 0.0
+    by = {e["duration_s"]: e for e in best_efforts(power, hr, clock)}
+    assert list(by) == [30, 60, 300, 600, 900, 1200, 1800, 3600]  # nothing longer than the ride
+    five = by[300]
+    assert (five["start_s"], five["end_s"], five["avg_power_w"]) == (1200, 1500, 350)
+    assert (five["min_hr"], five["max_hr"]) == (150, 180) and five["avg_hr"] == 165
+    assert by[30]["start_s"] == 1200 and by[30]["max_hr"] == 153  # the earliest of equal stretches
+    assert by[3600]["avg_power_w"] == round((350 * 300 + 150 * 3300) / 3600)
+    no_hr = best_efforts(power, np.full(power.size, np.nan), clock)
+    assert no_hr[0]["avg_hr"] is None and no_hr[0]["min_hr"] is None
+
+
+def test_best_efforts_go_on_hourly_past_four_hours() -> None:
+    durations = [e["duration_s"] for e in best_efforts(np.full(6 * 3600 + 10, 200.0), np.full(6 * 3600 + 10, 140.0),
+                                                       np.arange(6 * 3600 + 10, dtype=float))]
+    assert durations[-3:] == [14400, 18000, 21600]
+
+
 def test_timer_clock_places_seconds_on_the_stream_clock() -> None:
     streams = {"time": [0, 1, 2, 60, 61], "power": [100, 100, 100, 200, 200]}  # a 58 s stop
     clock, paused, series = timer_clock(streams, ("power",))
@@ -171,6 +196,8 @@ def client(settings: Settings) -> TestClient:
 
 def test_insights_for_a_ride(client: TestClient) -> None:
     body = client.get("/api/activities/strava/2/insights").json()
+    assert body["best_efforts"][0]["duration_s"] == 30 and body["best_efforts"][0]["avg_power_w"] == 400
+    assert body["best_efforts"][0]["avg_hr"] == 150
     assert body["weight"] == {"kg": 72.5, "origin": "body", "date": "2026-09-20"}
     assert body["durability"]["unit"] == "kJ" and body["durability"]["steps"][0] == 0
     efforts = body["efforts"]
@@ -194,7 +221,7 @@ def test_insights_use_the_pre_workout_weight(client: TestClient, settings: Setti
 
 def test_insights_without_cycling_power(client: TestClient) -> None:
     run = client.get("/api/activities/strava/run/insights").json()
-    assert run["durability"] is None and run["efforts"] is None and run["w_prime"] is None
+    assert run["durability"] is None and run["efforts"] is None and run["best_efforts"] is None and run["w_prime"] is None
     assert client.get("/api/activities/strava/nope/insights").status_code == 404
 
 

@@ -185,6 +185,8 @@ each (60 MB once unzipped), through `POST /api/activities/import`. Imports run o
 `GET /api/activities/{source}/{id}/insights` adds what coaches look at beyond NP/IF/TSS (`insights.py`):
 
 - **Per kg:** the body weight saved before the workout, else the latest weigh-in up to its day.
+- **Best efforts:** for 30 s, 1, 5, 10, 15, 20, 30 and 60 minutes, then every hour, the stretch with the highest
+  average power, when it was, and the min, max and average heart rate over it.
 - **Durability:** the best 1, 5, 8, 10, 15 and 20 minutes after the ride had already done 100, 200, 300 ... kJ of work
   (a multiple of 100 kJ past 100 steps), next to the same efforts from the start; the UI adds kJ/kg with a
   weight. Professionals' best efforts fade with accumulated work, most clearly beyond about 20 kJ/kg, and how little separates riders that fresh
@@ -428,7 +430,7 @@ Reads use read-only connections. Writes are threshold overrides, which re-score 
 | `POST /api/activities/import?filename&name&activity_type&timezone` | Import one `.fit`, `.gpx` or `.tcx` file (optionally `.gz`); the body is the file, as `application/octet-stream`. Stored as source `upload` and analysed; returns the workout and any copy already stored from another service |
 | `GET /api/activities/{source}/{id}` | One workout: `activity`, `analysis` (zones, power curve, thresholds used), `laps`, `device`, available `streams` channels |
 | `GET /api/activities/{source}/{id}/streams?max_points=2000` | Per-sample channels averaged down to `max_points` (`time` in seconds from the start); `w_bal` (W' left, J) for a ride with power and an FTP |
-| `GET /api/activities/{source}/{id}/insights` | Body weight for per-kg values, durability (best efforts after accumulated work), W' balance with matches, efforts above FTP |
+| `GET /api/activities/{source}/{id}/insights` | Body weight for per-kg values, best efforts (power with the heart rate over them), durability (best efforts after accumulated work), W' balance with matches, efforts above FTP |
 | `GET /api/summary?start_date&end_date&group_by=week` | Totals per day/week (Monday start)/month, overall and per sport: count, distance, hours, elevation, TSS, kJ, kcal burned |
 | `GET /api/training-load?start_date&end_date` | Daily TSS, CTL, ATL, TSB and `unscored` workouts (default 90 days) |
 | `GET /api/power-curve?start_date&end_date&activity_type` | Best power per duration with the activity that set it (cycling unless `activity_type=all`) |
